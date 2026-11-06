@@ -1,6 +1,6 @@
-# argodrive-ds4-kimi-k3.1
+# Kimi K3.1 Pro on one 96 GB GPU
 
-Kimi K3.1 Pro (2.8T parameters, 1.45 TB of experts) on one 96 GB GPU, with the experts streamed off NVMe as the router asks
+**argodrive-ds4-kimi-k3.1** runs Kimi K3.1 Pro (2.8T parameters, 1.45 TB of experts) on one 96 GB GPU, with the experts streamed off NVMe as the router asks
 for them: about 2 tok/s decode, and prefill from 10.6 tok/s on a 270-token prompt up to 41 tok/s on a 1,533-token one.
 
 This is Salvatore Sanfilippo's [ds4](https://github.com/antirez/ds4) at commit c97964b with a Kimi K3 / K3.1 Pro port on top.
