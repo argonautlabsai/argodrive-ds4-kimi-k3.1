@@ -27,6 +27,7 @@
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_repack.h"
 #include "ds4_image.h"
+#include "ds4_kimi_k3.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -2266,6 +2267,12 @@ static int cuda_model_stage_read_from(int fd, int *direct_fd, uint64_t align,
                                      uint64_t file_size, void *stage, uint64_t stage_bytes,
                                      uint64_t offset, uint64_t bytes, const char **payload) {
     *payload = (const char *)stage;
+    /* Kimi K3: routed-expert bytes are not in the model file; the expert source re-lays the deltafin raw-v1
+     * planes into block_mxfp4 straight into the pinned stage. */
+    if (ds4_k3_expert_source_active() && ds4_k3_expert_source_covers(offset, bytes)) {
+        if (bytes > stage_bytes) { errno = EINVAL; return 0; }
+        return ds4_k3_expert_source_read(offset, bytes, stage);
+    }
 #if defined(__linux__) && defined(O_DIRECT)
     if (*direct_fd >= 0 && align > 1 && file_size != 0) {
         const uint64_t aligned_off = cuda_round_down(offset, align);
@@ -2520,6 +2527,16 @@ static const char *cuda_model_range_ptr_from_fd(
         uint64_t offset,
         uint64_t bytes,
         const char *what) {
+    {
+        static int n_logged = 0;
+        static int trace = -1;
+        if (trace < 0) trace = getenv("DS4_K3_TRACE_STAGE") != NULL;
+        if (trace && n_logged < 120) {
+            n_logged++;
+            fprintf(stderr, "ds4: staging from disk: offset=%llu bytes=%llu (%s)\n", (unsigned long long)offset,
+                    (unsigned long long)bytes, what ? what : "?");
+        }
+    }
     if (g_model_fd < 0 || bytes == 0) return NULL;
     if (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base) return NULL;
     const uint64_t limit = cuda_model_cache_limit_bytes();
@@ -16336,6 +16353,12 @@ static int g_q8_dequant_gemm_enabled = 0;
 extern "C" void ds4_gpu_enable_q8_dequant_gemm(void) {
     g_q8_dequant_gemm_enabled = 1;
 }
+/* step 37 (kimi-k3): prompt passes of up to g_k3_q8_gemm_max rows run the dequant-to-f16 GEMM below instead of the
+   fused MMQ. With a single row tile the MMQ grid is out_dim/128 blocks, each walking the whole K dimension alone:
+   6.4 ms for a 7168x12288 projection at 66 rows against 0.7 ms at 1,549 rows (13 row tiles). Only the K3 loader sets
+   this; DS4 paths stay byte-stable. */
+static uint32_t g_k3_q8_gemm_max = 0;
+extern "C" void ds4_gpu_k3_set_spine_gemm_max(uint32_t n) { g_k3_q8_gemm_max = n; }
 
 __global__ static void q8_0_dequant_f16_kernel(
         __half *out,
@@ -16366,6 +16389,8 @@ __global__ static void q8_0_dequant_f16_kernel(
 static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
     if (!out || !x || !model_map) return 0;
     uint64_t blocks = (in_dim + 31) / 32;
+    const bool k3_gemm = g_k3_q8_gemm_max != 0u && n_tok >= 2u && n_tok <= g_k3_q8_gemm_max && g_cublas_ready &&
+                         blocks > 32u && (in_dim & 31u) == 0u;   /* step 37 */
     if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34)) return 0;
     uint64_t weight_bytes = out_dim * blocks * 34;
     if (weight_bytes > model_size - weight_offset) return 0;
@@ -16432,7 +16457,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
      * raw dense MMQ fallback is allocator-dependent for other GLM shapes on
      * GB10, including short prefills, so retain the deterministic kernels
      * below. DeepSeek keeps its established MMQ prefill path. */
-    if (n_tok > 1 && (in_dim % 256u) == 0 &&
+    if (n_tok > 1 && (in_dim % 256u) == 0 && !k3_gemm &&
         !g_q8_dequant_gemm_enabled && cuda_use_mmq()) {
         /* Inside a side region the MMQ follows the side stream (same
          * kernels); otherwise the legacy stream as always. */
@@ -16506,8 +16531,8 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
              * operation through the native Q8 kernels below. */
         }
     }
-    if (g_q8_dequant_gemm_enabled && g_cublas_ready &&
-        n_tok >= 128u && blocks > 32u && (in_dim & 31u) == 0u) {
+    if (((g_q8_dequant_gemm_enabled && n_tok >= 128u) || k3_gemm) && g_cublas_ready &&
+        blocks > 32u && (in_dim & 31u) == 0u) {
         /* Streaming dequant + f16 GEMM: the exact-q8 batched kernels only
          * cover blocks <= 32 (DS4 TP shard widths); the per-token fallback
          * re-reads the full weight per token (~30x the bytes at GLM dims).
@@ -16554,6 +16579,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 const float alpha = 1.0f;
                 const float beta = 0.0f;
                 if (gemm_trace) cudaEventRecord(ev1);
+                if (k3_gemm) cublasSetStream(cuda_cublas_for_tier(logical_tier), cuda_decode_stream());   /* same stream as the staging kernels */
                 cublasStatus_t st = cublasGemmEx(
                         cuda_cublas_for_tier(logical_tier),
                         CUBLAS_OP_T, CUBLAS_OP_N,
@@ -16567,7 +16593,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 if (st == CUBLAS_STATUS_SUCCESS) {
                     if (!cuda_ok(cudaMemcpyAsync(out->ptr, olocal,
                                  n_tok * out_dim * sizeof(float),
-                                 cudaMemcpyDeviceToDevice, 0),
+                                 cudaMemcpyDeviceToDevice, k3_gemm ? cuda_decode_stream() : (cudaStream_t)0),
                                  "q8 dequant gemm out copy")) {
                         st = CUBLAS_STATUS_INTERNAL_ERROR;
                     }
@@ -16590,6 +16616,12 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                         (int)st);
             }
         }
+    }
+    if (k3_gemm && (in_dim % 256u) == 0 && cuda_use_mmq()) {
+        /* step 37: the f16 GEMM could not run (no scratch for this weight): the fused MMQ is the next best */
+        const int rc = ds4_mmq_q8_0_dense(wptr, (const float *)x->ptr, (float *)out->ptr, (int)out_dim, (int)n_tok, (int)in_dim,
+                                          g_dsv41_shared.active ? cuda_decode_stream() : (cudaStream_t)0);
+        if (rc == 0) return 1;
     }
     const uint64_t xq_bytes = n_tok * blocks * 32u;
     const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
@@ -36399,3 +36431,2807 @@ extern "C" int ds4_gpu_compressor_verify_rows_tensor(
             n_rows);
     return cuda_ok(cudaGetLastError(), "compressor wide rows store launch");
 }
+
+/* =========================================================================
+ * Kimi K3 CUDA primitives (2026-10-31). Decode-only first version: the
+ * K3 driver in ds4.c sequences these per layer; everything else (Q8_0 spine
+ * matmuls, norms, router select, embedding, output head) reuses the generic
+ * ds4 GPU API. Experts are MXFP4 slabs uploaded per layer from the K3 expert
+ * source (no cache yet); the kernels are plain warp-per-row GEMVs.
+ * ========================================================================= */
+#include "ds4_kimi_k3.h"
+#include <thread>
+#include <vector>
+
+namespace {
+
+constexpr uint32_t K3_KDA_DIM = 128u;
+constexpr uint32_t K3_KDA_HISTORY = 3u;
+
+__device__ __forceinline__ float k3_sigmoid_dev(float x) { return 1.0f / (1.0f + __expf(-x)); }
+__device__ __forceinline__ float k3_silu_dev(float x) { return x * k3_sigmoid_dev(x); }
+__device__ __forceinline__ float k3_situ_dev(float g, float u, float b, float bl) {
+    return (b * tanhf(g / b) * k3_sigmoid_dev(g)) * (bl * tanhf(u / bl));
+}
+__device__ __forceinline__ float k3_warp_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+/* block-wide sum for blockDim.x == 1024 (32 warps); `red` is shared float[32] */
+__device__ __forceinline__ float k3_block_sum_1024(float v, float *red) {
+    v = k3_warp_sum(v);
+    const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5u;
+    if (lane == 0u) red[warp] = v;
+    __syncthreads();
+    float t = lane < 32u ? red[lane] : 0.0f;
+    t = k3_warp_sum(t);
+    __syncthreads();
+    return t;
+}
+
+__constant__ float k3_e2m1_table[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                                        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+
+/* Residual-anchor mix: values = [anchors(0..n_anchor-1), x]; keys = rmsnorm(values) (no weight);
+ * score_i = sum_j keys_i[j] * norm[j] * proj[j]; p = softmax(score); out = sum_i p_i * values_i. One block of 1024. */
+__device__ __forceinline__ static void k3_residual_mix_row(float *out, const float *x, const float *anchors, uint32_t n_anchor,
+                                                           const float *res_norm, const float *res_proj, uint32_t n, float eps) {
+    __shared__ float red[32];
+    __shared__ float scores[17];
+    __shared__ float probs[17];
+    const uint32_t count = n_anchor + 1u;
+    for (uint32_t i = 0; i < count; i++) {
+        const float *v = i < n_anchor ? anchors + (size_t)i * n : x;
+        float ss = 0.0f;
+        for (uint32_t j = threadIdx.x; j < n; j += blockDim.x) ss += v[j] * v[j];
+        ss = k3_block_sum_1024(ss, red);
+        const float inv = rsqrtf(ss / (float)n + eps);
+        float sc = 0.0f;
+        for (uint32_t j = threadIdx.x; j < n; j += blockDim.x) sc += v[j] * inv * res_norm[j] * res_proj[j];
+        sc = k3_block_sum_1024(sc, red);
+        if (threadIdx.x == 0u) scores[i] = sc;
+        __syncthreads();
+    }
+    if (threadIdx.x == 0u) {
+        float mx = scores[0];
+        for (uint32_t i = 1; i < count; i++) mx = fmaxf(mx, scores[i]);
+        float denom = 0.0f;
+        for (uint32_t i = 0; i < count; i++) { probs[i] = __expf(scores[i] - mx); denom += probs[i]; }
+        for (uint32_t i = 0; i < count; i++) probs[i] /= denom;
+    }
+    __syncthreads();
+    for (uint32_t j = threadIdx.x; j < n; j += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t i = 0; i < n_anchor; i++) acc += probs[i] * anchors[(size_t)i * n + j];
+        acc += probs[n_anchor] * x[j];
+        out[j] = acc;
+    }
+}
+__global__ static void k3_residual_mix_kernel(float *out, const float *x, const float *anchors, uint32_t n_anchor,
+                                              const float *res_norm, const float *res_proj, uint32_t n, float eps) {
+    k3_residual_mix_row(out, x, anchors, n_anchor, res_norm, res_proj, n, eps);
+}
+/* step 32: one block per token (anchors: 16 rows of n per token) */
+__global__ static void k3_residual_mix_batch_kernel(float *out, const float *x, const float *anchors, uint32_t n_anchor,
+                                                    const float *res_norm, const float *res_proj, uint32_t n, float eps) {
+    const size_t t = blockIdx.x;
+    k3_residual_mix_row(out + t * n, x + t * n, anchors ? anchors + t * 16u * n : nullptr, n_anchor, res_norm, res_proj, n, eps);
+}
+
+__global__ static void k3_situ_kernel(float *out, const float *gate, const float *up, uint32_t n, float b, float bl) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = k3_situ_dev(gate[i], up[i], b, bl);
+}
+
+__global__ static void k3_sigmoid_mul_kernel(float *out, const float *x, const float *gate, uint32_t n) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = x[i] * k3_sigmoid_dev(gate[i]);
+}
+
+/* kv_b output [heads][nope + vdim] -> k_nope [heads][nope], value [heads][vdim] */
+__global__ static void k3_split_kvb_kernel(float *k_nope, float *value, const float *kvb, uint32_t heads,
+                                           uint32_t nope, uint32_t vdim) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t per_head = nope + vdim;
+    if (i >= heads * per_head) return;
+    const uint32_t h = i / per_head, d = i % per_head;
+    if (d < nope) k_nope[h * nope + d] = kvb[i];
+    else value[h * vdim + (d - nope)] = kvb[i];
+}
+
+/* dense f32 caches: key [cap][heads][nope+rot], value [cap][heads][vdim]; rope dims copied unrotated from kv_raw */
+__global__ static void k3_mla_store_kernel(float *key_cache, float *value_cache, const float *k_nope, const float *kv_raw,
+                                           const float *value, uint32_t pos, uint32_t heads, uint32_t nope,
+                                           uint32_t rot, uint32_t kv_lora, uint32_t vdim) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t qk = nope + rot;
+    const uint32_t key_elems = heads * qk;
+    if (i < key_elems) {
+        const uint32_t h = i / qk, d = i % qk;
+        key_cache[((size_t)pos * heads + h) * qk + d] = d < nope ? k_nope[h * nope + d] : kv_raw[kv_lora + (d - nope)];
+    } else if (i < key_elems + heads * vdim) {
+        const uint32_t j = i - key_elems;
+        value_cache[(size_t)pos * heads * vdim + j] = value[j];
+    }
+}
+/* step 32: grid.y over the tokens of a prompt pass */
+__global__ static void k3_mla_store_batch_kernel(float *key_cache, float *value_cache, const float *k_nope, const float *kv_raw,
+                                                 const float *value, uint32_t pos0, uint32_t heads, uint32_t nope,
+                                                 uint32_t rot, uint32_t kv_lora, uint32_t vdim) {
+    const size_t t = blockIdx.y;
+    const uint32_t pos = pos0 + (uint32_t)t;
+    k_nope += t * heads * nope; kv_raw += t * (kv_lora + rot); value += t * heads * vdim;
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t qk = nope + rot;
+    const uint32_t key_elems = heads * qk;
+    if (i < key_elems) {
+        const uint32_t h = i / qk, d = i % qk;
+        key_cache[((size_t)pos * heads + h) * qk + d] = d < nope ? k_nope[h * nope + d] : kv_raw[kv_lora + (d - nope)];
+    } else if (i < key_elems + heads * vdim) {
+        const uint32_t j = i - key_elems;
+        value_cache[(size_t)pos * heads * vdim + j] = value[j];
+    }
+}
+
+/* one query over n_pos cached positions; grid = heads, block = 256, dynamic shared = n_pos floats */
+__global__ static void k3_split_kvb_batch_kernel(float *k_nope, float *value, const float *kvb, uint32_t heads,
+                                                 uint32_t nope, uint32_t vdim) {
+    const size_t t = blockIdx.y;
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t per_head = nope + vdim;
+    if (i >= heads * per_head) return;
+    const uint32_t h = i / per_head, d = i % per_head;
+    const float v = kvb[t * heads * per_head + i];
+    if (d < nope) k_nope[t * heads * nope + h * nope + d] = v;
+    else value[t * heads * vdim + h * vdim + (d - nope)] = v;
+}
+__global__ static void k3_mla_attend_kernel(float *heads_out, const float *q, const float *key_cache,
+                                            const float *value_cache, uint32_t n_pos, uint32_t heads,
+                                            uint32_t qk, uint32_t vdim, float scale) {
+    extern __shared__ float sc[];
+    __shared__ float red[32];
+    __shared__ float stats[2];
+    const uint32_t h = blockIdx.x;
+    const float *qh = q + (size_t)h * qk;
+    float local_max = -1e30f;
+    for (uint32_t t = threadIdx.x; t < n_pos; t += blockDim.x) {
+        const float *kt = key_cache + ((size_t)t * heads + h) * qk;
+        float s = 0.0f;
+        for (uint32_t d = 0; d < qk; d++) s += qh[d] * kt[d];
+        s *= scale;
+        sc[t] = s;
+        local_max = fmaxf(local_max, s);
+    }
+    /* block max */
+    for (int o = 16; o > 0; o >>= 1) local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, o));
+    if ((threadIdx.x & 31u) == 0u) red[threadIdx.x >> 5u] = local_max;
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        float m = -1e30f;
+        for (uint32_t w = 0; w < (blockDim.x >> 5u); w++) m = fmaxf(m, red[w]);
+        stats[0] = m;
+    }
+    __syncthreads();
+    const float m = stats[0];
+    float local_sum = 0.0f;
+    for (uint32_t t = threadIdx.x; t < n_pos; t += blockDim.x) { const float e = __expf(sc[t] - m); sc[t] = e; local_sum += e; }
+    local_sum = k3_warp_sum(local_sum);
+    if ((threadIdx.x & 31u) == 0u) red[threadIdx.x >> 5u] = local_sum;
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        float s = 0.0f;
+        for (uint32_t w = 0; w < (blockDim.x >> 5u); w++) s += red[w];
+        stats[1] = s;
+    }
+    __syncthreads();
+    const float inv = 1.0f / stats[1];
+    for (uint32_t v = threadIdx.x; v < vdim; v += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t t = 0; t < n_pos; t++) acc += sc[t] * value_cache[((size_t)t * heads + h) * vdim + v];
+        heads_out[(size_t)h * vdim + v] = acc * inv;
+    }
+}
+
+/* Kimi Delta Attention decode: the GLM-5.3 kernel with A_log indexed per channel (K3) or per head (GLM). */
+/* One token step for one head (block = K3_KDA_DIM threads): conv history, gating, the delta-rule state update and
+   the gated output. Pointers are per token; the state and conv history are those of the sequence (row 0). */
+template <bool PER_CHANNEL>
+__device__ __forceinline__ void k3_kda_step(float *scratch, 
+        float *out, float *conv_state, float *state,
+        const float *q_in, const float *k_in, const float *v_in,
+        const float *raw_gate, const float *raw_beta, const float *output_gate,
+        const float *q_conv, const float *k_conv, const float *v_conv,
+        const float *a_log, const float *dt_bias, const float *output_norm,
+        uint32_t n_heads, float lower_bound, float norm_eps, uint32_t head, uint32_t tid) {
+    const uint32_t row = 0u;
+    (void)row;
+
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    float *sq = scratch;
+    float *sk = sq + K3_KDA_DIM;
+    float *sd = sk + K3_KDA_DIM;
+    float *sv = sd + K3_KDA_DIM;
+    float *so = sv + K3_KDA_DIM;
+    float *reduce_q = so + K3_KDA_DIM;
+    float *reduce_k = reduce_q + 4;
+    float *reduce_o = reduce_k + 4;
+    float *beta_shared = reduce_o + 4;
+    const uint32_t projection = n_heads * K3_KDA_DIM;
+    const uint32_t channel = head * K3_KDA_DIM + tid;
+    const uint64_t input_base = (uint64_t)row * projection + head * K3_KDA_DIM;
+    const uint64_t conv_row_stride = (uint64_t)3 * K3_KDA_HISTORY * projection;
+    float *q_state = conv_state + (uint64_t)row * conv_row_stride;
+    float *k_state = q_state + K3_KDA_HISTORY * projection;
+    float *v_state = k_state + K3_KDA_HISTORY * projection;
+    float q_acc = 0.0f, k_acc = 0.0f, v_acc = 0.0f;
+    for (uint32_t w = 0; w < K3_KDA_HISTORY; w++) {
+        q_acc = fmaf(q_state[(uint64_t)w * projection + channel], q_conv[(uint64_t)channel * 4u + w], q_acc);
+        k_acc = fmaf(k_state[(uint64_t)w * projection + channel], k_conv[(uint64_t)channel * 4u + w], k_acc);
+        v_acc = fmaf(v_state[(uint64_t)w * projection + channel], v_conv[(uint64_t)channel * 4u + w], v_acc);
+    }
+    const float q_new = q_in[input_base + tid];
+    const float k_new = k_in[input_base + tid];
+    const float v_new = v_in[input_base + tid];
+    q_acc = fmaf(q_new, q_conv[(uint64_t)channel * 4u + 3u], q_acc);
+    k_acc = fmaf(k_new, k_conv[(uint64_t)channel * 4u + 3u], k_acc);
+    v_acc = fmaf(v_new, v_conv[(uint64_t)channel * 4u + 3u], v_acc);
+    q_state[channel] = q_state[projection + channel];
+    q_state[projection + channel] = q_state[2ull * projection + channel];
+    q_state[2ull * projection + channel] = q_new;
+    k_state[channel] = k_state[projection + channel];
+    k_state[projection + channel] = k_state[2ull * projection + channel];
+    k_state[2ull * projection + channel] = k_new;
+    v_state[channel] = v_state[projection + channel];
+    v_state[projection + channel] = v_state[2ull * projection + channel];
+    v_state[2ull * projection + channel] = v_new;
+    sq[tid] = k3_silu_dev(q_acc);
+    sk[tid] = k3_silu_dev(k_acc);
+    sv[tid] = k3_silu_dev(v_acc);
+    const float gate = raw_gate[input_base + tid] + dt_bias[channel];
+    const float a = PER_CHANNEL ? a_log[tid] : a_log[head];
+    sd[tid] = expf(lower_bound * k3_sigmoid_dev(expf(a) * gate));
+    if (tid == 0u) beta_shared[0] = k3_sigmoid_dev(raw_beta[(uint64_t)row * n_heads + head]);
+    __syncthreads();
+    float q_sumsq = k3_warp_sum(sq[tid] * sq[tid]);
+    float k_sumsq = k3_warp_sum(sk[tid] * sk[tid]);
+    if (lane == 0u) { reduce_q[warp] = q_sumsq; reduce_k[warp] = k_sumsq; }
+    __syncthreads();
+    float q_total = lane < 4u ? reduce_q[lane] : 0.0f;
+    float k_total = lane < 4u ? reduce_k[lane] : 0.0f;
+    q_total = __shfl_sync(0xffffffffu, k3_warp_sum(q_total), 0);
+    k_total = __shfl_sync(0xffffffffu, k3_warp_sum(k_total), 0);
+    sq[tid] *= rsqrtf(q_total + 1.0e-6f) * 0.08838834764831845f;
+    sk[tid] *= rsqrtf(k_total + 1.0e-6f);
+    __syncthreads();
+    const uint32_t k0 = lane * 4u;
+    const float4 q4 = *(const float4 *)(sq + k0);
+    const float4 k4 = *(const float4 *)(sk + k0);
+    const float4 decay4 = *(const float4 *)(sd + k0);
+    const uint64_t state_head = ((uint64_t)row * n_heads + head) * K3_KDA_DIM * K3_KDA_DIM;
+    for (uint32_t value = warp; value < K3_KDA_DIM; value += 4u) {
+        float4 *hptr = (float4 *)(state + state_head + (uint64_t)value * K3_KDA_DIM + k0);
+        float4 h = *hptr;
+        h.x *= decay4.x; h.y *= decay4.y; h.z *= decay4.z; h.w *= decay4.w;
+        const float hk = __shfl_sync(0xffffffffu, k3_warp_sum(h.x * k4.x + h.y * k4.y + h.z * k4.z + h.w * k4.w), 0);
+        const float delta_v = (sv[value] - hk) * beta_shared[0];
+        h.x = fmaf(k4.x, delta_v, h.x); h.y = fmaf(k4.y, delta_v, h.y);
+        h.z = fmaf(k4.z, delta_v, h.z); h.w = fmaf(k4.w, delta_v, h.w);
+        *hptr = h;
+        const float hq = __shfl_sync(0xffffffffu, k3_warp_sum(h.x * q4.x + h.y * q4.y + h.z * q4.z + h.w * q4.w), 0);
+        if (lane == 0u) so[value] = hq;
+    }
+    __syncthreads();
+    float o_sumsq = k3_warp_sum(so[tid] * so[tid]);
+    if (lane == 0u) reduce_o[warp] = o_sumsq;
+    __syncthreads();
+    float o_total = lane < 4u ? reduce_o[lane] : 0.0f;
+    o_total = __shfl_sync(0xffffffffu, k3_warp_sum(o_total), 0);
+    const float o_scale = rsqrtf(o_total / (float)K3_KDA_DIM + norm_eps);
+    const float out_gate = k3_sigmoid_dev(output_gate[input_base + tid]);
+    out[input_base + tid] = so[tid] * o_scale * output_norm[tid] * out_gate;
+}
+
+template <bool PER_CHANNEL>
+__global__ static void k3_kda_decode_kernel(
+        float *out, float *conv_state, float *state,
+        const float *q_in, const float *k_in, const float *v_in,
+        const float *raw_gate, const float *raw_beta, const float *output_gate,
+        const float *q_conv, const float *k_conv, const float *v_conv,
+        const float *a_log, const float *dt_bias, const float *output_norm,
+        uint32_t n_heads, uint32_t n_rows, float lower_bound, float norm_eps) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    if (row >= n_rows || head >= n_heads || tid >= K3_KDA_DIM) return;
+    __shared__ float scratch[656];
+    const uint64_t projection = (uint64_t)n_heads * K3_KDA_DIM;
+    const uint64_t conv_row_stride = (uint64_t)3 * K3_KDA_HISTORY * projection;
+    k3_kda_step<PER_CHANNEL>(scratch, out + (uint64_t)row * projection, conv_state + (uint64_t)row * conv_row_stride,
+                             state + (uint64_t)row * n_heads * K3_KDA_DIM * K3_KDA_DIM,
+                             q_in + (uint64_t)row * projection, k_in + (uint64_t)row * projection, v_in + (uint64_t)row * projection,
+                             raw_gate + (uint64_t)row * projection, raw_beta + (uint64_t)row * n_heads, output_gate + (uint64_t)row * projection,
+                             q_conv, k_conv, v_conv, a_log, dt_bias, output_norm, n_heads, lower_bound, norm_eps, head, tid);
+}
+
+/* Prompt pass (step 27): the same step for n_tok consecutive tokens of one sequence inside one launch, instead of
+   one launch per token (a 1,533-token prompt took 106,000 launches = 15 s of attention). */
+template <bool PER_CHANNEL>
+__global__ static void k3_kda_prefill_kernel(
+        float *out, float *conv_state, float *state,
+        const float *q_in, const float *k_in, const float *v_in,
+        const float *raw_gate, const float *raw_beta, const float *output_gate,
+        const float *q_conv, const float *k_conv, const float *v_conv,
+        const float *a_log, const float *dt_bias, const float *output_norm,
+        uint32_t n_heads, float lower_bound, float norm_eps, uint32_t n_tok) {
+    const uint32_t head = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    if (head >= n_heads || tid >= K3_KDA_DIM) return;
+    __shared__ float scratch[656];
+    const uint64_t projection = (uint64_t)n_heads * K3_KDA_DIM;
+    for (uint32_t t = 0; t < n_tok; t++) {
+        k3_kda_step<PER_CHANNEL>(scratch, out + (uint64_t)t * projection, conv_state, state,
+                                 q_in + (uint64_t)t * projection, k_in + (uint64_t)t * projection, v_in + (uint64_t)t * projection,
+                                 raw_gate + (uint64_t)t * projection, raw_beta + (uint64_t)t * n_heads, output_gate + (uint64_t)t * projection,
+                                 q_conv, k_conv, v_conv, a_log, dt_bias, output_norm, n_heads, lower_bound, norm_eps, head, tid);
+        __syncthreads();
+    }
+}
+
+/* ---- step 27b: the prompt pass as four kernels per chunk. Same arithmetic and reduction order as k3_kda_step. */
+template <bool PER_CHANNEL>
+__global__ static void k3_kda_prep_kernel(float *q_out, float *k_out, float *v_out, float *decay_out,
+        const float *q_in, const float *k_in, const float *v_in, const float *raw_gate, const float *conv_state,
+        const float *q_conv, const float *k_conv, const float *v_conv, const float *a_log, const float *dt_bias,
+        uint32_t n_heads, uint32_t token0, uint32_t n_tok, float lower_bound) {
+    const uint32_t tl = blockIdx.x, head = blockIdx.y, tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
+    if (tl >= n_tok || head >= n_heads || tid >= K3_KDA_DIM) return;
+    __shared__ float sq[K3_KDA_DIM], sk[K3_KDA_DIM], reduce_q[4], reduce_k[4];
+    const uint32_t projection = n_heads * K3_KDA_DIM;
+    const uint32_t channel = head * K3_KDA_DIM + tid;
+    const uint32_t token = token0 + tl;                                   /* position inside the prompt pass */
+    const float *q_state = conv_state;
+    const float *k_state = q_state + K3_KDA_HISTORY * projection;
+    const float *v_state = k_state + K3_KDA_HISTORY * projection;
+    const uint64_t index = (uint64_t)token * projection + channel;        /* inputs: absolute */
+    const uint64_t oindex = (uint64_t)tl * projection + channel;          /* prepared buffers: chunk-local */
+    float q_acc = 0.0f, k_acc = 0.0f, v_acc = 0.0f;
+    for (uint32_t w = 0; w < K3_KDA_HISTORY; w++) {
+        const int32_t src = (int32_t)token + (int32_t)w - (int32_t)K3_KDA_HISTORY;
+        float qv, kv, vv;
+        if (src >= 0) {
+            const uint64_t s = (uint64_t)(uint32_t)src * projection + channel;
+            qv = q_in[s]; kv = k_in[s]; vv = v_in[s];
+        } else {
+            const uint64_t s = (uint64_t)(token + w) * projection + channel;   /* the history rows before the pass */
+            qv = q_state[s]; kv = k_state[s]; vv = v_state[s];
+        }
+        q_acc = fmaf(qv, q_conv[(uint64_t)channel * 4u + w], q_acc);
+        k_acc = fmaf(kv, k_conv[(uint64_t)channel * 4u + w], k_acc);
+        v_acc = fmaf(vv, v_conv[(uint64_t)channel * 4u + w], v_acc);
+    }
+    q_acc = fmaf(q_in[index], q_conv[(uint64_t)channel * 4u + 3u], q_acc);
+    k_acc = fmaf(k_in[index], k_conv[(uint64_t)channel * 4u + 3u], k_acc);
+    v_acc = fmaf(v_in[index], v_conv[(uint64_t)channel * 4u + 3u], v_acc);
+    sq[tid] = k3_silu_dev(q_acc);
+    sk[tid] = k3_silu_dev(k_acc);
+    v_out[oindex] = k3_silu_dev(v_acc);
+    {
+        const float gate = raw_gate[index] + dt_bias[channel];
+        const float a = PER_CHANNEL ? a_log[tid] : a_log[head];
+        decay_out[oindex] = expf(lower_bound * k3_sigmoid_dev(expf(a) * gate));
+    }
+    __syncthreads();
+    float q_sumsq = k3_warp_sum(sq[tid] * sq[tid]);
+    float k_sumsq = k3_warp_sum(sk[tid] * sk[tid]);
+    if (lane == 0u) { reduce_q[warp] = q_sumsq; reduce_k[warp] = k_sumsq; }
+    __syncthreads();
+    float q_total = lane < 4u ? reduce_q[lane] : 0.0f;
+    float k_total = lane < 4u ? reduce_k[lane] : 0.0f;
+    q_total = __shfl_sync(0xffffffffu, k3_warp_sum(q_total), 0);
+    k_total = __shfl_sync(0xffffffffu, k3_warp_sum(k_total), 0);
+    q_out[oindex] = sq[tid] * (rsqrtf(q_total + 1.0e-6f) * 0.08838834764831845f);
+    k_out[oindex] = sk[tid] * rsqrtf(k_total + 1.0e-6f);
+}
+
+/* conv history after the pass: the last three raw inputs (or, for a pass shorter than three, the older rows shift) */
+__global__ static void k3_kda_conv_update_kernel(float *conv_state, const float *q_in, const float *k_in, const float *v_in,
+                                                 uint32_t projection, uint32_t n_tok) {
+    const uint32_t channel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (channel >= projection) return;
+    float *q_state = conv_state;
+    float *k_state = q_state + K3_KDA_HISTORY * projection;
+    float *v_state = k_state + K3_KDA_HISTORY * projection;
+    float nq[K3_KDA_HISTORY], nk[K3_KDA_HISTORY], nv[K3_KDA_HISTORY];
+    for (uint32_t w = 0; w < K3_KDA_HISTORY; w++) {
+        const int32_t src = (int32_t)n_tok - (int32_t)K3_KDA_HISTORY + (int32_t)w;
+        if (src >= 0) {
+            const uint64_t s = (uint64_t)(uint32_t)src * projection + channel;
+            nq[w] = q_in[s]; nk[w] = k_in[s]; nv[w] = v_in[s];
+        } else {
+            const uint64_t s = (uint64_t)(n_tok + w) * projection + channel;
+            nq[w] = q_state[s]; nk[w] = k_state[s]; nv[w] = v_state[s];
+        }
+    }
+    for (uint32_t w = 0; w < K3_KDA_HISTORY; w++) {
+        q_state[(uint64_t)w * projection + channel] = nq[w];
+        k_state[(uint64_t)w * projection + channel] = nk[w];
+        v_state[(uint64_t)w * projection + channel] = nv[w];
+    }
+}
+
+/* grid (n_heads, 32), block 128: one warp per value row, the row's 128 state entries as a float4 per lane */
+__global__ static void k3_kda_recur_kernel(float *out, float *state, const float *q, const float *k, const float *v,
+                                           const float *decay, const float *raw_beta, uint32_t n_heads, uint32_t token0,
+                                           uint32_t n_tok) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t value = blockIdx.y * 4u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (head >= n_heads || value >= K3_KDA_DIM) return;
+    const uint32_t projection = n_heads * K3_KDA_DIM;
+    const uint32_t k0 = lane * 4u;
+    float4 *hptr = (float4 *)(state + ((uint64_t)head * K3_KDA_DIM + value) * K3_KDA_DIM + k0);
+    float4 h = *hptr;
+    for (uint32_t tl = 0; tl < n_tok; tl++) {
+        const uint64_t base = (uint64_t)tl * projection + head * K3_KDA_DIM;
+        const float4 q4 = *(const float4 *)(q + base + k0);
+        const float4 k4 = *(const float4 *)(k + base + k0);
+        const float4 decay4 = *(const float4 *)(decay + base + k0);
+        h.x *= decay4.x; h.y *= decay4.y; h.z *= decay4.z; h.w *= decay4.w;
+        const float hk = __shfl_sync(0xffffffffu, k3_warp_sum(h.x * k4.x + h.y * k4.y + h.z * k4.z + h.w * k4.w), 0);
+        const float beta = k3_sigmoid_dev(raw_beta[(uint64_t)(token0 + tl) * n_heads + head]);
+        const float delta_v = (v[base + value] - hk) * beta;
+        h.x = fmaf(k4.x, delta_v, h.x); h.y = fmaf(k4.y, delta_v, h.y);
+        h.z = fmaf(k4.z, delta_v, h.z); h.w = fmaf(k4.w, delta_v, h.w);
+        const float hq = __shfl_sync(0xffffffffu, k3_warp_sum(h.x * q4.x + h.y * q4.y + h.z * q4.z + h.w * q4.w), 0);
+        if (lane == 0u) out[(uint64_t)(token0 + tl) * projection + head * K3_KDA_DIM + value] = hq;
+    }
+    *hptr = h;
+}
+
+__global__ static void k3_kda_out_kernel(float *out, const float *output_gate, const float *output_norm, uint32_t n_heads,
+                                         uint32_t token0, uint32_t n_tok, float norm_eps) {
+    const uint32_t tl = blockIdx.x, head = blockIdx.y, tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
+    if (tl >= n_tok || head >= n_heads || tid >= K3_KDA_DIM) return;
+    __shared__ float reduce_o[4];
+    const uint32_t projection = n_heads * K3_KDA_DIM;
+    const uint64_t index = (uint64_t)(token0 + tl) * projection + head * K3_KDA_DIM + tid;
+    const float so = out[index];
+    float o_sumsq = k3_warp_sum(so * so);
+    if (lane == 0u) reduce_o[warp] = o_sumsq;
+    __syncthreads();
+    float o_total = lane < 4u ? reduce_o[lane] : 0.0f;
+    o_total = __shfl_sync(0xffffffffu, k3_warp_sum(o_total), 0);
+    const float o_scale = rsqrtf(o_total / (float)K3_KDA_DIM + norm_eps);
+    const float out_gate = k3_sigmoid_dev(output_gate[index]);
+    out[index] = so * o_scale * output_norm[tid] * out_gate;
+}
+
+/* MXFP4 expert GEMVs over block_mxfp4 rows (17 bytes per 32). One warp per output row; lanes stride over blocks. */
+__device__ __forceinline__ float k3_mxfp4_row_dot(const uint8_t *row, const float *x, uint32_t blocks) {
+    float acc = 0.0f;
+    for (uint32_t j = threadIdx.x & 31u; j < blocks; j += 32u) {
+        const uint8_t *blk = row + (size_t)j * 17u;
+        const uint32_t e = blk[0];
+        const float d = e == 255u ? __int_as_float(0x7fffffff) : exp2f((float)e - 127.0f);
+        const float *xb = x + (size_t)j * 32u;
+        float s = 0.0f;
+#pragma unroll
+        for (uint32_t i = 0; i < 16u; i++) {
+            const uint32_t b = blk[1u + i];
+            s = fmaf(k3_e2m1_table[b & 0x0fu], xb[i], s);
+            s = fmaf(k3_e2m1_table[b >> 4], xb[16u + i], s);
+        }
+        acc = fmaf(d, s, acc);
+    }
+    return k3_warp_sum(acc);
+}
+
+/* grid (ceil(ff/8), n_used), block 256: mid[e][r] = situ(gate_e[r].x, up_e[r].x) */
+__global__ static void k3_moe_gate_up_kernel(float *mid, const uint8_t *const *gate_slabs, const uint8_t *const *up_slabs,
+                                             const float *x, uint32_t ff, uint32_t in_dim, float b, float bl) {
+    const uint32_t e = blockIdx.y;
+    const uint32_t r = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    if (r >= ff) return;
+    const uint32_t blocks = in_dim / 32u;
+    const size_t row_bytes = (size_t)blocks * 17u;
+    const float g = k3_mxfp4_row_dot(gate_slabs[e] + (size_t)r * row_bytes, x, blocks);
+    const float u = k3_mxfp4_row_dot(up_slabs[e] + (size_t)r * row_bytes, x, blocks);
+    if ((threadIdx.x & 31u) == 0u) mid[(size_t)e * ff + r] = k3_situ_dev(g, u, b, bl);
+}
+
+/* grid (ceil(latent/8), n_used): partial[e][c] = down_e[c] . mid[e] */
+__global__ static void k3_moe_down_kernel(float *partial, const uint8_t *const *down_slabs, const float *mid,
+                                          uint32_t latent, uint32_t ff) {
+    const uint32_t e = blockIdx.y;
+    const uint32_t c = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    if (c >= latent) return;
+    const uint32_t blocks = ff / 32u;
+    const float v = k3_mxfp4_row_dot(down_slabs[e] + (size_t)c * (size_t)blocks * 17u, mid + (size_t)e * ff, blocks);
+    if ((threadIdx.x & 31u) == 0u) partial[(size_t)e * latent + c] = v;
+}
+
+__global__ static void k3_moe_combine_kernel(float *out, const float *partial, const float *weights, uint32_t n_used,
+                                             uint32_t latent) {
+    const uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= latent) return;
+    float acc = 0.0f;
+    for (uint32_t e = 0; e < n_used; e++) acc = fmaf(weights[e], partial[(size_t)e * latent + c], acc);
+    out[c] = acc;
+}
+
+struct k3_moe_pool {
+    uint32_t n_used = 0, ff = 0, latent = 0;
+    size_t gu_bytes = 0, d_bytes = 0;
+    uint8_t *dev_gate = nullptr, *dev_up = nullptr, *dev_down = nullptr;   /* n_used slabs each */
+    uint8_t *host_stage = nullptr;                                          /* pinned: n_used x (2 gu + d) */
+    const uint8_t **dev_gate_ptrs = nullptr, **dev_up_ptrs = nullptr, **dev_down_ptrs = nullptr;
+    float *dev_mid = nullptr, *dev_partial = nullptr, *dev_weights = nullptr;
+};
+static k3_moe_pool g_k3_moe;
+
+static bool k3_moe_pool_ensure(uint32_t n_used, uint32_t ff, uint32_t latent) {
+    k3_moe_pool &p = g_k3_moe;
+    if (p.n_used == n_used && p.ff == ff && p.latent == latent) return true;
+    const size_t gu = (size_t)ff * (latent / 32u) * 17u, d = (size_t)latent * (ff / 32u) * 17u;
+    if (cudaMalloc(&p.dev_gate, gu * n_used) != cudaSuccess || cudaMalloc(&p.dev_up, gu * n_used) != cudaSuccess ||
+        cudaMalloc(&p.dev_down, d * n_used) != cudaSuccess ||
+        cudaMallocHost((void **)&p.host_stage, (2u * gu + d) * n_used) != cudaSuccess ||
+        cudaMalloc(&p.dev_gate_ptrs, sizeof(void *) * n_used) != cudaSuccess ||
+        cudaMalloc(&p.dev_up_ptrs, sizeof(void *) * n_used) != cudaSuccess ||
+        cudaMalloc(&p.dev_down_ptrs, sizeof(void *) * n_used) != cudaSuccess ||
+        cudaMalloc(&p.dev_mid, sizeof(float) * ff * n_used) != cudaSuccess ||
+        cudaMalloc(&p.dev_partial, sizeof(float) * latent * n_used) != cudaSuccess ||
+        cudaMalloc(&p.dev_weights, sizeof(float) * n_used) != cudaSuccess) {
+        fprintf(stderr, "ds4: kimi-k3 expert pool allocation failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+        return false;
+    }
+    std::vector<const uint8_t *> gp(n_used), up(n_used), dp(n_used);
+    for (uint32_t e = 0; e < n_used; e++) { gp[e] = p.dev_gate + gu * e; up[e] = p.dev_up + gu * e; dp[e] = p.dev_down + d * e; }
+    cudaMemcpy(p.dev_gate_ptrs, gp.data(), sizeof(void *) * n_used, cudaMemcpyHostToDevice);
+    cudaMemcpy(p.dev_up_ptrs, up.data(), sizeof(void *) * n_used, cudaMemcpyHostToDevice);
+    cudaMemcpy(p.dev_down_ptrs, dp.data(), sizeof(void *) * n_used, cudaMemcpyHostToDevice);
+    p.n_used = n_used; p.ff = ff; p.latent = latent; p.gu_bytes = gu; p.d_bytes = d;
+    return cudaGetLastError() == cudaSuccess;
+}
+
+}  // namespace
+
+extern "C" int ds4_gpu_k3_residual_mix_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const ds4_gpu_tensor *anchors,
+                                              uint32_t n_anchor, const void *model_map, uint64_t model_size,
+                                              uint64_t norm_offset, uint64_t proj_offset, uint32_t n, float eps) {
+    if (!out || !x || n == 0u || n_anchor > 16u || (n_anchor != 0u && !anchors)) return 0;
+    const int tier = ds4_tensor_device_idx(out);
+    const float *norm = glm53_cuda_weight_f32(model_map, model_size, norm_offset, n, tier, "K3 residual norm");
+    const float *proj = glm53_cuda_weight_f32(model_map, model_size, proj_offset, n, tier, "K3 residual proj");
+    if (!norm || !proj) return 0;
+    k3_residual_mix_kernel<<<1, 1024, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)x->ptr,
+        anchors ? (const float *)anchors->ptr : nullptr, n_anchor, norm, proj, n, eps);
+    return cuda_ok(cudaGetLastError(), "K3 residual mix launch");
+}
+
+extern "C" int ds4_gpu_k3_situ_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up,
+                                      uint32_t n, float beta, float beta_linear) {
+    if (!out || !gate || !up || n == 0u) return 0;
+    k3_situ_kernel<<<(n + 255u) / 256u, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)gate->ptr,
+        (const float *)up->ptr, n, beta, beta_linear);
+    return cuda_ok(cudaGetLastError(), "K3 SiTU launch");
+}
+
+extern "C" int ds4_gpu_k3_sigmoid_mul_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const ds4_gpu_tensor *gate,
+                                             uint32_t n) {
+    if (!out || !x || !gate || n == 0u) return 0;
+    k3_sigmoid_mul_kernel<<<(n + 255u) / 256u, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)x->ptr,
+        (const float *)gate->ptr, n);
+    return cuda_ok(cudaGetLastError(), "K3 sigmoid-mul launch");
+}
+
+extern "C" int ds4_gpu_k3_split_kvb_tensor(ds4_gpu_tensor *k_nope, ds4_gpu_tensor *value, const ds4_gpu_tensor *kvb,
+                                           uint32_t heads, uint32_t nope, uint32_t vdim) {
+    if (!k_nope || !value || !kvb) return 0;
+    const uint32_t n = heads * (nope + vdim);
+    k3_split_kvb_kernel<<<(n + 255u) / 256u, 256, 0, cuda_decode_stream()>>>((float *)k_nope->ptr, (float *)value->ptr,
+        (const float *)kvb->ptr, heads, nope, vdim);
+    return cuda_ok(cudaGetLastError(), "K3 kv_b split launch");
+}
+
+
+#include <cuda_fp16.h>
+/* step 48: the same store/attend kernels over a half-precision cache (DS4_K3_MLA_CACHE=f16|bf16); scores and the
+   value accumulation stay fp32 */
+template <typename TC> __device__ __forceinline__ float k3c_ld(const TC *p) { return (float)*p; }
+template <> __device__ __forceinline__ float k3c_ld<__nv_bfloat16>(const __nv_bfloat16 *p) { return __bfloat162float(*p); }
+template <> __device__ __forceinline__ float k3c_ld<__half>(const __half *p) { return __half2float(*p); }
+template <typename TC> __device__ __forceinline__ void k3c_st(TC *p, float v) { *p = (TC)v; }
+template <> __device__ __forceinline__ void k3c_st<__nv_bfloat16>(__nv_bfloat16 *p, float v) { *p = __float2bfloat16(v); }
+template <> __device__ __forceinline__ void k3c_st<__half>(__half *p, float v) { *p = __float2half(v); }
+template <typename TC>
+__global__ static void k3_mla_store_batch_kernel_t(TC *key_cache, TC *value_cache, const float *k_nope, const float *kv_raw,
+                                                   const float *value, uint32_t pos0, uint32_t heads, uint32_t nope,
+                                                   uint32_t rot, uint32_t kv_lora, uint32_t vdim) {
+    const size_t t = blockIdx.y;
+    const uint32_t pos = pos0 + (uint32_t)t;
+    k_nope += t * heads * nope; kv_raw += t * (kv_lora + rot); value += t * heads * vdim;
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t qk = nope + rot;
+    const uint32_t key_elems = heads * qk;
+    if (i < key_elems) {
+        const uint32_t h = i / qk, d = i % qk;
+        k3c_st(key_cache + ((size_t)pos * heads + h) * qk + d, d < nope ? k_nope[h * nope + d] : kv_raw[kv_lora + (d - nope)]);
+    } else if (i < key_elems + heads * vdim) {
+        const uint32_t j = i - key_elems;
+        k3c_st(value_cache + (size_t)pos * heads * vdim + j, value[j]);
+    }
+}
+template <typename TC>
+__global__ static void k3_mla_attend_batch_kernel_t(float *heads_out, const float *q, const TC *key_cache,
+                                                    const TC *value_cache, uint32_t pos0, uint32_t heads,
+                                                    uint32_t qk, uint32_t vdim, float scale) {
+    extern __shared__ float sc[];
+    __shared__ float red[32];
+    __shared__ float stats[2];
+    const uint32_t t_q = blockIdx.x, h = blockIdx.y;
+    const uint32_t n_pos = pos0 + t_q + 1u;
+    const float *qh = q + ((size_t)t_q * heads + h) * qk;
+    float local_max = -1e30f;
+    for (uint32_t t = threadIdx.x; t < n_pos; t += blockDim.x) {
+        const TC *kt = key_cache + ((size_t)t * heads + h) * qk;
+        float s = 0.0f;
+        for (uint32_t d = 0; d < qk; d++) s += qh[d] * k3c_ld(kt + d);
+        s *= scale;
+        sc[t] = s;
+        local_max = fmaxf(local_max, s);
+    }
+    for (int o = 16; o > 0; o >>= 1) local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, o));
+    if ((threadIdx.x & 31u) == 0u) red[threadIdx.x >> 5u] = local_max;
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        float m = -1e30f;
+        for (uint32_t w = 0; w < (blockDim.x >> 5u); w++) m = fmaxf(m, red[w]);
+        stats[0] = m;
+    }
+    __syncthreads();
+    const float m = stats[0];
+    float local_sum = 0.0f;
+    for (uint32_t t = threadIdx.x; t < n_pos; t += blockDim.x) { const float e = __expf(sc[t] - m); sc[t] = e; local_sum += e; }
+    local_sum = k3_warp_sum(local_sum);
+    if ((threadIdx.x & 31u) == 0u) red[threadIdx.x >> 5u] = local_sum;
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        float s = 0.0f;
+        for (uint32_t w = 0; w < (blockDim.x >> 5u); w++) s += red[w];
+        stats[1] = s;
+    }
+    __syncthreads();
+    const float inv = 1.0f / stats[1];
+    float *o = heads_out + ((size_t)t_q * heads + h) * vdim;
+    for (uint32_t v = threadIdx.x; v < vdim; v += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t t = 0; t < n_pos; t++) acc += sc[t] * k3c_ld(value_cache + ((size_t)t * heads + h) * vdim + v);
+        o[v] = acc * inv;
+    }
+}
+/* 0: fp32 (the original kernels), 1: f16, 2: bf16 */
+static int k3_mla_cache_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("DS4_K3_MLA_CACHE");
+        mode = !e ? 0 : !strcmp(e, "f16") ? 1 : !strcmp(e, "bf16") ? 2 : 0;
+    }
+    return mode;
+}
+extern "C" int ds4_gpu_k3_mla_cache_elem_bytes(void) { return k3_mla_cache_mode() ? 2 : 4; }
+
+extern "C" int ds4_gpu_k3_mla_store_tensor(ds4_gpu_tensor *key_cache, ds4_gpu_tensor *value_cache,
+                                           const ds4_gpu_tensor *k_nope, const ds4_gpu_tensor *kv_raw,
+                                           const ds4_gpu_tensor *value, uint32_t pos, uint32_t cache_cap,
+                                           uint32_t heads, uint32_t nope, uint32_t rot, uint32_t kv_lora, uint32_t vdim) {
+    if (!key_cache || !value_cache || !k_nope || !kv_raw || !value || pos >= cache_cap) return 0;
+    const uint32_t n = heads * (nope + rot) + heads * vdim;
+    const int cm = k3_mla_cache_mode();
+    if (cm == 1) k3_mla_store_batch_kernel_t<__half><<<dim3((n + 255u) / 256u, 1u, 1u), 256, 0, cuda_decode_stream()>>>((__half *)key_cache->ptr,
+        (__half *)value_cache->ptr, (const float *)k_nope->ptr, (const float *)kv_raw->ptr, (const float *)value->ptr, pos, heads, nope, rot, kv_lora, vdim);
+    else if (cm == 2) k3_mla_store_batch_kernel_t<__nv_bfloat16><<<dim3((n + 255u) / 256u, 1u, 1u), 256, 0, cuda_decode_stream()>>>((__nv_bfloat16 *)key_cache->ptr,
+        (__nv_bfloat16 *)value_cache->ptr, (const float *)k_nope->ptr, (const float *)kv_raw->ptr, (const float *)value->ptr, pos, heads, nope, rot, kv_lora, vdim);
+    else k3_mla_store_kernel<<<(n + 255u) / 256u, 256, 0, cuda_decode_stream()>>>((float *)key_cache->ptr,
+        (float *)value_cache->ptr, (const float *)k_nope->ptr, (const float *)kv_raw->ptr, (const float *)value->ptr,
+        pos, heads, nope, rot, kv_lora, vdim);
+    return cuda_ok(cudaGetLastError(), "K3 MLA cache store launch");
+}
+
+extern "C" int ds4_gpu_k3_mla_attend_tensor(ds4_gpu_tensor *heads_out, const ds4_gpu_tensor *q,
+                                            const ds4_gpu_tensor *key_cache, const ds4_gpu_tensor *value_cache,
+                                            uint32_t n_pos, uint32_t heads, uint32_t qk, uint32_t vdim) {
+    if (!heads_out || !q || !key_cache || !value_cache || n_pos == 0u || n_pos > 8192u) return 0;
+    const float scale = 1.0f / sqrtf((float)qk);
+    const int cm = k3_mla_cache_mode();
+    if (cm == 1) k3_mla_attend_batch_kernel_t<__half><<<dim3(1u, heads, 1u), 256, n_pos * sizeof(float), cuda_decode_stream()>>>((float *)heads_out->ptr,
+        (const float *)q->ptr, (const __half *)key_cache->ptr, (const __half *)value_cache->ptr, n_pos - 1u, heads, qk, vdim, scale);
+    else if (cm == 2) k3_mla_attend_batch_kernel_t<__nv_bfloat16><<<dim3(1u, heads, 1u), 256, n_pos * sizeof(float), cuda_decode_stream()>>>((float *)heads_out->ptr,
+        (const float *)q->ptr, (const __nv_bfloat16 *)key_cache->ptr, (const __nv_bfloat16 *)value_cache->ptr, n_pos - 1u, heads, qk, vdim, scale);
+    else k3_mla_attend_kernel<<<heads, 256, n_pos * sizeof(float), cuda_decode_stream()>>>((float *)heads_out->ptr,
+        (const float *)q->ptr, (const float *)key_cache->ptr, (const float *)value_cache->ptr, n_pos, heads, qk, vdim,
+        scale);
+    return cuda_ok(cudaGetLastError(), "K3 MLA attention launch");
+}
+
+extern "C" int ds4_gpu_k3_kda_decode(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *conv_state, ds4_gpu_tensor *recurrent_state,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *raw_gate, const ds4_gpu_tensor *raw_beta, const ds4_gpu_tensor *output_gate,
+        const void *model_map, uint64_t model_size,
+        uint64_t q_conv_offset, uint64_t k_conv_offset, uint64_t v_conv_offset,
+        uint64_t a_log_offset, uint64_t dt_bias_offset, uint64_t output_norm_offset,
+        uint32_t n_heads, float gate_lower_bound, float norm_eps, int a_log_per_channel) {
+    if (!out || !conv_state || !recurrent_state || !q || !k || !v || !raw_gate || !raw_beta || !output_gate ||
+        n_heads == 0u || gate_lower_bound >= 0.0f) {
+        return 0;
+    }
+    const uint64_t projection = (uint64_t)n_heads * K3_KDA_DIM;
+    const int tier = ds4_tensor_device_idx(out);
+    const float *qw = glm53_cuda_weight_f32(model_map, model_size, q_conv_offset, projection * 4u, tier, "K3 KDA q conv");
+    const float *kw = glm53_cuda_weight_f32(model_map, model_size, k_conv_offset, projection * 4u, tier, "K3 KDA k conv");
+    const float *vw = glm53_cuda_weight_f32(model_map, model_size, v_conv_offset, projection * 4u, tier, "K3 KDA v conv");
+    const float *a_log = glm53_cuda_weight_f32(model_map, model_size, a_log_offset,
+        a_log_per_channel ? K3_KDA_DIM : n_heads, tier, "K3 KDA A_log");
+    const float *dt_bias = glm53_cuda_weight_f32(model_map, model_size, dt_bias_offset, projection, tier, "K3 KDA dt bias");
+    const float *o_norm = glm53_cuda_weight_f32(model_map, model_size, output_norm_offset, K3_KDA_DIM, tier, "K3 KDA o norm");
+    if (!qw || !kw || !vw || !a_log || !dt_bias || !o_norm) return 0;
+    const dim3 grid(1u, n_heads, 1u);
+    if (a_log_per_channel) {
+        k3_kda_decode_kernel<true><<<grid, K3_KDA_DIM, 0, cuda_decode_stream()>>>(
+            (float *)out->ptr, (float *)conv_state->ptr, (float *)recurrent_state->ptr, (const float *)q->ptr,
+            (const float *)k->ptr, (const float *)v->ptr, (const float *)raw_gate->ptr, (const float *)raw_beta->ptr,
+            (const float *)output_gate->ptr, qw, kw, vw, a_log, dt_bias, o_norm, n_heads, 1u, gate_lower_bound, norm_eps);
+    } else {
+        k3_kda_decode_kernel<false><<<grid, K3_KDA_DIM, 0, cuda_decode_stream()>>>(
+            (float *)out->ptr, (float *)conv_state->ptr, (float *)recurrent_state->ptr, (const float *)q->ptr,
+            (const float *)k->ptr, (const float *)v->ptr, (const float *)raw_gate->ptr, (const float *)raw_beta->ptr,
+            (const float *)output_gate->ptr, qw, kw, vw, a_log, dt_bias, o_norm, n_heads, 1u, gate_lower_bound, norm_eps);
+    }
+    return cuda_ok(cudaGetLastError(), "K3 KDA decode launch");
+}
+
+/* Routed experts for one token: read the selected experts through the K3 expert source (n_used threads), upload,
+ * gate/up with SiTU, down, weighted combine. out[latent] = sum_e w_e * expert_e(x). */
+extern "C" int ds4_gpu_k3_moe_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const int32_t *selected,
+                                     const float *weights, uint32_t n_used, uint64_t gate_offset, uint64_t up_offset,
+                                     uint64_t down_offset, uint32_t ff, uint32_t latent, float beta, float beta_linear) {
+    if (!out || !x || !selected || !weights || n_used == 0u || n_used > 64u) return 0;
+    if (!k3_moe_pool_ensure(n_used, ff, latent)) return 0;
+    k3_moe_pool &p = g_k3_moe;
+    cudaStream_t stream = cuda_decode_stream();
+    /* the stage buffers are reused: previous uploads must have landed */
+    if (!cuda_ok(cudaStreamSynchronize(stream), "K3 MoE stage sync")) return 0;
+    std::vector<int> ok(n_used, 1);
+    std::vector<std::thread> workers;
+    for (uint32_t e = 0; e < n_used; e++) {
+        workers.emplace_back([&, e]() {
+            uint8_t *stage = p.host_stage + (size_t)e * (2u * p.gu_bytes + p.d_bytes);
+            const uint64_t id = (uint64_t)selected[e];
+            ok[e] = ds4_k3_expert_source_read(gate_offset + id * p.gu_bytes, p.gu_bytes, stage) &&
+                    ds4_k3_expert_source_read(up_offset + id * p.gu_bytes, p.gu_bytes, stage + p.gu_bytes) &&
+                    ds4_k3_expert_source_read(down_offset + id * p.d_bytes, p.d_bytes, stage + 2u * p.gu_bytes);
+        });
+    }
+    for (auto &w : workers) w.join();
+    for (uint32_t e = 0; e < n_used; e++) if (!ok[e]) { fprintf(stderr, "ds4: K3 expert read failed\n"); return 0; }
+    for (uint32_t e = 0; e < n_used; e++) {
+        const uint8_t *stage = p.host_stage + (size_t)e * (2u * p.gu_bytes + p.d_bytes);
+        if (cudaMemcpyAsync(p.dev_gate + p.gu_bytes * e, stage, p.gu_bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess ||
+            cudaMemcpyAsync(p.dev_up + p.gu_bytes * e, stage + p.gu_bytes, p.gu_bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess ||
+            cudaMemcpyAsync(p.dev_down + p.d_bytes * e, stage + 2u * p.gu_bytes, p.d_bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) {
+            return cuda_ok(cudaGetLastError(), "K3 expert upload");
+        }
+    }
+    if (cudaMemcpyAsync(p.dev_weights, weights, sizeof(float) * n_used, cudaMemcpyHostToDevice, stream) != cudaSuccess) {
+        return cuda_ok(cudaGetLastError(), "K3 expert weights upload");
+    }
+    const dim3 gu_grid((ff + 7u) / 8u, n_used), d_grid((latent + 7u) / 8u, n_used);
+    k3_moe_gate_up_kernel<<<gu_grid, 256, 0, stream>>>(p.dev_mid, p.dev_gate_ptrs, p.dev_up_ptrs, (const float *)x->ptr,
+                                                       ff, latent, beta, beta_linear);
+    k3_moe_down_kernel<<<d_grid, 256, 0, stream>>>(p.dev_partial, p.dev_down_ptrs, p.dev_mid, latent, ff);
+    k3_moe_combine_kernel<<<(latent + 255u) / 256u, 256, 0, stream>>>((float *)out->ptr, p.dev_partial, p.dev_weights,
+                                                                      n_used, latent);
+    return cuda_ok(cudaGetLastError(), "K3 MoE launch");
+}
+
+/* ------------------------------------------------------------------------------------------------------------
+ * Raw-v1 expert pipeline (2026-10-31). One 17,547,264-byte file per expert: w1 packed, w1 scale, w2 packed,
+ * w2 scale, w3 packed, w3 scale (packed = e2m1 nibbles, byte i of a 32-element block holds elements 2i (low) and
+ * 2i+1 (high); scale = one e8m0 byte per block). A persistent reader pool reads each selected file whole
+ * (O_DIRECT when possible) into its pinned slot and issues that slot's H2D copy on an upload stream the moment it
+ * lands; the GEMVs consume the raw planes, so nothing is repacked on the host.
+ * ------------------------------------------------------------------------------------------------------------ */
+#include <condition_variable>
+#include <list>
+#include <deque>
+#include <mutex>
+#include <thread>
+
+namespace {
+
+/* ---- raw-v1 expert GEMVs: one warp per output row; the row's MXFP4 bytes are held in registers (up to 4 x 16 B +
+   4 scales per lane, rows of up to 4096 elements) and dotted with every token that routed to the expert, so an
+   expert's bytes are read from HBM once per row however many tokens use it. That is what makes the batched prompt
+   pass pay: the expert is read from disk once per layer and applied to all of its tokens. */
+template <int CH>
+struct k3_raw_row {
+    uint4 p[CH];
+    float d[CH];
+};
+template <int CH>
+__device__ __forceinline__ void k3_raw_row_load(k3_raw_row<CH> &r, const uint8_t *packed_row,
+                                                const uint8_t *scale_row, uint32_t blocks) {
+    const uint32_t lane = threadIdx.x & 31u;
+#pragma unroll
+    for (int c = 0; c < CH; c++) {
+        const uint32_t j = lane + 32u * (uint32_t)c;
+        if (j < blocks) {
+            r.p[c] = *reinterpret_cast<const uint4 *>(packed_row + (size_t)j * 16u);
+            const uint32_t e = scale_row[j];
+            r.d[c] = e == 255u ? __int_as_float(0x7fffffff) : exp2f((float)e - 127.0f);
+        } else {
+            r.p[c] = make_uint4(0u, 0u, 0u, 0u);
+            r.d[c] = 0.0f;
+        }
+    }
+}
+template <int CH>
+__device__ __forceinline__ float k3_raw_row_dot_x(const k3_raw_row<CH> &r, const float *x, uint32_t blocks,
+                                                  const float *tbl) {
+    const uint32_t lane = threadIdx.x & 31u;
+    float acc = 0.0f;
+#pragma unroll
+    for (int c = 0; c < CH; c++) {
+        const uint32_t j = lane + 32u * (uint32_t)c;
+        if (j < blocks) {
+            const float *xb = x + (size_t)j * 32u;
+            const uint32_t w[4] = {r.p[c].x, r.p[c].y, r.p[c].z, r.p[c].w};
+            float s = 0.0f;
+#pragma unroll
+            for (uint32_t q = 0; q < 4u; q++) {
+#pragma unroll
+                for (uint32_t b = 0; b < 4u; b++) {
+                    const uint32_t byte = (w[q] >> (8u * b)) & 0xffu;
+                    const uint32_t i = q * 4u + b;
+                    s = fmaf(tbl[byte & 0x0fu], xb[2u * i], s);
+                    s = fmaf(tbl[byte >> 4], xb[2u * i + 1u], s);
+                }
+            }
+            acc = fmaf(r.d[c], s, acc);
+        }
+    }
+    return k3_warp_sum(acc);
+}
+
+/* grid ceil(ff/8), block 256, one expert slab: mid[j*ff + r] = situ(w1[r].x[tok[j]], w3[r].x[tok[j]]) for the
+   n_tok tokens listed in tok (row indices into x). */
+__global__ static void k3_raw_gate_up_multi_kernel(float *mid, const uint8_t *slab, const float *x, const uint32_t *tok,
+                                                   uint32_t n_tok, uint32_t ff, uint32_t latent, size_t w1p, size_t w1s,
+                                                   size_t w3p, size_t w3s, float b, float bl) {
+    __shared__ float tbl[16];
+    if (threadIdx.x < 16u) tbl[threadIdx.x] = k3_e2m1_table[threadIdx.x];
+    __syncthreads();
+    const uint32_t r = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    if (r >= ff) return;
+    const uint32_t blocks = latent / 32u;
+    const size_t prow = (size_t)latent / 2u;
+    k3_raw_row<4> w1, w3;
+    k3_raw_row_load<4>(w1, slab + w1p + (size_t)r * prow, slab + w1s + (size_t)r * blocks, blocks);
+    k3_raw_row_load<4>(w3, slab + w3p + (size_t)r * prow, slab + w3s + (size_t)r * blocks, blocks);
+    for (uint32_t j = 0; j < n_tok; j++) {
+        const float *xj = x + (size_t)tok[j] * latent;
+        const float g = k3_raw_row_dot_x<4>(w1, xj, blocks, tbl);
+        const float u = k3_raw_row_dot_x<4>(w3, xj, blocks, tbl);
+        if ((threadIdx.x & 31u) == 0u) mid[(size_t)j * ff + r] = k3_situ_dev(g, u, b, bl);
+    }
+}
+
+/* grid ceil(latent/8): out[tok[j]*latent + c] += tw[j] * (w2[c] . mid[j]). The weighted expert output accumulates
+   straight into each token's row; the experts of one layer run in stream order, so no atomics are needed. */
+__global__ static void k3_raw_down_acc_kernel(float *out, const uint8_t *slab, const float *mid, const uint32_t *tok,
+                                              const float *tw, uint32_t n_tok, uint32_t ff, uint32_t latent, size_t w2p,
+                                              size_t w2s) {
+    __shared__ float tbl[16];
+    if (threadIdx.x < 16u) tbl[threadIdx.x] = k3_e2m1_table[threadIdx.x];
+    __syncthreads();
+    const uint32_t c = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    if (c >= latent) return;
+    const uint32_t blocks = ff / 32u;
+    k3_raw_row<4> w2;
+    k3_raw_row_load<4>(w2, slab + w2p + (size_t)c * ((size_t)ff / 2u), slab + w2s + (size_t)c * blocks, blocks);
+    for (uint32_t j = 0; j < n_tok; j++) {
+        const float v = k3_raw_row_dot_x<4>(w2, mid + (size_t)j * ff, blocks, tbl);
+        if ((threadIdx.x & 31u) == 0u) out[(size_t)tok[j] * latent + c] += tw[j] * v;
+    }
+}
+
+/* ---- step 26 (2026-11-01): transposed expert GEMVs. One warp per output row as before, but lanes stride over the
+   32 elements inside each 16-byte chunk (lane l takes element 32c + l), so activation reads are consecutive across
+   lanes; the row's packed bytes, its per-chunk scales and the activations live in shared memory. Up to
+   K3_GEMV2_MAX_TOK tokens per launch (more go to the GEMM path or the v1 kernels). Dynamic shared memory:
+   8 rows x (row bytes + blocks x 4) + n_tok x in_dim x 4 + 64. */
+#define K3_GEMV2_MAX_TOK 4
+template <int MAXT>
+__global__ static void k3_raw_gate_up_v2_kernel(float *mid, const uint8_t *slab, const float *x, const uint32_t *tok,
+                                                uint32_t n_tok, uint32_t ff, uint32_t latent, size_t w1p, size_t w1s,
+                                                size_t w3p, size_t w3s, float b, float bl) {
+    extern __shared__ __align__(16) uint8_t sm[];
+    const uint32_t blocks = latent / 32u, prow = latent / 2u;
+    float *tbl = reinterpret_cast<float *>(sm);                                  /* 16 floats */
+    float *xs = tbl + 16;                                                        /* n_tok x latent */
+    float *ds = xs + (size_t)n_tok * latent;                                     /* 8 x blocks (step 34: sized by n_tok) */
+    uint8_t *ps = reinterpret_cast<uint8_t *>(ds + 8u * blocks);                 /* 8 x prow */
+    const uint32_t warp = threadIdx.x >> 5u, lane = threadIdx.x & 31u;
+    if (threadIdx.x < 16u) tbl[threadIdx.x] = k3_e2m1_table[threadIdx.x];
+    for (uint32_t j = 0; j < n_tok; j++) {
+        const float *xj = x + (size_t)tok[j] * latent;
+        for (uint32_t i = threadIdx.x; i < latent; i += blockDim.x) xs[(size_t)j * latent + i] = xj[i];
+    }
+    const uint32_t r = blockIdx.x * 8u + warp;
+    const bool row_ok = r < ff;
+    uint8_t *prow_s = ps + (size_t)warp * prow;
+    float *d_s = ds + (size_t)warp * blocks;
+    float acc[2][MAXT];
+    float g[MAXT], u[MAXT];
+    for (int plane = 0; plane < 2; plane++) {
+        const uint8_t *packed = slab + (plane == 0 ? w1p : w3p) + (size_t)r * prow;
+        const uint8_t *scale = slab + (plane == 0 ? w1s : w3s) + (size_t)r * blocks;
+        __syncthreads();   /* previous plane's smem reads are done (also covers the x/table fill on the first pass) */
+        if (row_ok) {
+            /* coalesced copy of the row (prow bytes) and its scales into this warp's smem */
+            const uint4 *src = reinterpret_cast<const uint4 *>(packed);
+            uint4 *dst = reinterpret_cast<uint4 *>(prow_s);
+            for (uint32_t i = lane; i < prow / 16u; i += 32u) dst[i] = src[i];
+            for (uint32_t c = lane; c < blocks; c += 32u) {
+                const uint32_t e = scale[c];
+                d_s[c] = e == 255u ? __int_as_float(0x7fffffff) : exp2f((float)e - 127.0f);
+            }
+        }
+        __syncwarp();
+#pragma unroll
+        for (int j = 0; j < MAXT; j++) acc[plane][j] = 0.0f;
+        if (row_ok) {
+            const uint32_t shift = 4u * (lane & 1u), half = lane >> 1u;
+#pragma unroll 8
+            for (uint32_t c = 0; c < blocks; c++) {
+                const uint32_t byte = prow_s[c * 16u + half];
+                const float v = tbl[(byte >> shift) & 0xfu] * d_s[c];
+                const float *xc = xs + (size_t)c * 32u + lane;
+#pragma unroll
+                for (int j = 0; j < MAXT; j++) if (j < (int)n_tok) acc[plane][j] = fmaf(v, xc[(size_t)j * latent], acc[plane][j]);
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < MAXT; j++) { g[j] = k3_warp_sum(acc[0][j]); u[j] = k3_warp_sum(acc[1][j]); }
+    if (row_ok && lane == 0u) {
+#pragma unroll
+        for (int j = 0; j < MAXT; j++) if (j < (int)n_tok) mid[(size_t)j * ff + r] = k3_situ_dev(g[j], u[j], b, bl);
+    }
+}
+
+template <int MAXT>
+__global__ static void k3_raw_down_v2_kernel(float *out, const uint8_t *slab, const float *mid, const uint32_t *tok,
+                                             const float *tw, uint32_t n_tok, uint32_t ff, uint32_t latent, size_t w2p,
+                                             size_t w2s) {
+    extern __shared__ __align__(16) uint8_t sm[];
+    const uint32_t blocks = ff / 32u, prow = ff / 2u;
+    float *tbl = reinterpret_cast<float *>(sm);
+    float *ms = tbl + 16;                                                        /* n_tok x ff */
+    float *ds = ms + (size_t)n_tok * ff;                                         /* step 34: sized by n_tok */
+    uint8_t *ps = reinterpret_cast<uint8_t *>(ds + 8u * blocks);
+    const uint32_t warp = threadIdx.x >> 5u, lane = threadIdx.x & 31u;
+    if (threadIdx.x < 16u) tbl[threadIdx.x] = k3_e2m1_table[threadIdx.x];
+    for (uint32_t j = 0; j < n_tok; j++)
+        for (uint32_t i = threadIdx.x; i < ff; i += blockDim.x) ms[(size_t)j * ff + i] = mid[(size_t)j * ff + i];
+    const uint32_t c0 = blockIdx.x * 8u + warp;
+    const bool row_ok = c0 < latent;
+    uint8_t *prow_s = ps + (size_t)warp * prow;
+    float *d_s = ds + (size_t)warp * blocks;
+    __syncthreads();
+    if (row_ok) {
+        const uint4 *src = reinterpret_cast<const uint4 *>(slab + w2p + (size_t)c0 * prow);
+        uint4 *dst = reinterpret_cast<uint4 *>(prow_s);
+        for (uint32_t i = lane; i < prow / 16u; i += 32u) dst[i] = src[i];
+        const uint8_t *scale = slab + w2s + (size_t)c0 * blocks;
+        for (uint32_t c = lane; c < blocks; c += 32u) {
+            const uint32_t e = scale[c];
+            d_s[c] = e == 255u ? __int_as_float(0x7fffffff) : exp2f((float)e - 127.0f);
+        }
+    }
+    __syncwarp();
+    float acc[MAXT];
+#pragma unroll
+    for (int j = 0; j < MAXT; j++) acc[j] = 0.0f;
+    if (row_ok) {
+        const uint32_t shift = 4u * (lane & 1u), half = lane >> 1u;
+#pragma unroll 8
+        for (uint32_t c = 0; c < blocks; c++) {
+            const uint32_t byte = prow_s[c * 16u + half];
+            const float v = tbl[(byte >> shift) & 0xfu] * d_s[c];
+            const float *mc = ms + (size_t)c * 32u + lane;
+#pragma unroll
+            for (int j = 0; j < MAXT; j++) if (j < (int)n_tok) acc[j] = fmaf(v, mc[(size_t)j * ff], acc[j]);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < MAXT; j++) {
+        const float s = k3_warp_sum(acc[j]);
+        if (row_ok && lane == 0u && j < (int)n_tok) out[(size_t)tok[j] * latent + c0] += tw[j] * s;
+    }
+}
+/* out[c] = sum over the union's experts (fixed order) of part[idx][c]: deterministic decode accumulation */
+__global__ static void k3_part_reduce_kernel(float *out, const float *part, uint32_t n_part, uint32_t n_tok, uint32_t latent) {
+    const uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t row = (size_t)n_tok * latent;
+    if (c >= row) return;
+    float acc = 0.0f;
+    for (uint32_t i = 0; i < n_part; i++) acc += part[(size_t)i * row + c];
+    out[c] = acc;
+}
+/* step 76: out[t][c] = sum over the token's slots, in the router's order, of the compact rows (0xFFFFFFFF = skipped slot) */
+__global__ static void k3_tent_reduce_kernel(float *out, const float *cpart, const uint32_t *tent, uint32_t n_tok, uint32_t n_used, uint32_t latent) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_tok * latent) return;
+    const uint32_t t = i / latent, c = i % latent;
+    float acc = 0.0f;
+    for (uint32_t k = 0; k < n_used; k++) { const uint32_t j = tent[(size_t)t * n_used + k]; if (j != 0xFFFFFFFFu) acc += cpart[(size_t)j * latent + c]; }
+    out[i] = acc;
+}
+static size_t k3_gemv2_smem_gate_up_n(uint32_t latent, uint32_t n_tok) {
+    return 64u + (size_t)n_tok * latent * 4u + 8u * (latent / 32u) * 4u + 8u * (latent / 2u);
+}
+static size_t k3_gemv2_smem_down_n(uint32_t ff, uint32_t n_tok) {
+    return 64u + (size_t)n_tok * ff * 4u + 8u * (ff / 32u) * 4u + 8u * (ff / 2u);
+}
+static size_t k3_gemv2_smem_gate_up(uint32_t ff, uint32_t latent) {
+    (void)ff;
+    return 64u + (size_t)K3_GEMV2_MAX_TOK * latent * 4u + 8u * (latent / 32u) * 4u + 8u * (latent / 2u);
+}
+static size_t k3_gemv2_smem_down(uint32_t ff, uint32_t latent) {
+    (void)latent;
+    return 64u + (size_t)K3_GEMV2_MAX_TOK * ff * 4u + 8u * (ff / 32u) * 4u + 8u * (ff / 2u);
+}
+
+static inline double k3_now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+struct k3_raw_job { uint32_t layer, expert; int dev, host; bool read; bool bulk; bool prefetch; uint32_t off, len; double t_enq; };   /* bulk: a prompt pass's fill; prefetch: for the next layer; off/len: the chunk (step 38); t_enq: enqueue time (step 44) */
+
+/* Step 25 (2026-11-01): two LRU caches of whole expert files replace the 16-slot ring. A disk read lands in a pinned
+   host slab and is uploaded into a device slab; a later request for the same (layer, expert) is served from the
+   device slab (no read, no upload) or from the host slab (upload only). Decode inserts at the hot end; prompt passes
+   insert at the cold end so a long prompt's union does not flush the decode working set. Measured on eight chat
+   prompts: an LRU of ~3,700 experts serves ~49 % of decode reads. Physical reuse of a slab is gated by events (a host
+   slab's upload must have left it; a device slab's kernels must have retired); the maps are the main thread's. */
+static const uint64_t K3_NOKEY = ~0ull;
+struct k3_lru {
+    uint32_t cap = 0;
+    std::vector<uint64_t> key;                      /* slab -> key or K3_NOKEY */
+    const std::unordered_map<uint64_t, uint32_t> *twin_map = nullptr; uint32_t bias_window = 0;   /* step 75: the other level's map */
+    std::vector<uint8_t> pinned;                    /* slab -> 1 while a pending job owns it: not evictable */
+    std::vector<uint8_t> filling;                   /* slab -> 1 from enqueue until its fill was seen */
+    std::vector<uint8_t> transient;                 /* slab -> 1 when inserted by a prompt pass (evicted first) */
+    std::vector<uint8_t> chance;                    /* slab -> extra passes through the LRU before eviction (cold-tier entries) */
+    uint8_t cold_chance = 1;                        /* DS4_K3_CACHE_COLD_CHANCE */
+    /* DS4_K3_CACHE_POLICY=decay: eviction by a decayed use count (log domain, decay per token = DS4_K3_CACHE_DECAY,
+       default 0.9; a token = 92 layer calls) found by sampling 64 unpinned slabs; the list order is then unused.
+       Simulated on eight chat prompts at 1,584 slabs: LRU 30 %, decayed 35 % hits (Belady 55 %). */
+    bool decay_mode = false;
+    double tick = 0.0, lb = 0.0;                    /* tick advances per layer call; lb = -ln(decay) / 92 */
+    std::vector<float> score;
+    uint32_t rng = 12345u;
+    static float lse(float a, float b) { const float m = a > b ? a : b; return m + log1pf(expf(-fabsf(a - b))); }
+    void use(uint32_t s) { score[s] = lse(score[s], (float)(tick * lb)); }
+    std::list<uint32_t> order;                      /* front = hot ... back = cold */
+    std::vector<std::list<uint32_t>::iterator> pos;
+    std::unordered_map<uint64_t, uint32_t> map;
+    void init(uint32_t n) {
+        cap = n; key.assign(n, K3_NOKEY); pinned.assign(n, 0); filling.assign(n, 0); transient.assign(n, 1); pos.resize(n);
+        chance.assign(n, 0);
+        { const char *cc = getenv("DS4_K3_CACHE_COLD_CHANCE"); cold_chance = cc ? (uint8_t)(atoi(cc) < 0 ? 0 : atoi(cc) > 8 ? 8 : atoi(cc)) : 1; }
+        score.assign(n, -1e30f);
+        const char *pol = getenv("DS4_K3_CACHE_POLICY");
+        decay_mode = pol && !strcmp(pol, "decay");
+        const char *dc = getenv("DS4_K3_CACHE_DECAY");
+        double decay = dc ? atof(dc) : 0.9;
+        if (!(decay > 0.0 && decay < 1.0)) decay = 0.9;
+        lb = -log(decay) / 92.0;
+        order.clear(); map.clear(); map.reserve(n * 2u);
+        for (uint32_t s = 0; s < n; s++) { order.push_back(s); pos[s] = std::prev(order.end()); }
+    }
+    /* appends n_new slabs at the cold end */
+    void grow(uint32_t n_new) {
+        const uint32_t n0 = cap;
+        cap += n_new; key.resize(cap, K3_NOKEY); pinned.resize(cap, 0); filling.resize(cap, 0); transient.resize(cap, 1); pos.resize(cap);
+        chance.resize(cap, 0);
+        score.resize(cap, -1e30f);
+        for (uint32_t s = n0; s < cap; s++) { order.push_back(s); pos[s] = std::prev(order.end()); }
+    }
+    int lookup(uint64_t k, bool touch) {
+        auto it = map.find(k);
+        if (it == map.end()) return -1;
+        const uint32_t s = it->second;
+        if (touch) { order.erase(pos[s]); order.push_front(s); pos[s] = order.begin(); transient[s] = 0; if (decay_mode) use(s); }
+        return (int)s;
+    }
+    /* takes the coldest unpinned slab for key k (hot: front of the order, else back); -1 if every slab is pinned */
+    int alloc(uint64_t k, bool hot, uint64_t *evicted = nullptr, bool protect = false) {
+        /* a prompt pass (hot = false) recycles transient slabs first so that it never pushes out the decode working
+           set beyond what it needs for its own in-flight fills; decode inserts take the coldest unpinned slab */
+        int victim = -1;
+        if (decay_mode) {
+            /* lowest score among 64 sampled unpinned slabs (transients carry -1e30, so they go first) */
+            float best = 3e38f;
+            for (uint32_t i = 0; i < 64u && i < cap; i++) {
+                rng = rng * 1664525u + 1013904223u;
+                const uint32_t s = (rng >> 8) % cap;
+                if (pinned[s]) continue;
+                if (score[s] < best) { best = score[s]; victim = (int)s; }
+            }
+            if (victim < 0) { for (uint32_t s = 0; s < cap; s++) if (!pinned[s]) { victim = (int)s; break; } }
+        } else {
+            if (hot && bias_window && twin_map) {   /* step 75: prefer a cold slab whose expert the host pool still holds */
+                uint32_t seen = 0;
+                for (auto bt = order.rbegin(); bt != order.rend() && seen < bias_window; ++bt) {
+                    const uint32_t s = *bt;
+                    if (pinned[s]) continue;
+                    if (key[s] == K3_NOKEY || transient[s]) { victim = (int)s; break; }
+                    if (chance[s]) continue;
+                    seen++;
+                    if (twin_map->count(key[s])) { victim = (int)s; break; }
+                }
+            }
+            if (victim < 0) {
+            auto it = order.rbegin();
+            while (it != order.rend()) {
+                const uint32_t s = *it;
+                if (pinned[s]) { ++it; continue; }
+                if (chance[s] && key[s] != K3_NOKEY) {
+                    /* second chance: back to the hot end; the reverse iterator keeps its base, so it now yields the
+                       entry that preceded s and the scan goes on without advancing */
+                    chance[s]--;
+                    order.erase(pos[s]); order.push_front(s); pos[s] = order.begin();
+                    continue;
+                }
+                if (hot || transient[s]) { victim = (int)s; break; }
+                if (victim < 0) victim = (int)s;   /* fallback: the coldest unpinned decode entry */
+                ++it;
+            }
+            }
+        }
+        if (victim < 0) return -1;
+        const uint32_t s = (uint32_t)victim;
+        if (evicted) *evicted = key[s];
+        drop(s);
+        key[s] = k; map[k] = s; transient[s] = hot ? 0 : 1;
+        chance[s] = protect ? cold_chance : 0;
+        score[s] = hot ? (float)(tick * lb) : -1e30f;
+        order.erase(pos[s]);
+        if (hot) { order.push_front(s); pos[s] = order.begin(); }
+        else { order.push_back(s); pos[s] = std::prev(order.end()); }
+        return (int)s;
+    }
+    void drop(uint32_t s) {
+        if (key[s] == K3_NOKEY) return;
+        auto m = map.find(key[s]);
+        if (m != map.end() && m->second == s) map.erase(m);
+        key[s] = K3_NOKEY;
+        transient[s] = 1;
+        order.erase(pos[s]); order.push_back(s); pos[s] = std::prev(order.end());
+    }
+};
+
+struct k3_raw_pool {
+    bool ready = false;
+    uint32_t ff = 0, latent = 0, max_tok = 0, max_pending = 16;
+    size_t file_bytes = 0, w1p = 0, w1s = 0, w2p = 0, w2s = 0, w3p = 0, w3s = 0;
+    uint8_t *host_raw = nullptr, *host = nullptr;
+    std::vector<uint8_t *> dev_ptr;                 /* device slab -> address (several regions: the cache grows once) */
+    bool grown = false;
+    k3_lru hc, dc;                                  /* host (pinned) and device caches */
+    std::vector<cudaEvent_t> host_free, dev_free, dev_ready;
+    std::vector<int> dev_host;                      /* device slab -> host slab of its pending job */
+    std::vector<uint8_t> hhit;                      /* step 75: device slab -> 1 when its pending job is a host-hit upload */
+    cudaStream_t up_stream = nullptr;
+    cudaStream_t up_streams[8] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};   /* step 63: slab d uploads on up_streams[d % n_up] */
+    uint32_t n_up = 1;
+    cudaStream_t cp_streams[8] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};   /* step 64: slab d copies down on cp_streams[d % n_cp] */
+    uint32_t n_cp = 1;
+    cudaStream_t copy_stream = nullptr;               /* step 28: victim copy-downs (device -> pinned host) */
+    int victim = 1;                                   /* DS4_K3_CACHE_VICTIM (1): the host cache holds device evictions */
+    int pool_first = 0;  /* step 74: DS4_K3_POOL_FIRST */
+    int pool_keep = 0;   /* step 75: DS4_K3_POOL_KEEP */
+    cudaEvent_t lists_uploaded = nullptr;
+    float *dev_mid = nullptr;                       /* max_tok x ff: experts are serialised on the decode stream */
+    float *dev_part = nullptr;                      /* decode (n_tok = 1): one latent row per expert of the union, reduced in a fixed
+                                                       order so the token's output does not depend on arrival order */
+    uint32_t part_cap = 0;
+    uint32_t *host_tok = nullptr, *dev_tok = nullptr; /* (token, weight) lists grouped by expert: pinned + device */
+    uint32_t *host_tent = nullptr, *dev_tent = nullptr, *dev_iota = nullptr; float *dev_cpart = nullptr; size_t cpart_cap = 0;   /* step 76 */
+    float *host_tw = nullptr, *dev_tw = nullptr;
+    size_t list_cap = 0;
+    int device = 0, direct = 1;
+    std::mutex mu;
+    std::condition_variable cv_job, cv_done;
+    std::deque<k3_raw_job> jobs;
+    std::deque<uint32_t> ready_q;                   /* device slabs whose fill (read + upload) was issued */
+    std::vector<uint32_t> failed_slabs;
+    int failed = 0;
+    std::atomic<uint64_t> bytes{0}, hits_dev{0}, hits_host{0}, misses{0}, copydowns{0};
+    /* step 29: next-layer prefetch (hints come from the router prediction in the decode path) */
+    uint32_t hint_layer = ~0u, hint_n = 0;
+    int32_t hint_e[256];
+    int pf_mode = 0;                                  /* DS4_K3_PREFETCH: 0 off, 1 cold-tier candidates, 2 any tier */
+    uint32_t pf_max = 2, pf_rank = 8, pf_inflight_max = 4, pf_pending = 0;
+    uint32_t pf_tail_pending = 2;                     /* step 40: in 'all' mode a decode layer prefetches once its last fill is enqueued
+                                                         and at most this many are still in flight, i.e. during the GPU tail when both
+                                                         drives idle (after the tier swap the RAID burst sets the layer pace) */
+    std::vector<uint8_t> wanted;                      /* device slab -> 1 while the current layer waits for its fill */
+    std::vector<uint8_t> cold_job;                    /* device slab -> 1 while its pending fill reads the Samsung tier */
+    std::atomic<uint64_t> pf_issued{0}, pf_adopted{0};
+    std::atomic<uint64_t> pf_hit{0}, q_wait_us{0}, q_waits{0};   /* step 44: prompt-pass prefetches hit later on the device; demand reads' time in the queue */
+    int verify = 0;                                   /* step 44: a verification batch keeps decode policies (ds4_gpu_k3_set_verify) */
+    int split_decode_only = 0;                        /* step 49: DS4_K3_SPLIT_DECODE_ONLY: prompt-pass fills stay whole-file */
+    /* step 57: cache-aware expert skipping (decode and verification rows only): a routed expert that is neither in the
+       device cache nor in the host cache nor in flight costs a disk read (~3 ms on the layer's critical path); when its
+       normalised router weight is below skip_wmin it is dropped and the kept weights are rescaled (DS4_K3_EXPERT_SKIP=1;
+       2 observes only). Updated by the decode thread alone. */
+    int skip_mode = 0;
+    float skip_wmin = 0.03f;
+    uint32_t skip_max = 0, skip_keep_min = 8;
+    int skip_renorm = 1;
+    uint64_t skipped = 0, skip_mass_e6 = 0, skip_obs_n = 0;
+    uint64_t skip_obs[6] = {0, 0, 0, 0, 0, 0};       /* disk-miss experts by weight: <.01 <.02 <.03 <.04 <.06 >=.06 */
+    /* step 30: side streams for the decode GEMVs */
+    uint32_t ms_n = 0, ms_next = 0;
+    cudaStream_t ms_stream[8];
+    cudaEvent_t ms_fork = nullptr, ms_join[8];
+    float *ms_mid = nullptr;                          /* ms_n x ff */
+    /* step 31: cap on Samsung-tier reads in flight */
+    uint32_t cold_limit = 4, cold_now = 0;
+    std::condition_variable cv_cold;
+    /* step 35: tier C (a further copy on slower storage) takes bulk cold reads while more than green_backlog cold fills remain
+       in the layer (a tier C read takes ~90 ms, so it must never become a layer's tail); prompt passes prefetch the
+       next layer's predicted cold experts so the disks stay busy through the GPU tail and the next attention */
+    uint32_t green_limit = 0, green_now = 0, green_backlog = 24, cold_backlog = 0;
+    double cold_ewma_ms = 8.0, green_ewma_ms = 60.0;  /* step 36c: recent read times per tier; a tier C read is taken only
+                                                         while the Samsung would need longer than that to drain the backlog */
+    std::atomic<uint64_t> green_reads{0};
+    int bulk_pf_mode = 1;
+    uint32_t bulk_pf_max = 96, bulk_pf_inflight = 96;
+    uint32_t bulk_pf_div = 20;                        /* step 36b: prefetch at most n_tok / bulk_pf_div experts per layer: the idle
+                                                         disk time a layer leaves is ~80 us per prompt token (attention + routing +
+                                                         GPU tail), i.e. one 17.5 MB cold read per ~20 tokens at 10 GB/s (Samsung + tier C) */
+    std::deque<k3_raw_job> cold_q;                    /* step 36: cold jobs waiting for a tier slot (readers stay free for RAID jobs) */
+    std::vector<uint8_t> pf_slab;                     /* device slab -> 1 while a prefetch pins it (until the target layer consumes or skips it) */
+    std::vector<uint32_t> pf_list;
+    /* step 38 (argodrive port): an expert file is read as `split` page-aligned chunks; with eta_mode each chunk is homed on
+       the tier (0 RAID, 1 Samsung, 2 tier C) that holds the file and is expected to finish it first: max((outstanding
+       chunks + 1) x bytes / aggregate rate, bytes / per-stream rate), per-tier caps (0 = none). The per-stream rate is
+       measured as chunks land, so a slow copy (tier C through FUSE + NFS at 0.5 GB/s per stream) is never picked when it
+       would land after the other home. Byte identity does not depend on the home. */
+    uint32_t split = 1;
+    int eta_mode = 0;
+    uint32_t bulk_eta_backlog = 16;                   /* step 60: eta_mode 2 homes a prompt pass's demand chunk by throughput share once the RAID has this many chunks in flight */
+    double bulk_depth[4] = {6.0, 6.0, 12.0, 12.0};          /* step 60b: target chunks in flight per tier for bulk homing (bandwidth x latency) */
+    std::atomic<uint32_t> bulk_left{0};               /* step 60c: fills of the current prompt-pass layer not yet enqueued */
+    uint32_t green_tail_guard = 100;                  /* step 60c: tier C takes a bulk chunk only while this many fills are still to come */
+    double agg_gbps[4] = {27.0, 6.8, 3.6, 3.6}, stream_gbps[4] = {6.0, 6.7, 3.6, 3.6}, meas_gbps[4] = {0.0, 0.0, 0.0, 0.0};   /* step 62: three-home rates measured 4 Nov */
+    uint32_t outstanding[4] = {0, 0, 0, 0}, tier_cap[4] = {0, 4, 8, 8};
+    uint32_t dird_limit = 0;                          /* step 67: tier D (DS4_K3_EXPERT_DIR_D) chunks in flight; 0 = no tier D */
+    std::atomic<uint64_t> tier_chunks[4] = {{0}, {0}, {0}, {0}};
+    std::atomic<uint64_t> tier_bytes[4] = {{0}, {0}, {0}, {0}};   /* step 42: bytes actually read per tier */
+    std::atomic<uint64_t> fallback_reads{0}, fallback_bytes{0};   /* reads served by a tier other than the intended one */
+    std::vector<uint8_t> chunks_left, chunk_failed;   /* device slab -> chunks still to land / any chunk failed */
+    /* step 68 (diagnostic): per-fill timeline, DS4_K3_TRACE_FILLS=<layers to print> */
+    int trace_fills = 0; uint64_t trace_fill_calls = 0, trace_fill_printed = 0;
+    std::vector<double> tf_enq, tf_pick, tf_r0, tf_r1, tf_up, tf_rdy; std::vector<int8_t> tf_tier;
+    double wait_s = 0.0;
+};
+/* Heap-allocated and never destroyed on purpose: a static pool's destructor runs pthread_cond_destroy at exit, which
+   blocks until every waiter has left, and the detached reader threads wait on cv_job forever (t8/t9 hung for hours). */
+static k3_raw_pool *g_k3_raw_ptr = nullptr;
+static k3_raw_pool &k3_raw_get(void) {
+    if (!g_k3_raw_ptr) g_k3_raw_ptr = new k3_raw_pool();
+    return *g_k3_raw_ptr;
+}
+
+/* Reader thread: takes the next job; reads the file into its host slab unless the slab already holds it (host cache
+   hit), uploads the slab into its device slab behind that slab's previous kernels, and reports the device slab. */
+static void k3_raw_worker(k3_raw_pool *p) {
+    cudaSetDevice(p->device);
+    for (;;) {
+        k3_raw_job job;
+        int tier = 0;        /* legacy mode: 1 = a Samsung slot is held, 2 = a tier C slot is held */
+        int home = -1;       /* eta mode: the tier charged for this chunk (0 RAID, 1 Samsung, 2 tier C) */
+        {
+            std::unique_lock<std::mutex> lk(p->mu);
+            if (p->eta_mode) {
+                /* step 38: least-expected-completion homing among the tiers that hold the file and have cap room */
+                auto pick = [&](const k3_raw_job &j) -> int {
+                    /* expected completion per tier = (chunks ahead + 1) x bytes / aggregate rate, floored by one chunk at the
+                       tier's per-stream rate. Chunks waiting in cold_q are all cold, so they count against the Samsung (RAID
+                       chunks never wait); that is what lets tier C win while a prompt pass has a deep backlog and lose at the
+                       end of a layer or in decode. If the best tier is at its cap the chunk waits for it. */
+                    int best = -1; double best_ms = 0.0; bool best_capped = false; bool any_home = false;
+                    const bool tpj = p->eta_mode >= 2 && j.bulk && !j.prefetch;   /* step 60c */
+                    /* deltafin's rule, symmetric: only the chunks already in flight on a tier count against it, so a shared
+                       backlog distributes itself by rate (the tier whose queue clears soonest takes the next chunk); the
+                       caps bound each queue (38e: an asymmetric variant that charged the whole layer backlog to the Samsung
+                       sent 90 % of cold chunks to tier C at 0.4 GB/s each — served long prompt 88 s against 58 s) */
+                    for (int t = 0; t < 4; t++) {
+                        if (t == 2 && p->green_limit == 0u) continue;
+                        if (t == 3 && p->dird_limit == 0u) continue;   /* step 67 */
+                        if (t >= 2 && tpj && p->bulk_left.load() < p->green_tail_guard) continue;   /* step 60c: tier C (and D) never ends a layer */
+                        if (!ds4_k3_expert_source_has_tier(j.layer, j.expert, t)) continue;
+                        any_home = true;
+                        const double ahead = (double)p->outstanding[t] + 1.0;
+                        const double agg = ahead * (double)j.len / (p->agg_gbps[t] * 1e6);
+                        const double one = (double)j.len / (p->stream_gbps[t] * 1e6);
+                        /* step 60 (eta_mode 2): a prompt pass's demand chunk, with the RAID already deep in flight, is homed by
+                           queue time alone on the secondary homes (no per-stream latency floor): the pass is bound by aggregate
+                           bandwidth, not by one chunk's latency; decode and prefetch chunks keep the completion-time rule */
+                        /* step 60b: in eta_mode 2 every bulk demand chunk is homed by queue fill relative to the tier's target
+                           depth (so a slow parallel tier such as tier C runs at its own depth while the RAID stays saturated) */
+                        const bool tp = p->eta_mode >= 2 && j.bulk && !j.prefetch;
+                        const double ms = tp ? ((double)p->outstanding[t] + 1.0) / p->bulk_depth[t] : (agg > one ? agg : one);
+                        const bool capped = p->tier_cap[t] != 0u && p->outstanding[t] >= p->tier_cap[t];
+                        if (best < 0 || ms < best_ms) { best = t; best_ms = ms; best_capped = capped; }
+                    }
+                    if (!any_home) return 3;   /* not in any listed tier: read through the directory chain, uncharged */
+                    return best_capped ? -1 : best;
+                };
+                for (;;) {
+                    bool took = false;
+                    for (auto it = p->cold_q.begin(); it != p->cold_q.end(); ++it) {
+                        const int t = pick(*it);
+                        if (t >= 0) { job = *it; p->cold_q.erase(it); home = t; took = true; break; }
+                    }
+                    if (took) break;
+                    if (!p->jobs.empty()) {
+                        job = p->jobs.front();
+                        p->jobs.pop_front();
+                        if (!job.read) break;
+                        home = pick(job);
+                        if (home >= 0) break;
+                        p->cold_q.push_back(job);   /* every home is at its cap: wait for a landing */
+                        continue;
+                    }
+                    p->cv_job.wait(lk);
+                }
+                if (home >= 0 && home < 4) p->outstanding[home]++;
+            } else {
+                /* step 36: a cold job that finds no tier slot waits in cold_q instead of holding this reader; a tier C slot
+                   takes a prefetch job at any depth (its latency is hidden by the next layer) or a layer's own job while the
+                   layer still has more than green_backlog cold fills to come (so tier C never ends a layer) */
+                auto green_ok = [&](const k3_raw_job &j) {
+                    if (!j.bulk || p->green_limit == 0u || p->green_now >= p->green_limit) return false;
+                    if (j.prefetch) return true;
+                    if (p->cold_backlog <= p->green_backlog) return false;
+                    const double drain_ms = (double)p->cold_backlog * p->cold_ewma_ms / (double)(p->cold_limit ? p->cold_limit : 1u);
+                    return drain_ms > p->green_ewma_ms * 1.25;
+                };
+                for (;;) {
+                    if (!p->cold_q.empty()) {
+                        if (p->cold_now < p->cold_limit) { job = p->cold_q.front(); p->cold_q.pop_front(); p->cold_now++; tier = 1; break; }
+                        bool took = false;
+                        for (auto it = p->cold_q.begin(); it != p->cold_q.end(); ++it) {
+                            if (green_ok(*it)) { job = *it; p->cold_q.erase(it); p->green_now++; tier = 2; took = true; break; }
+                        }
+                        if (took) break;
+                    }
+                    if (!p->jobs.empty()) {
+                        job = p->jobs.front();
+                        p->jobs.pop_front();
+                        const bool cold = job.read && p->cold_limit != 0u && !ds4_k3_expert_source_is_primary(job.layer, job.expert);
+                        if (!cold) break;
+                        if (p->cold_now < p->cold_limit) { p->cold_now++; tier = 1; break; }
+                        if (green_ok(job)) { p->green_now++; tier = 2; break; }
+                        p->cold_q.push_back(job);
+                        continue;
+                    }
+                    p->cv_job.wait(lk);
+                }
+            }
+        }
+        if (p->trace_fills && job.dev >= 0) { const double tp = k3_now_sec(); const uint32_t td = (uint32_t)job.dev; if (p->tf_pick[td] == 0.0 || tp < p->tf_pick[td]) p->tf_pick[td] = tp; }   /* step 68 */
+        if (job.read && !job.prefetch && job.t_enq > 0.0) {   /* step 44: a demand read's time in the queue */
+            p->q_wait_us += (uint64_t)((k3_now_sec() - job.t_enq) * 1e6);
+            p->q_waits++;
+        }
+        uint8_t *h = p->host + (size_t)job.host * p->file_bytes;
+        int ok = 1;
+        if (job.read) {
+            /* the slab's previous content may still be the source of an upload */
+            ok = cudaEventSynchronize(p->host_free[job.host]) == cudaSuccess;
+            const double tr0 = k3_now_sec();
+            int used = -1;
+            if (ok) {
+                const int want = p->eta_mode ? (home < 4 ? home : -1) : (tier == 2 ? 2 : -1);
+                ok = ds4_k3_expert_source_read_range_tier(job.layer, job.expert, h, job.off, job.len, p->direct, want, &used);
+            }
+            const double ms = (k3_now_sec() - tr0) * 1e3;
+            if (p->trace_fills && job.dev >= 0) { const uint32_t td = (uint32_t)job.dev; if (p->tf_r0[td] == 0.0 || tr0 < p->tf_r0[td]) p->tf_r0[td] = tr0; const double tr1 = tr0 + ms / 1e3; if (tr1 > p->tf_r1[td]) p->tf_r1[td] = tr1; p->tf_tier[td] = (int8_t)used; }   /* step 68 */
+            if (ok && used >= 0 && used < 4) {
+                p->tier_bytes[used] += job.len;
+                /* step 42: the read came from a tier other than the one dispatched to (a missing file): count it,
+                   so a benchmark can never again quietly measure the wrong device */
+                const int intended = p->eta_mode ? (home < 4 ? home : -1) : (tier == 2 ? 2 : (tier == 1 ? 1 : -1));
+                if (intended >= 0 && used != intended) { p->fallback_reads++; p->fallback_bytes += job.len; }
+            }
+            {
+                std::lock_guard<std::mutex> lk(p->mu);
+                if (p->eta_mode) {
+                    if (home >= 0 && home < 4) {
+                        if (p->outstanding[home]) p->outstanding[home]--;
+                        if (ok && ms > 0.0) {   /* measured per-chunk rate of this tier under its current concurrency (reported, not used:
+                                                   the ETA floor is the configured single-stream rate) */
+                            const double gbps = (double)job.len / (ms * 1e6);
+                            p->meas_gbps[home] += 0.1 * (gbps - p->meas_gbps[home]);
+                        }
+                        p->tier_chunks[home]++;
+                        if (home >= 2) p->green_reads++;
+                    }
+                } else if (tier) {
+                    if (tier == 1) { p->cold_now--; p->cold_ewma_ms += 0.1 * (ms - p->cold_ewma_ms); }
+                    else { p->green_now--; p->green_reads++; p->green_ewma_ms += 0.1 * (ms - p->green_ewma_ms); }
+                }
+                p->cv_job.notify_all();
+            }
+            if (!ok) fprintf(stderr, "ds4: K3 expert file L%u-E%u chunk at %u read failed: %s\n", job.layer, job.expert, job.off, strerror(errno));
+            else p->bytes += job.len;
+        }
+        const cudaStream_t us = p->up_streams[(uint32_t)job.dev % p->n_up];   /* step 63 */
+        if (ok) {
+            if (cudaStreamWaitEvent(us, p->dev_free[job.dev], 0) != cudaSuccess ||
+                cudaStreamWaitEvent(us, p->host_free[job.host], 0) != cudaSuccess ||
+                cudaMemcpyAsync(p->dev_ptr[(size_t)job.dev] + job.off, h + job.off, job.len, cudaMemcpyHostToDevice,
+                                us) != cudaSuccess) {
+                fprintf(stderr, "ds4: K3 expert upload failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+                ok = 0;
+            }
+        }
+        if (p->trace_fills) { const double tu = k3_now_sec(); if (tu > p->tf_up[(uint32_t)job.dev]) p->tf_up[(uint32_t)job.dev] = tu; }   /* step 68 */
+        std::lock_guard<std::mutex> lk(p->mu);
+        if (!ok) p->chunk_failed[(uint32_t)job.dev] = 1;
+        if (p->chunks_left[(uint32_t)job.dev] > 0u) p->chunks_left[(uint32_t)job.dev]--;
+        if (p->chunks_left[(uint32_t)job.dev] != 0u) continue;   /* more chunks of this slab are still in flight */
+        /* the last chunk of the slab: every chunk copy is queued on up_stream before this point */
+        bool all_ok = p->chunk_failed[(uint32_t)job.dev] == 0u;
+        if (all_ok && (cudaEventRecord(p->dev_ready[job.dev], us) != cudaSuccess ||
+                       cudaEventRecord(p->host_free[job.host], us) != cudaSuccess)) {
+            fprintf(stderr, "ds4: K3 expert upload events failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+            all_ok = false;
+        }
+        if (!all_ok) { p->failed = 1; p->failed_slabs.push_back((uint32_t)job.dev); }
+        p->ready_q.push_back((uint32_t)job.dev);
+        p->cv_done.notify_all();
+    }
+}
+
+/* Step 28, victim cache: the expert that device slab d just gave up (key old) is copied down into a host slab on the
+   copy stream, behind d's last kernel (dev_free[d]) and the host slab's last use (host_free[h]); both events are then
+   re-recorded behind the copy, so d's refill and the host slab's next read or upload wait for it. */
+static void k3_victim_copy(k3_raw_pool &p, uint32_t d, uint64_t old) {
+    if (p.hc.lookup(old, false) >= 0) return;
+    const bool cold = !ds4_k3_expert_source_is_primary((uint32_t)(old >> 20), (uint32_t)(old & 0xfffffu));
+    const int h = p.hc.alloc(old, true, nullptr, cold);
+    if (h < 0) return;
+    uint8_t *dst = p.host + (size_t)h * p.file_bytes;
+    const cudaStream_t cs = p.cp_streams[d % p.n_cp];   /* step 64 */
+    if (cudaStreamWaitEvent(cs, p.dev_free[d], 0) != cudaSuccess ||
+        cudaStreamWaitEvent(cs, p.host_free[(uint32_t)h], 0) != cudaSuccess ||
+        cudaMemcpyAsync(dst, p.dev_ptr[d], p.file_bytes, cudaMemcpyDeviceToHost, cs) != cudaSuccess ||
+        cudaEventRecord(p.dev_free[d], cs) != cudaSuccess ||
+        cudaEventRecord(p.host_free[(uint32_t)h], cs) != cudaSuccess) {
+        fprintf(stderr, "ds4: K3 victim copy-down failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+        p.hc.drop((uint32_t)h);
+        return;
+    }
+    p.copydowns++;
+}
+
+static uint64_t k3_mem_available_bytes(void) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256];
+    uint64_t kb = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "MemAvailable: %llu kB", (unsigned long long *)&kb) == 1) break;
+    }
+    fclose(f);
+    return kb * 1024ull;
+}
+static uint32_t k3_env_u32(const char *name, uint32_t dflt) {
+    const char *e = getenv(name);
+    if (!e || !e[0]) return dflt;
+    const long v = atol(e);
+    return v < 0 ? dflt : (uint32_t)v;
+}
+
+/* Sizes the host cache from what is free (the device cache is sized by ds4_gpu_k3_cache_grow after the first forward:
+   free VRAM - DS4_K3_CACHE_VRAM_RESERVE_MB (4096), capped by DS4_K3_CACHE_VRAM_GB); host = MemAvailable - DS4_K3_CACHE_RAM_RESERVE_MB (8192), capped by DS4_K3_CACHE_RAM_GB
+   (default cap 36). DS4_K3_EXPERT_SLOTS (16) is the number of fills in flight, DS4_K3_EXPERT_THREADS the readers. */
+static bool k3_raw_pool_ensure(uint32_t ff, uint32_t latent) {
+    k3_raw_pool &p = k3_raw_get();
+    if (p.ready) {
+        if (p.ff == ff && p.latent == latent) return true;
+        fprintf(stderr, "ds4: kimi-k3 raw expert pool geometry changed\n");
+        return false;
+    }
+    const size_t gu_packed = (size_t)ff * latent / 2u, gu_scale = (size_t)ff * latent / 32u;
+    p.w1p = 0; p.w1s = gu_packed; p.w2p = p.w1s + gu_scale; p.w2s = p.w2p + gu_packed;
+    p.w3p = p.w2s + gu_scale; p.w3s = p.w3p + gu_packed;
+    p.file_bytes = p.w3s + gu_scale;
+    const uint64_t src_bytes = ds4_k3_expert_source_file_bytes();
+    if (src_bytes != 0 && src_bytes != p.file_bytes) {
+        fprintf(stderr, "ds4: kimi-k3 expert file size %llu does not match the geometry (%zu)\n",
+                (unsigned long long)src_bytes, p.file_bytes);
+        return false;
+    }
+    cudaGetDevice(&p.device);
+    /* the spine is staged lazily during the first forward, so free VRAM is not known here: start with a small
+       device cache and grow it to the budget after the first forward (ds4_gpu_k3_cache_grow, called by the driver) */
+    uint32_t cap_dev = k3_env_u32("DS4_K3_CACHE_VRAM_INIT_SLABS", 192u);   /* step 36: room for a prompt pass's prefetch before the cache grows */
+    if (cap_dev < 32u) cap_dev = 32u;
+    if (cap_dev > 1024u) cap_dev = 1024u;
+    const uint64_t ram_reserve = (uint64_t)k3_env_u32("DS4_K3_CACHE_RAM_RESERVE_MB", 8192u) << 20;
+    const uint64_t avail = k3_mem_available_bytes();
+    uint64_t host_budget = avail > ram_reserve ? avail - ram_reserve : 0;
+    const uint64_t ram_cap = (uint64_t)k3_env_u32("DS4_K3_CACHE_RAM_GB", 50u) << 30;   /* step 59: 50 GiB on the 70 GiB VM (4 Nov) */
+    if (host_budget > ram_cap) host_budget = ram_cap;
+    uint32_t cap_host = (uint32_t)(host_budget / p.file_bytes);
+    if (cap_host < 64u) cap_host = 64u;
+    if (cap_host > 32768u) cap_host = 32768u;
+    {
+        uint8_t *region = nullptr;
+        if (cudaMalloc(&region, p.file_bytes * cap_dev) != cudaSuccess) {
+            fprintf(stderr, "ds4: kimi-k3 device expert cache of %u slabs failed: %s\n", cap_dev, cudaGetErrorString(cudaGetLastError()));
+            return false;
+        }
+        p.dev_ptr.resize(cap_dev);
+        for (uint32_t s = 0; s < cap_dev; s++) p.dev_ptr[s] = region + (size_t)s * p.file_bytes;
+    }
+    for (;;) {
+        if (cudaMallocHost((void **)&p.host_raw, p.file_bytes * cap_host + 4096u) == cudaSuccess) break;
+        cudaGetLastError();
+        if (cap_host <= 64u) { fprintf(stderr, "ds4: kimi-k3 pinned expert cache failed\n"); return false; }
+        cap_host /= 2u;
+        if (cap_host < 64u) cap_host = 64u;
+    }
+    p.host = (uint8_t *)(((uintptr_t)p.host_raw + 4095u) & ~(uintptr_t)4095u);
+    if (cudaStreamCreateWithFlags(&p.up_stream, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaStreamCreateWithFlags(&p.copy_stream, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaEventCreateWithFlags(&p.lists_uploaded, cudaEventDisableTiming) != cudaSuccess) {
+        fprintf(stderr, "ds4: kimi-k3 raw expert pool stream failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+        return false;
+    }
+    p.host_free.resize(cap_host); p.dev_free.resize(cap_dev); p.dev_ready.resize(cap_dev); p.dev_host.assign(cap_dev, -1); p.hhit.assign(cap_dev, 0);
+    p.wanted.assign(cap_dev, 0); p.cold_job.assign(cap_dev, 0); p.pf_slab.assign(cap_dev, 0); p.chunks_left.assign(cap_dev, 0); p.chunk_failed.assign(cap_dev, 0);
+    p.tf_enq.assign(cap_dev, 0.0); p.tf_pick.assign(cap_dev, 0.0); p.tf_r0.assign(cap_dev, 0.0); p.tf_r1.assign(cap_dev, 0.0); p.tf_up.assign(cap_dev, 0.0); p.tf_rdy.assign(cap_dev, 0.0); p.tf_tier.assign(cap_dev, -1);   /* step 68 */
+    for (uint32_t s = 0; s < cap_host; s++)
+        if (cudaEventCreateWithFlags(&p.host_free[s], cudaEventDisableTiming) != cudaSuccess) return false;
+    for (uint32_t s = 0; s < cap_dev; s++) {
+        if (cudaEventCreateWithFlags(&p.dev_free[s], cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&p.dev_ready[s], cudaEventDisableTiming) != cudaSuccess) return false;
+    }
+    p.hc.init(cap_host);
+    p.dc.init(cap_dev);
+    p.direct = getenv("DS4_K3_EXPERT_BUFFERED") ? 0 : 1;
+    p.victim = getenv("DS4_K3_CACHE_VICTIM") ? (atoi(getenv("DS4_K3_CACHE_VICTIM")) != 0) : 1;
+    p.pool_first = getenv("DS4_K3_POOL_FIRST") ? (atoi(getenv("DS4_K3_POOL_FIRST")) != 0) : 1;   /* step 74: default on (promoted 5 Nov 2026) */
+    if (p.pool_first) fprintf(stderr, "ds4: kimi-k3 decode pool-first enqueue (step 74): device and host-pool experts visited before the disk reads\n");
+    p.pool_keep = getenv("DS4_K3_POOL_KEEP") ? (atoi(getenv("DS4_K3_POOL_KEEP")) != 0) : 0;   /* step 75 */
+    p.dc.bias_window = getenv("DS4_K3_POOL_EVICT_BIAS") ? (uint32_t)(atoi(getenv("DS4_K3_POOL_EVICT_BIAS")) < 0 ? 0 : atoi(getenv("DS4_K3_POOL_EVICT_BIAS"))) : 0u;
+    if (p.dc.bias_window) p.dc.twin_map = &p.hc.map;
+    if (p.pool_keep || p.dc.bias_window) fprintf(stderr, "ds4: kimi-k3 host pool (step 75): %s%s%u\n", p.pool_keep ? "host-hit uploads keep their host copy; " : "", "eviction bias window ", p.dc.bias_window);
+    { const char *pf = getenv("DS4_K3_PREFETCH");
+      /* step 51: on by default (+6 % decode with 3 per layer within the top 4, 6 in flight) */
+      p.pf_mode = !pf ? 2 : !strcmp(pf, "all") ? 2 : !strcmp(pf, "coldfirst") ? 3 : (!strcmp(pf, "0") || !strcmp(pf, "off")) ? 0 : 1; }
+    p.pf_max = k3_env_u32("DS4_K3_PREFETCH_N", 3u);
+    p.pf_rank = k3_env_u32("DS4_K3_PREFETCH_RANK", 4u); if (p.pf_rank > 32u) p.pf_rank = 32u;
+    p.pf_inflight_max = k3_env_u32("DS4_K3_PREFETCH_INFLIGHT", 6u);
+    p.pf_tail_pending = k3_env_u32("DS4_K3_PREFETCH_TAIL", 2u);
+    p.trace_fills = (int)k3_env_u32("DS4_K3_TRACE_FILLS", 0u);   /* step 68 */
+    if (p.trace_fills) fprintf(stderr, "ds4: kimi-k3 fill timeline trace: %d decode layers after the first 20 tokens\n", p.trace_fills);
+    p.cold_limit = k3_env_u32("DS4_K3_COLD_INFLIGHT", 8u);   /* step 51: 8 (two split files in flight on the Samsung) */
+    p.green_limit = ds4_k3_expert_source_has_dir_c() ? k3_env_u32("DS4_K3_GREEN_INFLIGHT", 16u) : 0u;   /* step 62 */
+    if (p.green_limit > 32u) p.green_limit = 32u;
+    p.green_backlog = k3_env_u32("DS4_K3_GREEN_BACKLOG", 24u);   /* floor; the latency rule above it decides */
+    /* step 38: argodrive mode */
+    p.split = k3_env_u32("DS4_K3_SPLIT_READ", 2u); if (p.split < 1u) p.split = 1u; if (p.split > 8u) p.split = 8u;   /* step 51: 2 chunks */
+    p.split_decode_only = getenv("DS4_K3_SPLIT_DECODE_ONLY") ? atoi(getenv("DS4_K3_SPLIT_DECODE_ONLY")) != 0 : 1;   /* step 51: decode only by default */
+    p.skip_mode = (int)k3_env_u32("DS4_K3_EXPERT_SKIP", 0u);   /* step 57 */
+    { const char *sw = getenv("DS4_K3_SKIP_WMIN"); if (sw && sw[0]) p.skip_wmin = (float)atof(sw); }
+    p.skip_max = k3_env_u32("DS4_K3_SKIP_MAX", 0u);
+    p.skip_keep_min = k3_env_u32("DS4_K3_SKIP_KEEP_MIN", 8u); if (p.skip_keep_min < 1u) p.skip_keep_min = 1u;
+    p.skip_renorm = getenv("DS4_K3_SKIP_RENORM") ? atoi(getenv("DS4_K3_SKIP_RENORM")) != 0 : 1;
+    if (p.skip_mode) fprintf(stderr, "ds4: kimi-k3 expert skipping %s: disk-miss experts with weight < %.3f, max %u per layer, keep >= %u per token, renorm %d\n",
+                             p.skip_mode == 1 ? "ON" : "observe only", p.skip_wmin, p.skip_max, p.skip_keep_min, p.skip_renorm);
+    p.eta_mode = getenv("DS4_K3_SPLIT_ETA") ? atoi(getenv("DS4_K3_SPLIT_ETA")) : 2;   /* step 61: depth-targeted bulk homing by default */
+    p.bulk_eta_backlog = k3_env_u32("DS4_K3_BULK_ETA_BACKLOG", 16u);   /* step 60 */
+    {   /* step 63: several upload streams so chunk copies from different slabs do not queue behind one another */
+        uint32_t n = k3_env_u32("DS4_K3_UPLOAD_STREAMS", 8u); if (n < 1u) n = 1u; if (n > 8u) n = 8u;   /* step 64: 8 (4 streams 1.93, 8 streams 1.97 tok/s) */
+        p.up_streams[0] = p.up_stream; p.n_up = 1;
+        for (uint32_t i = 1; i < n; i++) { if (cudaStreamCreateWithFlags(&p.up_streams[i], cudaStreamNonBlocking) != cudaSuccess) { cudaGetLastError(); break; } p.n_up = i + 1; }
+        if (p.n_up > 1u) fprintf(stderr, "ds4: kimi-k3 expert uploads on %u streams\n", p.n_up);
+    }
+    {   /* step 64: copy-downs likewise */
+        uint32_t n = k3_env_u32("DS4_K3_COPYDOWN_STREAMS", 1u);   /* step 64b: 1 (4 streams neutral, 1.84/1.94 vs 1.86/1.96) */ if (n < 1u) n = 1u; if (n > 8u) n = 8u;
+        p.cp_streams[0] = p.copy_stream; p.n_cp = 1;
+        for (uint32_t i = 1; i < n; i++) { if (cudaStreamCreateWithFlags(&p.cp_streams[i], cudaStreamNonBlocking) != cudaSuccess) { cudaGetLastError(); break; } p.n_cp = i + 1; }
+        if (p.n_cp > 1u) fprintf(stderr, "ds4: kimi-k3 victim copy-downs on %u streams\n", p.n_cp);
+    }
+    { const char *r = getenv("DS4_K3_BULK_DEPTH");   /* step 60b */
+      if (r) { double a = 0, b = 0, c = 0, d = 0; const int nn = sscanf(r, "%lf,%lf,%lf,%lf", &a, &b, &c, &d); if (nn >= 3 && a > 0 && b > 0 && c > 0) { p.bulk_depth[0] = a; p.bulk_depth[1] = b; p.bulk_depth[2] = c; if (nn == 4 && d > 0) p.bulk_depth[3] = d; } } }
+    p.green_tail_guard = k3_env_u32("DS4_K3_GREEN_TAIL_GUARD", 100u);   /* step 60c */
+    { const char *r = getenv("DS4_K3_SPLIT_ETA_GBPS");
+      if (r) { double a = 0, b = 0, c = 0, d = 0; const int nn = sscanf(r, "%lf,%lf,%lf,%lf", &a, &b, &c, &d); if (nn >= 3 && a > 0 && b > 0 && c > 0) { p.agg_gbps[0] = a; p.agg_gbps[1] = b; p.agg_gbps[2] = c; if (nn == 4 && d > 0) p.agg_gbps[3] = d; } } }
+    { const char *r = getenv("DS4_K3_SPLIT_STREAM_GBPS");
+      if (r) { double a = 0, b = 0, c = 0, d = 0; const int nn = sscanf(r, "%lf,%lf,%lf,%lf", &a, &b, &c, &d); if (nn >= 3 && a > 0 && b > 0 && c > 0) { p.stream_gbps[0] = a; p.stream_gbps[1] = b; p.stream_gbps[2] = c; if (nn == 4 && d > 0) p.stream_gbps[3] = d; } } }
+    p.tier_cap[0] = k3_env_u32("DS4_K3_RAID_INFLIGHT", 0u);
+    p.tier_cap[1] = k3_env_u32("DS4_K3_SPLIT_SAMSUNG_CHUNKS", p.cold_limit * (p.split ? p.split : 1u) * 2u);   /* caps count chunks; the Samsung's
+                                                                                                                 queue must be allowed to grow for
+                                                                                                                 tier C to be worth choosing */
+    p.tier_cap[2] = k3_env_u32("DS4_K3_SPLIT_GREEN_CHUNKS", p.green_limit * (p.split ? p.split : 1u));
+    p.dird_limit = ds4_k3_expert_source_has_dir_d() ? k3_env_u32("DS4_K3_DIRD_INFLIGHT", 16u) : 0u;   /* step 67 */
+    if (p.dird_limit > 32u) p.dird_limit = 32u;
+    p.tier_cap[3] = k3_env_u32("DS4_K3_SPLIT_DIRD_CHUNKS", p.dird_limit * (p.split ? p.split : 1u));
+    p.bulk_pf_mode = getenv("DS4_K3_PREFILL_PREFETCH") ? atoi(getenv("DS4_K3_PREFILL_PREFETCH")) : 1;
+    p.bulk_pf_max = k3_env_u32("DS4_K3_PREFILL_PREFETCH_N", 96u); if (p.bulk_pf_max > 256u) p.bulk_pf_max = 256u;
+    p.bulk_pf_inflight = k3_env_u32("DS4_K3_PREFILL_PREFETCH_INFLIGHT", 96u);
+    p.bulk_pf_div = k3_env_u32("DS4_K3_PREFILL_PREFETCH_DIV", 20u); if (p.bulk_pf_div == 0u) p.bulk_pf_div = 1u;
+    {
+        uint32_t ms = k3_env_u32("DS4_K3_GEMV_STREAMS", 0u);   /* p13: 4 streams cost more launch time than they save */
+        if (ms > 8u) ms = 8u;
+        if (ms >= 2u) {
+            bool ok = cudaEventCreateWithFlags(&p.ms_fork, cudaEventDisableTiming) == cudaSuccess &&
+                      cudaMalloc(&p.ms_mid, sizeof(float) * (size_t)ms * ff) == cudaSuccess;
+            for (uint32_t i = 0; ok && i < ms; i++)
+                ok = cudaStreamCreateWithFlags(&p.ms_stream[i], cudaStreamNonBlocking) == cudaSuccess &&
+                     cudaEventCreateWithFlags(&p.ms_join[i], cudaEventDisableTiming) == cudaSuccess;
+            if (ok) p.ms_n = ms; else { cudaGetLastError(); fprintf(stderr, "ds4: K3 GEMV side streams unavailable\n"); }
+        }
+    }
+    uint32_t in_flight = k3_env_u32("DS4_K3_EXPERT_SLOTS", 32u);   /* step 61: room for tier C's reads beside the RAID's */
+    if (in_flight < 2u) in_flight = 2u;
+    if (in_flight > 64u) in_flight = 64u;
+    if (in_flight > cap_host / 2u) in_flight = cap_host / 2u;
+    if (in_flight > cap_dev / 2u) in_flight = cap_dev / 2u;
+    p.max_pending = in_flight;
+    /* readers are held only while reading (cold jobs wait in cold_q): the RAID fills plus the two cold tiers; with
+       split reads every fill is `split` chunk jobs */
+    /* step 43: the reader count is bounded at 256 and the effective value is reported; a request above the bound is
+       clamped, not silently replaced (until 3 Nov a request above 64 fell back to the fill count, so
+       DS4_K3_EXPERT_THREADS=128 ran 16 readers) */
+    const uint32_t n_threads_dflt = in_flight * p.split + 16u;
+    uint32_t n_threads = k3_env_u32("DS4_K3_EXPERT_THREADS", n_threads_dflt);
+    if (n_threads == 0u) n_threads = n_threads_dflt;
+    if (n_threads > 256u) n_threads = 256u;
+    if (getenv("DS4_K3_EXPERT_THREADS") && (long)n_threads != atol(getenv("DS4_K3_EXPERT_THREADS")))
+        fprintf(stderr, "ds4: kimi-k3 DS4_K3_EXPERT_THREADS=%s is outside 1..256; running %u reader threads\n",
+                getenv("DS4_K3_EXPERT_THREADS"), n_threads);
+    p.ff = ff; p.latent = latent; p.ready = true;
+    for (uint32_t t = 0; t < n_threads; t++) std::thread(k3_raw_worker, &p).detach();
+    fprintf(stderr, "ds4: kimi-k3 expert caches: device %u slabs to start (grows after the first forward), host %u slabs "
+            "(%.1f GB pinned of %.1f available), %u fills in flight, %u reader threads, %s I/O, host cache %s\n",
+            cap_dev, cap_host, (double)cap_host * p.file_bytes / 1e9, (double)avail / 1e9, in_flight, n_threads,
+            p.direct ? "direct" : "buffered", p.victim ? "holds device evictions (victim)" : "holds cold-tier reads");
+    if (p.ms_n) fprintf(stderr, "ds4: kimi-k3 decode expert GEMVs on %u streams\n", p.ms_n);
+    if (p.cold_limit) fprintf(stderr, "ds4: kimi-k3 Samsung-tier reads in flight capped at %u\n", p.cold_limit);
+    if (p.green_limit) fprintf(stderr, "ds4: kimi-k3 tier C takes prompt-pass cold reads: %u in flight while the Samsung backlog (at least %u) would outlast a tier C read\n", p.green_limit, p.green_backlog);
+    {   /* step 42: say at startup how each tier is actually read */
+        static const char *const tname[4] = {"primary (RAID)", "dir_b (Samsung)", "dir_c (tier C)", "dir_d (tier D)"};
+        uint32_t probe_e[4] = {0, 0, 0, 0};
+        for (uint32_t e = 0; e < 1024u; e++) { if (!probe_e[1] && ds4_k3_expert_source_has_tier(1, e, 1) && !ds4_k3_expert_source_is_primary(1, e)) probe_e[1] = e; if (!probe_e[0] && ds4_k3_expert_source_is_primary(1, e)) probe_e[0] = e; }
+        for (int t = 0; t < 4; t++) {
+            if (t == 2 && !ds4_k3_expert_source_has_dir_c()) continue;
+            if (t == 3 && !ds4_k3_expert_source_has_dir_d()) continue;   /* step 67 */
+            const int r = ds4_k3_expert_source_probe_tier(t, 1, probe_e[t]);
+            fprintf(stderr, "ds4: kimi-k3 tier %s: %s\n", tname[t], r == 1 ? "direct I/O" : r == 2 ? "BUFFERED reads (O_DIRECT refused)" : r == -1 ? "probe file missing" : "not configured");
+        }
+    }
+    if (p.split > 1u || p.eta_mode) fprintf(stderr, "ds4: kimi-k3 argodrive: %u chunk%s per expert file, %s homing (rates GB/s RAID %.1f / Samsung %.1f / tier C %.1f aggregate, %.1f / %.1f / %.1f per stream; caps %u / %u / %u chunks)\n",
+                                            p.split, p.split > 1u ? "s" : "", p.eta_mode ? "least-expected-completion" : "static",
+                                            p.agg_gbps[0], p.agg_gbps[1], p.agg_gbps[2], p.stream_gbps[0], p.stream_gbps[1], p.stream_gbps[2],
+                                            p.tier_cap[0], p.tier_cap[1], p.tier_cap[2]);
+    if (p.dird_limit) fprintf(stderr, "ds4: kimi-k3 tier D (step 67, fourth home): %u in flight, %.1f GB/s aggregate, %.1f per stream, cap %u chunks, bulk depth %.0f\n", p.dird_limit, p.agg_gbps[3], p.stream_gbps[3], p.tier_cap[3], p.bulk_depth[3]);
+    if (p.bulk_pf_mode) fprintf(stderr, "ds4: kimi-k3 prompt-pass prefetch: up to %u predicted cold experts of the next layer (at most one per %u prompt tokens), %u in flight, %u reader threads\n", p.bulk_pf_max, p.bulk_pf_div, p.bulk_pf_inflight, n_threads);
+    if (p.pf_mode) fprintf(stderr, "ds4: kimi-k3 next-layer prefetch: %s-tier candidates, up to %u per layer within the predicted top %u, %u in flight\n",
+                           p.pf_mode == 2 ? "any" : p.pf_mode == 3 ? "cold-first, then any" : "cold", p.pf_max, p.pf_rank, p.pf_inflight_max);
+    return true;
+}
+
+/* Grow the mid buffer and the token lists to n_tok tokens x n_used experts (never shrinks). */
+static bool k3_raw_pool_reserve_tokens(uint32_t n_tok, uint32_t n_used) {
+    k3_raw_pool &p = k3_raw_get();
+    const size_t need_list = (size_t)n_tok * n_used;
+    if (n_tok <= p.max_tok && need_list <= p.list_cap) return true;
+    for (uint32_t i = 1; i < p.n_up; i++) (void)cudaStreamSynchronize(p.up_streams[i]);   /* step 63 */
+    for (uint32_t i = 1; i < p.n_cp; i++) (void)cudaStreamSynchronize(p.cp_streams[i]);   /* step 64 */
+    if (cudaStreamSynchronize(cuda_decode_stream()) != cudaSuccess || cudaStreamSynchronize(p.up_stream) != cudaSuccess) {
+        return false;
+    }
+    if (n_tok > p.max_tok) {
+        if (p.dev_mid) cudaFree(p.dev_mid);
+        p.dev_mid = nullptr;
+        p.max_tok = 0;
+        if (cudaMalloc(&p.dev_mid, sizeof(float) * (size_t)p.ff * n_tok) != cudaSuccess) {
+            fprintf(stderr, "ds4: K3 expert mid buffer for %u tokens failed\n", n_tok);
+            return false;
+        }
+        p.max_tok = n_tok;
+    }
+    if (need_list > p.list_cap) {
+        if (p.host_tok) cudaFreeHost(p.host_tok);
+        if (p.host_tw) cudaFreeHost(p.host_tw);
+        if (p.dev_tok) cudaFree(p.dev_tok);
+        if (p.dev_tw) cudaFree(p.dev_tw);
+        if (p.host_tent) cudaFreeHost(p.host_tent); if (p.dev_tent) cudaFree(p.dev_tent); if (p.dev_iota) cudaFree(p.dev_iota);   /* step 76 */
+        p.host_tent = nullptr; p.dev_tent = nullptr; p.dev_iota = nullptr;
+        p.host_tok = nullptr; p.host_tw = nullptr; p.dev_tok = nullptr; p.dev_tw = nullptr; p.list_cap = 0;
+        if (cudaMallocHost((void **)&p.host_tok, sizeof(uint32_t) * need_list) != cudaSuccess ||
+            cudaMallocHost((void **)&p.host_tw, sizeof(float) * need_list) != cudaSuccess ||
+            cudaMalloc(&p.dev_tok, sizeof(uint32_t) * need_list) != cudaSuccess ||
+            cudaMalloc(&p.dev_tw, sizeof(float) * need_list) != cudaSuccess ||
+            cudaMallocHost((void **)&p.host_tent, sizeof(uint32_t) * need_list) != cudaSuccess ||   /* step 76 */
+            cudaMalloc(&p.dev_tent, sizeof(uint32_t) * need_list) != cudaSuccess ||
+            cudaMalloc(&p.dev_iota, sizeof(uint32_t) * need_list) != cudaSuccess) {
+            fprintf(stderr, "ds4: K3 expert token lists for %zu entries failed\n", need_list);
+            return false;
+        }
+        {   /* step 76: identity rows for the compact partials */
+            std::vector<uint32_t> io(need_list); for (size_t i = 0; i < need_list; i++) io[i] = (uint32_t)i;
+            if (cudaMemcpy(p.dev_iota, io.data(), sizeof(uint32_t) * need_list, cudaMemcpyHostToDevice) != cudaSuccess) return false;
+        }
+        p.list_cap = need_list;
+    }
+    return true;
+}
+
+/* ---- step 23: per-expert GEMM for experts that serve several prompt tokens. The slot's MXFP4 planes are
+   dequantised once into bf16 scratch (W1, W3: [ff x latent]; W2: [latent x ff]); gate/up and down run as cuBLAS
+   GEMMs over the expert's gathered tokens; SiTU and the weighted scatter-add stay small kernels. One shared
+   scratch set is enough: every kernel of one expert precedes the next expert's on the decode stream. */
+struct k3_gemm_scratch {
+    uint32_t ff = 0, latent = 0, cap_tok = 0;
+    __nv_bfloat16 *w1 = nullptr, *w3 = nullptr, *w2 = nullptr;
+    __nv_bfloat16 *xg = nullptr, *mid16 = nullptr;
+    float *gate = nullptr, *up = nullptr, *part = nullptr;
+};
+static k3_gemm_scratch *g_k3_gemm = nullptr;
+
+static bool k3_gemm_scratch_ensure(uint32_t ff, uint32_t latent, uint32_t n_tok) {
+    if (!g_k3_gemm) g_k3_gemm = new k3_gemm_scratch();
+    k3_gemm_scratch &g = *g_k3_gemm;
+    if (g.ff == ff && g.latent == latent && g.cap_tok >= n_tok) return true;
+    if (cudaStreamSynchronize(cuda_decode_stream()) != cudaSuccess) return false;
+    cudaFree(g.w1); cudaFree(g.w3); cudaFree(g.w2); cudaFree(g.xg); cudaFree(g.mid16); cudaFree(g.gate); cudaFree(g.up); cudaFree(g.part);
+    g.w1 = g.w3 = g.w2 = g.xg = g.mid16 = nullptr; g.gate = g.up = g.part = nullptr;
+    const size_t wn = (size_t)ff * latent;
+    if (cudaMalloc(&g.w1, wn * sizeof(__nv_bfloat16)) != cudaSuccess || cudaMalloc(&g.w3, wn * sizeof(__nv_bfloat16)) != cudaSuccess ||
+        cudaMalloc(&g.w2, wn * sizeof(__nv_bfloat16)) != cudaSuccess ||
+        cudaMalloc(&g.xg, (size_t)n_tok * latent * sizeof(__nv_bfloat16)) != cudaSuccess ||
+        cudaMalloc(&g.mid16, (size_t)n_tok * ff * sizeof(__nv_bfloat16)) != cudaSuccess ||
+        cudaMalloc(&g.gate, (size_t)n_tok * ff * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&g.up, (size_t)n_tok * ff * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&g.part, (size_t)n_tok * latent * sizeof(float)) != cudaSuccess) {
+        fprintf(stderr, "ds4: K3 expert GEMM scratch for %u tokens failed: %s\n", n_tok, cudaGetErrorString(cudaGetLastError()));
+        g.ff = g.latent = g.cap_tok = 0;
+        return false;
+    }
+    g.ff = ff; g.latent = latent; g.cap_tok = n_tok;
+    return true;
+}
+
+/* one thread per 32-element block: 16 packed bytes + an e8m0 scale -> 32 bf16 values (row-major planes) */
+__global__ static void k3_raw_dequant_kernel(__nv_bfloat16 *out, const uint8_t *packed, const uint8_t *scales,
+                                             uint32_t n_blocks) {
+    __shared__ float tbl[16];
+    if (threadIdx.x < 16u) tbl[threadIdx.x] = k3_e2m1_table[threadIdx.x];
+    __syncthreads();
+    const uint32_t j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n_blocks) return;
+    const uint4 p = *reinterpret_cast<const uint4 *>(packed + (size_t)j * 16u);
+    const uint32_t e = scales[j];
+    const float d = e == 255u ? __int_as_float(0x7fffffff) : exp2f((float)e - 127.0f);
+    const uint32_t w[4] = {p.x, p.y, p.z, p.w};
+    __nv_bfloat16 *o = out + (size_t)j * 32u;
+#pragma unroll
+    for (uint32_t q = 0; q < 4u; q++) {
+#pragma unroll
+        for (uint32_t b = 0; b < 4u; b++) {
+            const uint32_t byte = (w[q] >> (8u * b)) & 0xffu;
+            const uint32_t i = q * 4u + b;
+            o[2u * i] = __float2bfloat16(d * tbl[byte & 0x0fu]);
+            o[2u * i + 1u] = __float2bfloat16(d * tbl[byte >> 4]);
+        }
+    }
+}
+
+/* step 33: 4 threads per block; thread q converts packed word q (8 values) and stores them as one uint4 */
+__global__ static void k3_raw_dequant4_kernel(__nv_bfloat16 *out, const uint8_t *packed, const uint8_t *scales,
+                                              uint32_t n_blocks) {
+    __shared__ float tbl[16];
+    if (threadIdx.x < 16u) tbl[threadIdx.x] = k3_e2m1_table[threadIdx.x];
+    __syncthreads();
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t j = i >> 2u, q = i & 3u;
+    if (j >= n_blocks) return;
+    const uint32_t w = reinterpret_cast<const uint32_t *>(packed)[(size_t)j * 4u + q];
+    const uint32_t e = scales[j];
+    const float d = e == 255u ? __int_as_float(0x7fffffff) : exp2f((float)e - 127.0f);
+    __nv_bfloat162 r[4];
+#pragma unroll
+    for (uint32_t b = 0; b < 4u; b++) {
+        const uint32_t byte = (w >> (8u * b)) & 0xffu;
+        r[b] = __floats2bfloat162_rn(d * tbl[byte & 0x0fu], d * tbl[byte >> 4]);
+    }
+    uint4 v;
+    v.x = *reinterpret_cast<const uint32_t *>(&r[0]); v.y = *reinterpret_cast<const uint32_t *>(&r[1]);
+    v.z = *reinterpret_cast<const uint32_t *>(&r[2]); v.w = *reinterpret_cast<const uint32_t *>(&r[3]);
+    *reinterpret_cast<uint4 *>(out + (size_t)j * 32u + (size_t)q * 8u) = v;
+}
+
+__global__ static void k3_gather_bf16_kernel(__nv_bfloat16 *xg, const float *x, const uint32_t *tok, uint32_t n_tok,
+                                             uint32_t latent) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_tok * latent) return;
+    const uint32_t j = i / latent, c = i % latent;
+    xg[i] = __float2bfloat16(x[(size_t)tok[j] * latent + c]);
+}
+
+__global__ static void k3_situ_bf16_kernel(__nv_bfloat16 *out, const float *gate, const float *up, uint32_t n, float b,
+                                           float bl) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __float2bfloat16(k3_situ_dev(gate[i], up[i], b, bl));
+}
+
+/* out[tok[j]*latent + c] += tw[j] * part[j*latent + c]; a token appears at most once per expert, experts in stream order */
+__global__ static void k3_scatter_add_kernel(float *out, const float *part, const uint32_t *tok, const float *tw,
+                                             uint32_t n_tok, uint32_t latent) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_tok * latent) return;
+    const uint32_t j = i / latent, c = i % latent;
+    out[(size_t)tok[j] * latent + c] += tw[j] * part[i];
+}
+
+/* C (row-major [n x m], f32) = X (row-major [n x k], bf16) . W^T (W row-major [m x k], bf16) */
+static bool k3_gemm_bf16(cublasHandle_t h, const __nv_bfloat16 *W, const __nv_bfloat16 *X, float *C, int m, int n, int k) {
+    const float alpha = 1.0f, beta = 0.0f;
+    const cublasStatus_t st = cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, m, n, k, &alpha, W, CUDA_R_16BF, k, X, CUDA_R_16BF, k,
+                                           &beta, C, CUDA_R_32F, m, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+    if (st != CUBLAS_STATUS_SUCCESS) fprintf(stderr, "ds4: K3 expert GEMM failed: status %d\n", (int)st);
+    return st == CUBLAS_STATUS_SUCCESS;
+}
+
+}  // namespace
+
+/* Routed experts for n_tok tokens of one layer: the (token, weight) pairs are grouped by expert; each expert of the
+   union is served from the device cache, the host cache (upload only) or disk (read + upload), and applied to all of
+   its tokens the moment its slab is ready. out[t] = sum_e w[t][e] * expert_e(x[t]) (zeroed here first). n_tok = 1
+   is the decode step. */
+/* step 77: create the expert pool at model load instead of at the first layer call (a fresh process paid ~15 s there) */
+extern "C" int ds4_gpu_k3_pool_prepare(uint32_t ff, uint32_t latent, uint32_t n_tok, uint32_t n_used) {
+    if (!k3_raw_pool_ensure(ff, latent)) return 0;
+    if (!k3_raw_pool_reserve_tokens(n_tok, n_used)) return 0;
+    return 1;
+}
+extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const int32_t *selected,
+                                               const float *weights, uint32_t n_tok, uint32_t n_used, uint32_t layer,
+                                               uint32_t ff, uint32_t latent, float beta, float beta_linear) {
+    if (!out || !x || !selected || !weights || n_tok == 0u || n_used == 0u || n_used > 64u) return 0;
+    if (latent % 32u != 0u || ff % 32u != 0u || latent > 4096u || ff > 4096u) return 0;
+    if (out->bytes < (uint64_t)n_tok * latent * sizeof(float) || x->bytes < (uint64_t)n_tok * latent * sizeof(float)) return 0;
+    if (!k3_raw_pool_ensure(ff, latent) || !k3_raw_pool_reserve_tokens(n_tok, n_used)) return 0;
+    k3_raw_pool &p = k3_raw_get();
+    cudaStream_t stream = cuda_decode_stream();
+    /* experts serving at least gemm_min tokens go through the bf16 GEMM path (0 disables it) */
+    static int gemm_min = -1;
+    if (gemm_min < 0) {
+        const char *e = getenv("DS4_K3_EXPERT_GEMM_MIN");
+        gemm_min = e ? atoi(e) : 4;
+        if (gemm_min < 0) gemm_min = 0;
+    }
+    static int verify_gemm = -1;
+    if (verify_gemm < 0) verify_gemm = getenv("DS4_K3_VERIFY_GEMM") ? 1 : 0;
+    const bool gemm_ok = gemm_min > 0 && n_tok >= (uint32_t)gemm_min && g_cublas_ready && (p.verify == 0 || verify_gemm) &&
+                         k3_gemm_scratch_ensure(ff, latent, n_tok);
+    cublasHandle_t cublas = gemm_ok ? cuda_cublas_for_tier(0) : nullptr;
+    if (gemm_ok) cublasSetStream(cublas, stream);
+    /* group the (token, weight) pairs by expert */
+    uint32_t count[1024], off[1025], fill[1024], ulist[1024];
+    memset(count, 0, sizeof(count));
+    /* step 57: decide the skips first (decode and verification rows only, so n_tok <= 8 here; a prompt pass keeps
+       every expert): lightest disk-miss experts below the weight threshold go, each token keeps at least skip_keep_min */
+    uint8_t skip[1024];
+    float wscale[64];
+    memset(skip, 0, sizeof(skip));
+    const bool skip_on = p.skip_mode != 0 && (n_tok == 1u || p.verify != 0) && n_tok <= 64u;
+    if (skip_on) {
+        for (uint32_t t = 0; t < n_tok; t++) wscale[t] = 1.0f;
+        const uint64_t lkey = (uint64_t)layer << 20;
+        uint8_t cls[1024];                       /* 0xff unknown, 0 device, 1 in flight, 2 host, 3 disk */
+        float wmax[1024];
+        memset(cls, 0xff, sizeof(cls));
+        uint32_t cand[1024], n_cand = 0;
+        for (uint32_t t = 0; t < n_tok; t++) {
+            for (uint32_t i = 0; i < n_used; i++) {
+                const int32_t ei = selected[(size_t)t * n_used + i];
+                if (ei < 0 || ei >= 1024) return 0;
+                const uint32_t e = (uint32_t)ei;
+                const float w = weights[(size_t)t * n_used + i];
+                if (cls[e] == 0xff) {
+                    const int d = p.dc.lookup(lkey | e, false);
+                    if (d >= 0) cls[e] = p.dc.filling[(uint32_t)d] ? 1 : 0;
+                    else cls[e] = p.hc.lookup(lkey | e, false) >= 0 ? 2 : 3;
+                    wmax[e] = w;
+                    if (cls[e] == 3) cand[n_cand++] = e;
+                } else if (w > wmax[e]) wmax[e] = w;
+            }
+        }
+        for (uint32_t i = 0; i < n_cand; i++) {   /* observation: disk-miss experts by weight */
+            const float w = wmax[cand[i]];
+            p.skip_obs_n++;
+            p.skip_obs[w < 0.01f ? 0 : w < 0.02f ? 1 : w < 0.03f ? 2 : w < 0.04f ? 3 : w < 0.06f ? 4 : 5]++;
+        }
+        if (p.skip_mode == 1 && n_cand) {
+            for (uint32_t i = 1; i < n_cand; i++) {   /* lightest first */
+                const uint32_t v = cand[i]; uint32_t j = i;
+                while (j > 0 && wmax[cand[j - 1u]] > wmax[v]) { cand[j] = cand[j - 1u]; j--; }
+                cand[j] = v;
+            }
+            uint32_t kept[64]; float lost[64];
+            for (uint32_t t = 0; t < n_tok; t++) { kept[t] = n_used; lost[t] = 0.0f; }
+            uint32_t n_skip = 0;
+            for (uint32_t i = 0; i < n_cand && (p.skip_max == 0u || n_skip < p.skip_max); i++) {
+                const uint32_t e = cand[i];
+                if (!(wmax[e] < p.skip_wmin)) break;
+                bool okk = true;
+                for (uint32_t t = 0; t < n_tok && okk; t++)
+                    for (uint32_t k = 0; k < n_used; k++)
+                        if ((uint32_t)selected[(size_t)t * n_used + k] == e) { if (kept[t] <= p.skip_keep_min) okk = false; break; }
+                if (!okk) continue;
+                skip[e] = 1; n_skip++;
+                for (uint32_t t = 0; t < n_tok; t++)
+                    for (uint32_t k = 0; k < n_used; k++)
+                        if ((uint32_t)selected[(size_t)t * n_used + k] == e) { kept[t]--; lost[t] += weights[(size_t)t * n_used + k]; break; }
+            }
+            p.skipped += n_skip;
+            for (uint32_t t = 0; t < n_tok; t++) {
+                p.skip_mass_e6 += (uint64_t)(lost[t] * 1e6f);
+                if (p.skip_renorm && lost[t] > 0.0f && lost[t] < 0.999f) wscale[t] = 1.0f / (1.0f - lost[t]);
+            }
+        }
+    }
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t i = 0; i < n_used; i++) {
+            const int32_t e = selected[(size_t)t * n_used + i];
+            if (e < 0 || e >= 1024) return 0;
+            if (skip[e]) continue;   /* step 57 */
+            count[e]++;
+        }
+    }
+    uint32_t n_union = 0;
+    off[0] = 0;
+    for (uint32_t e = 0; e < 1024u; e++) {
+        off[e + 1u] = off[e] + count[e];
+        fill[e] = off[e];
+        if (count[e]) ulist[n_union++] = e;
+    }
+    /* the previous layer's lists may still be the source of an in-flight copy */
+    if (cudaEventSynchronize(p.lists_uploaded) != cudaSuccess) return cuda_ok(cudaGetLastError(), "K3 raw lists sync");
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t i = 0; i < n_used; i++) {
+            const uint32_t e = (uint32_t)selected[(size_t)t * n_used + i];
+            p.host_tent[(size_t)t * n_used + i] = 0xFFFFFFFFu;   /* step 76: (token, slot) -> list entry; skipped = none */
+            if (skip[e]) continue;   /* step 57 */
+            p.host_tent[(size_t)t * n_used + i] = fill[e];
+            p.host_tok[fill[e]] = t;
+            p.host_tw[fill[e]] = skip_on ? weights[(size_t)t * n_used + i] * wscale[t] : weights[(size_t)t * n_used + i];
+            fill[e]++;
+        }
+    }
+    const size_t n_list = (size_t)n_tok * n_used;
+    if (cudaMemcpyAsync(p.dev_tok, p.host_tok, sizeof(uint32_t) * n_list, cudaMemcpyHostToDevice, stream) != cudaSuccess ||
+        cudaMemcpyAsync(p.dev_tw, p.host_tw, sizeof(float) * n_list, cudaMemcpyHostToDevice, stream) != cudaSuccess ||
+        cudaMemcpyAsync(p.dev_tent, p.host_tent, sizeof(uint32_t) * n_list, cudaMemcpyHostToDevice, stream) != cudaSuccess ||   /* step 76 */
+        cudaEventRecord(p.lists_uploaded, stream) != cudaSuccess ||
+        cudaMemsetAsync(out->ptr, 0, (size_t)n_tok * latent * sizeof(float), stream) != cudaSuccess) {
+        return cuda_ok(cudaGetLastError(), "K3 raw batch setup");
+    }
+    const double t0 = k3_now_sec();
+    const dim3 gu_grid((ff + 7u) / 8u), d_grid((latent + 7u) / 8u);
+    /* step 26: transposed GEMVs (DS4_K3_GEMV_V1=1 restores the register-row kernels); dynamic smem above 48 KB */
+    static int gemv_v2 = -1;
+    const size_t smem_gu = k3_gemv2_smem_gate_up(ff, latent), smem_dn = k3_gemv2_smem_down(ff, latent);
+    if (gemv_v2 < 0) {
+        gemv_v2 = getenv("DS4_K3_GEMV_V1") ? 0 : 1;
+        if (gemv_v2) {
+            if (cudaFuncSetAttribute(k3_raw_gate_up_v2_kernel<K3_GEMV2_MAX_TOK>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_gu) != cudaSuccess ||
+                cudaFuncSetAttribute(k3_raw_down_v2_kernel<K3_GEMV2_MAX_TOK>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_dn) != cudaSuccess) {
+                fprintf(stderr, "ds4: K3 GEMV v2 needs %zu/%zu bytes of shared memory: not available, using v1\n", smem_gu, smem_dn);
+                cudaGetLastError();
+                gemv_v2 = 0;
+            } else {
+                fprintf(stderr, "ds4: K3 expert GEMV v2 (transposed, %zu + %zu bytes smem)\n", smem_gu, smem_dn);
+            }
+        }
+    }
+    /* decode inserts at the hot end of both caches; a prompt pass at the cold end (DS4_K3_CACHE_PREFILL_INSERT=1: hot) */
+    static int prefill_hot = -1, host_all = -1;
+    if (prefill_hot < 0) prefill_hot = getenv("DS4_K3_CACHE_PREFILL_INSERT") ? 1 : 0;
+    if (host_all < 0) host_all = getenv("DS4_K3_CACHE_HOST_ALL") ? 1 : 0;
+    /* step 44: a verification batch (several rows under decode policies): hot insertion, no tier C, no prompt-pass
+       prefetch, one cache tick, GEMV kernels (DS4_K3_VERIFY_GEMM=1 allows the GEMM path), so its numbers and its cache
+       behaviour are the decode path's */
+    const bool verify = p.verify != 0;
+    const bool hot = n_tok == 1u || prefill_hot || verify;
+    const bool bulk = n_tok > 1u && !verify;   /* step 35: a prompt pass's fills may use tier C and prefetch the next layer */
+    const uint64_t layer_key = (uint64_t)layer << 20;
+    if (n_tok == 1u || verify) { p.dc.tick += 1.0; p.hc.tick += 1.0; }
+    /* deterministic decode: every expert of the union accumulates into its own row (indexed by its position in
+       ulist), and a reduce in that fixed order writes out; the GEMM path and prompt passes keep accumulating. */
+    static int determ = -1;
+    if (determ < 0) determ = getenv("DS4_K3_NONDETERMINISTIC") ? 0 : 1;
+    /* partial rows [n_union x n_tok x latent] while they fit DS4_K3_PARTIALS_MB (256): decode always, prompts of
+       tens of tokens; longer prompt passes accumulate in arrival order (their float sums then vary run to run) */
+    static uint32_t part_cap_mb = 0;
+    if (!part_cap_mb) part_cap_mb = k3_env_u32("DS4_K3_PARTIALS_MB", 256u);
+    const size_t part_floats = (size_t)n_union * n_tok * latent;
+    const bool use_part = determ && part_floats * sizeof(float) <= (size_t)part_cap_mb << 20;
+    uint32_t part_idx[1024];
+    if (use_part) {
+        if (p.part_cap < part_floats) {
+            if (cudaStreamSynchronize(stream) != cudaSuccess) return 0;
+            if (p.dev_part) cudaFree(p.dev_part);
+            p.dev_part = nullptr; p.part_cap = 0;
+            const size_t want = (size_t)part_cap_mb << 20;
+            if (cudaMalloc(&p.dev_part, want) != cudaSuccess) return cuda_ok(cudaGetLastError(), "K3 partials");
+            p.part_cap = (uint32_t)(want / sizeof(float));
+        }
+        for (uint32_t i = 0; i < n_union; i++) part_idx[ulist[i]] = i;
+        if (cudaMemsetAsync(p.dev_part, 0, sizeof(float) * part_floats, stream) != cudaSuccess) return cuda_ok(cudaGetLastError(), "K3 partials memset");
+    }
+    /* step 76: a prompt pass whose dense partials do not fit keeps one weighted row per (token, slot) in a compact
+       buffer [n_list x latent] and reduces each token's slots in the router's order: bit-stable long prompt passes */
+    static int cpart_on = -1; static uint32_t cpart_cap_mb = 0;
+    if (cpart_on < 0) { cpart_on = getenv("DS4_K3_PROMPT_COMPACT") ? (atoi(getenv("DS4_K3_PROMPT_COMPACT")) != 0) : 1;   /* default on (5 Nov 2026) */ cpart_cap_mb = k3_env_u32("DS4_K3_CPART_MB", 512u); }
+    bool use_cpart = determ && !use_part && n_tok > 1u && cpart_on;
+    if (use_cpart) {
+        const size_t cfloats = (size_t)n_list * latent;
+        if (cfloats * sizeof(float) > ((size_t)cpart_cap_mb << 20)) {
+            static int warned = 0;
+            if (!warned) { warned = 1; fprintf(stderr, "ds4: K3 compact partials: %zu MB needed, cap %u MB (DS4_K3_CPART_MB); this pass accumulates in arrival order\n", (size_t)((cfloats * sizeof(float)) >> 20), cpart_cap_mb); }
+            use_cpart = false;
+        } else {
+            if (p.cpart_cap < cfloats) {
+                if (cudaStreamSynchronize(stream) != cudaSuccess) return 0;
+                if (p.dev_cpart) cudaFree(p.dev_cpart);
+                p.dev_cpart = nullptr; p.cpart_cap = 0;
+                if (cudaMalloc(&p.dev_cpart, cfloats * sizeof(float)) != cudaSuccess) return cuda_ok(cudaGetLastError(), "K3 compact partials");
+                p.cpart_cap = cfloats;
+            }
+            if (cudaMemsetAsync(p.dev_cpart, 0, cfloats * sizeof(float), stream) != cudaSuccess) return cuda_ok(cudaGetLastError(), "K3 compact partials memset");
+        }
+    }
+    static int selftest_on = -1;
+    if (selftest_on < 0) selftest_on = getenv("DS4_K3_GEMV_SELFTEST") ? 1 : 0;
+    const bool multi = p.ms_n >= 2u && use_part && n_tok == 1u && gemv_v2 && !gemm_ok && !selftest_on;
+    if (multi) {
+        if (cudaEventRecord(p.ms_fork, stream) != cudaSuccess) return cuda_ok(cudaGetLastError(), "K3 GEMV fork");
+        for (uint32_t i = 0; i < p.ms_n; i++)
+            if (cudaStreamWaitEvent(p.ms_stream[i], p.ms_fork, 0) != cudaSuccess) return cuda_ok(cudaGetLastError(), "K3 GEMV fork wait");
+    }
+    auto launch = [&](uint32_t d, uint32_t e) -> bool {
+        const uint8_t *slab = p.dev_ptr[d];
+        float *acc_out = use_part ? p.dev_part + (size_t)part_idx[e] * n_tok * latent : (use_cpart ? p.dev_cpart : (float *)out->ptr);
+        const uint32_t *orow = use_cpart ? p.dev_iota + off[e] : p.dev_tok + off[e];   /* step 76: output rows (input rows stay dev_tok) */
+        const uint32_t si = multi ? (p.ms_next++ % p.ms_n) : 0u;
+        cudaStream_t ls = multi ? p.ms_stream[si] : stream;
+        float *mid_buf = multi ? p.ms_mid + (size_t)si * ff : p.dev_mid;
+        if (cudaStreamWaitEvent(ls, p.dev_ready[d], 0) != cudaSuccess) return cuda_ok(cudaGetLastError(), "K3 raw wait") != 0;
+        if (gemm_ok && count[e] >= (uint32_t)gemm_min) {
+            k3_gemm_scratch &g = *g_k3_gemm;
+            const uint32_t nb = ff * latent / 32u, kt = count[e];
+            static int dq4 = -1;
+            if (dq4 < 0) dq4 = getenv("DS4_K3_DEQUANT_V1") ? 0 : 1;
+            if (dq4) {
+                const unsigned g4 = (unsigned)((nb * 4u + 255u) / 256u);
+                k3_raw_dequant4_kernel<<<g4, 256, 0, stream>>>(g.w1, slab + p.w1p, slab + p.w1s, nb);
+                k3_raw_dequant4_kernel<<<g4, 256, 0, stream>>>(g.w3, slab + p.w3p, slab + p.w3s, nb);
+                k3_raw_dequant4_kernel<<<g4, 256, 0, stream>>>(g.w2, slab + p.w2p, slab + p.w2s, nb);
+            } else {
+            k3_raw_dequant_kernel<<<(nb + 255u) / 256u, 256, 0, stream>>>(g.w1, slab + p.w1p, slab + p.w1s, nb);
+            k3_raw_dequant_kernel<<<(nb + 255u) / 256u, 256, 0, stream>>>(g.w3, slab + p.w3p, slab + p.w3s, nb);
+            k3_raw_dequant_kernel<<<(nb + 255u) / 256u, 256, 0, stream>>>(g.w2, slab + p.w2p, slab + p.w2s, nb);
+            }
+            k3_gather_bf16_kernel<<<(kt * latent + 255u) / 256u, 256, 0, stream>>>(g.xg, (const float *)x->ptr,
+                                                                                   p.dev_tok + off[e], kt, latent);
+            if (!k3_gemm_bf16(cublas, g.w1, g.xg, g.gate, (int)ff, (int)kt, (int)latent) ||
+                !k3_gemm_bf16(cublas, g.w3, g.xg, g.up, (int)ff, (int)kt, (int)latent)) return false;
+            k3_situ_bf16_kernel<<<(kt * ff + 255u) / 256u, 256, 0, stream>>>(g.mid16, g.gate, g.up, kt * ff, beta, beta_linear);
+            if (!k3_gemm_bf16(cublas, g.w2, g.mid16, g.part, (int)latent, (int)kt, (int)ff)) return false;
+            k3_scatter_add_kernel<<<(kt * latent + 255u) / 256u, 256, 0, stream>>>(acc_out, g.part,
+                                                                                   orow, p.dev_tw + off[e],
+                                                                                   kt, latent);
+        } else if (gemv_v2 && count[e] <= (uint32_t)K3_GEMV2_MAX_TOK) {
+            /* DS4_K3_GEMV_SELFTEST=1: on the first few experts run both kernel pairs and report the differences */
+            static int selftest = -1, tested = 0;
+            if (selftest < 0) selftest = getenv("DS4_K3_GEMV_SELFTEST") ? 1 : 0;
+            if (selftest && tested < 4 && count[e] >= 2u) {
+                tested++;
+                const size_t nm = (size_t)count[e] * ff, no = (size_t)n_tok * latent;
+                float *mid1 = nullptr, *mid2 = nullptr, *o1 = nullptr, *o2 = nullptr;
+                cudaMalloc(&mid1, nm * 4); cudaMalloc(&mid2, nm * 4); cudaMalloc(&o1, no * 4); cudaMalloc(&o2, no * 4);
+                cudaMemsetAsync(o1, 0, no * 4, stream); cudaMemsetAsync(o2, 0, no * 4, stream);
+                k3_raw_gate_up_multi_kernel<<<gu_grid, 256, 0, stream>>>(mid1, slab, (const float *)x->ptr, p.dev_tok + off[e],
+                                                                         count[e], ff, latent, p.w1p, p.w1s, p.w3p, p.w3s, beta, beta_linear);
+                k3_raw_gate_up_v2_kernel<K3_GEMV2_MAX_TOK><<<gu_grid, 256, k3_gemv2_smem_gate_up_n(latent, count[e]), stream>>>(
+                    mid2, slab, (const float *)x->ptr, p.dev_tok + off[e], count[e], ff, latent, p.w1p, p.w1s, p.w3p, p.w3s, beta, beta_linear);
+                /* down from the SAME mid (mid1) so the two downs are compared on equal input */
+                k3_raw_down_acc_kernel<<<d_grid, 256, 0, stream>>>(o1, slab, mid1, p.dev_tok + off[e], p.dev_tw + off[e], count[e], ff, latent, p.w2p, p.w2s);
+                k3_raw_down_v2_kernel<K3_GEMV2_MAX_TOK><<<d_grid, 256, k3_gemv2_smem_down_n(ff, count[e]), stream>>>(o2, slab, mid1, p.dev_tok + off[e], p.dev_tw + off[e], count[e], ff, latent, p.w2p, p.w2s);
+                std::vector<float> h1(nm), h2(nm), q1(no), q2(no);
+                cudaStreamSynchronize(stream);
+                cudaMemcpy(h1.data(), mid1, nm * 4, cudaMemcpyDeviceToHost); cudaMemcpy(h2.data(), mid2, nm * 4, cudaMemcpyDeviceToHost);
+                cudaMemcpy(q1.data(), o1, no * 4, cudaMemcpyDeviceToHost); cudaMemcpy(q2.data(), o2, no * 4, cudaMemcpyDeviceToHost);
+                double dm = 0, am = 0, dd = 0, ad = 0; size_t im = 0, id = 0;
+                for (size_t i = 0; i < nm; i++) { const double d = fabs((double)h1[i] - h2[i]); if (d > dm) { dm = d; im = i; } am = fmax(am, fabs((double)h1[i])); }
+                for (size_t i = 0; i < no; i++) { const double d = fabs((double)q1[i] - q2[i]); if (d > dd) { dd = d; id = i; } ad = fmax(ad, fabs((double)q1[i])); }
+                fprintf(stderr, "ds4: K3 GEMV selftest layer %u expert %u: gate_up max|v1-v2| %.3g at %zu (v1 %.5g v2 %.5g, max|v1| %.3g); down max|v1-v2| %.3g at %zu (v1 %.5g v2 %.5g, max|v1| %.3g)\n",
+                        layer, e, dm, im, h1[im], h2[im], am, dd, id, q1[id], q2[id], ad);
+                cudaFree(mid1); cudaFree(mid2); cudaFree(o1); cudaFree(o2);
+            }
+            k3_raw_gate_up_v2_kernel<K3_GEMV2_MAX_TOK><<<gu_grid, 256, k3_gemv2_smem_gate_up_n(latent, count[e]), ls>>>(
+                mid_buf, slab, (const float *)x->ptr, p.dev_tok + off[e], count[e], ff, latent, p.w1p, p.w1s, p.w3p, p.w3s,
+                beta, beta_linear);
+            k3_raw_down_v2_kernel<K3_GEMV2_MAX_TOK><<<d_grid, 256, k3_gemv2_smem_down_n(ff, count[e]), ls>>>(
+                acc_out, slab, mid_buf, orow, p.dev_tw + off[e], count[e], ff, latent, p.w2p, p.w2s);
+        } else {
+            k3_raw_gate_up_multi_kernel<<<gu_grid, 256, 0, stream>>>(p.dev_mid, slab, (const float *)x->ptr, p.dev_tok + off[e],
+                                                                     count[e], ff, latent, p.w1p, p.w1s, p.w3p, p.w3s,
+                                                                     beta, beta_linear);
+            k3_raw_down_acc_kernel<<<d_grid, 256, 0, stream>>>(acc_out, slab, p.dev_mid, orow,
+                                                               p.dev_tw + off[e], count[e], ff, latent, p.w2p, p.w2s);
+        }
+        return cudaEventRecord(p.dev_free[d], ls) == cudaSuccess;
+    };
+    uint32_t next = 0, launched = 0, pending = 0, cold_inflight = 0;
+    int failed = 0;
+    {
+        std::lock_guard<std::mutex> lk(p.mu);
+        p.failed = 0;
+        p.failed_slabs.clear();
+        /* step 29: prefetch fills that completed since the previous layer are plain cache entries now */
+        for (size_t i = 0; i < p.ready_q.size(); ) {
+            const uint32_t d = p.ready_q[i];
+            if (p.wanted[d]) { i++; continue; }
+            const int h = p.dev_host[d];
+            if (h >= 0) { p.hc.pinned[(uint32_t)h] = 0; if (p.victim && !host_all && !(p.pool_keep && p.hhit[d])) p.hc.drop((uint32_t)h); }   /* step 75 */
+            p.dc.pinned[d] = p.pf_slab[d] ? 1 : 0; p.dc.filling[d] = 0; p.dev_host[d] = -1; p.cold_job[d] = 0;
+            if (p.pf_pending) p.pf_pending--;
+            p.ready_q.erase(p.ready_q.begin() + (long)i);
+        }
+        /* step 36: prefetches for this layer stay pinned until its enqueue loop reaches them (a prompt pass would
+           otherwise recycle them first, as transient entries, before it gets there: t82 re-read 27 GB); older ones
+           that completed become plain entries */
+        for (size_t i = 0; i < p.pf_list.size(); ) {
+            const uint32_t d = p.pf_list[i];
+            const bool mine = p.pf_slab[d] && p.dc.key[d] != K3_NOKEY && (uint32_t)(p.dc.key[d] >> 20) == layer;
+            if (!p.pf_slab[d] || (!mine && !p.dc.filling[d])) {
+                if (p.pf_slab[d]) { p.pf_slab[d] = 0; p.dc.pinned[d] = 0; }
+                p.pf_list[i] = p.pf_list.back(); p.pf_list.pop_back();
+                continue;
+            }
+            i++;
+        }
+        /* step 35: cold-tier fills this layer still needs (tier C helps while this backlog is deep) */
+        uint32_t n_cold_layer = 0;
+        for (uint32_t i = 0; i < n_union; i++) {
+            const uint32_t e = ulist[i];
+            if (ds4_k3_expert_source_is_primary(layer, e)) continue;
+            const int dd = p.dc.lookup(layer_key | e, false);
+            if (dd >= 0 && !p.dc.filling[(uint32_t)dd]) continue;
+            n_cold_layer++;
+        }
+        p.cold_backlog = n_cold_layer;
+        p.cv_job.notify_all();
+    }
+    /* step 38: a fill is `split` chunk jobs landing in the same slab; the worker homes each chunk */
+    auto push_fill = [&](uint32_t L, uint32_t E, uint32_t d, int h, bool read, bool pf) {
+        if (p.trace_fills) { p.tf_enq[d] = k3_now_sec(); p.tf_pick[d] = p.tf_r0[d] = p.tf_r1[d] = p.tf_up[d] = p.tf_rdy[d] = 0.0; p.tf_tier[d] = -1; }   /* step 68 */
+        const uint32_t n = read ? ((bulk && p.split_decode_only) ? 1u : p.split) : 1u;
+        const uint64_t pages = p.file_bytes / 4096u, per = (pages + n - 1u) / n;
+        std::lock_guard<std::mutex> lk(p.mu);
+        p.chunks_left[d] = (uint8_t)n; p.chunk_failed[d] = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            const uint64_t off = (uint64_t)i * per * 4096u;
+            if (off >= p.file_bytes) { if (p.chunks_left[d]) p.chunks_left[d]--; continue; }
+            const uint64_t len = per * 4096u < p.file_bytes - off ? per * 4096u : p.file_bytes - off;
+            p.jobs.push_back({L, E, (int)d, h, read, bulk, pf, (uint32_t)off, (uint32_t)len, k3_now_sec()});
+        }
+    };
+    bool pf_done = false;
+    auto issue_prefetch = [&]() {
+        pf_done = true;
+        if (p.hint_layer != layer + 1u || p.hint_n == 0u) return;
+        if (hot ? p.pf_mode == 0 : p.bulk_pf_mode == 0) return;
+        const uint32_t nl = layer + 1u;
+        uint32_t want_max = hot ? p.pf_max : p.bulk_pf_max;
+        if (!hot && want_max > n_tok / p.bulk_pf_div) want_max = n_tok / p.bulk_pf_div;   /* step 36b: only what the bubble can absorb */
+        if (want_max == 0u) return;
+        const uint32_t want_rank = hot ? p.pf_rank : p.hint_n;
+        const uint32_t want_inflight = hot ? p.pf_inflight_max : p.bulk_pf_inflight;
+        uint32_t issued = 0;
+        const int passes = (hot && p.pf_mode == 3) ? 2 : 1;   /* step 50: cold-tier candidates first, then the rest */
+        for (int pass = 0; pass < passes; pass++)
+        for (uint32_t i = 0; i < p.hint_n && i < want_rank && issued < want_max && p.pf_pending < want_inflight; i++) {
+            const int32_t ei = p.hint_e[i];
+            if (ei < 0 || ei >= 1024) continue;
+            const uint32_t e2 = (uint32_t)ei;
+            const bool cold2 = !ds4_k3_expert_source_is_primary(nl, e2);
+            if (hot ? (p.pf_mode == 1 && !cold2) : !cold2) continue;
+            if (passes == 2 && (pass == 0 ? !cold2 : cold2)) continue;
+            const uint64_t k2 = ((uint64_t)nl << 20) | e2;
+            if (p.dc.lookup(k2, false) >= 0) continue;
+            int h2 = p.hc.lookup(k2, false);
+            const bool read2 = h2 < 0;
+            if (read2) { h2 = p.hc.alloc(k2, false); if (h2 < 0) break; }
+            uint64_t ev2 = K3_NOKEY;
+            const int d2 = p.dc.alloc(k2, hot, &ev2);   /* a prompt pass's prefetch is transient like its other fills */
+            if (d2 < 0) { if (read2) p.hc.drop((uint32_t)h2); break; }
+            p.hc.pinned[(uint32_t)h2] = 1; p.dc.pinned[(uint32_t)d2] = 1; p.dc.filling[(uint32_t)d2] = 1;
+            p.dev_host[(uint32_t)d2] = h2; p.wanted[(uint32_t)d2] = 0; p.cold_job[(uint32_t)d2] = cold2 ? 1 : 0; p.hhit[(uint32_t)d2] = read2 ? 0 : 1;   /* step 75 */
+            if (!hot) { p.pf_slab[(uint32_t)d2] = 1; p.pf_list.push_back((uint32_t)d2); }
+            if (p.victim && hot && !host_all && ev2 != K3_NOKEY) k3_victim_copy(p, (uint32_t)d2, ev2);
+            if (read2) p.misses++; else p.hits_host++;
+            push_fill(nl, e2, (uint32_t)d2, h2, read2, true);
+            if (cold2 && read2) { std::lock_guard<std::mutex> lk(p.mu); p.cold_backlog++; }
+            p.cv_job.notify_all();
+            p.pf_pending++; p.pf_issued++; issued++;
+        }
+        p.hint_layer = ~0u;   /* one use per hint */
+    };
+    uint32_t vis_buf[1024]; const uint32_t *vis = ulist;   /* step 74: the enqueue loop's visiting order; ulist and the partial slots keep theirs */
+    if (p.pool_first && hot && n_tok == 1u && n_union > 1u) {
+        uint32_t nh = 0, nm = 0, tailbuf[1024];
+        for (uint32_t i = 0; i < n_union; i++) {
+            const uint64_t kk = layer_key | ulist[i];
+            if (p.dc.lookup(kk, false) >= 0 || p.hc.lookup(kk, false) >= 0) vis_buf[nh++] = ulist[i]; else tailbuf[nm++] = ulist[i];
+        }
+        for (uint32_t i = 0; i < nm; i++) vis_buf[nh + i] = tailbuf[i];
+        vis = vis_buf;
+    }
+    while (launched < n_union) {
+        /* enqueue: device hits launch now; the rest become fills while the in-flight budget and free slabs allow */
+        while (next < n_union && pending < p.max_pending) {
+            if (bulk) p.bulk_left = n_union - next;   /* step 60c */
+            const uint32_t e = vis[next];   /* step 74 */
+            const uint64_t k = layer_key | e;
+            int d = p.dc.lookup(k, hot);
+            if (d >= 0 && !p.dc.filling[(uint32_t)d]) {
+                p.hits_dev++;
+                if (p.pf_slab[(uint32_t)d]) { p.pf_slab[(uint32_t)d] = 0; p.dc.pinned[(uint32_t)d] = 0; p.pf_hit++; }   /* a prefetch consumed */
+                if (hot) (void)p.hc.lookup(k, true);   /* keep the host copy's recency in step with the device hit */
+                if (!launch((uint32_t)d, e)) return 0;
+                launched++; next++;
+                continue;
+            }
+            if (d >= 0) {
+                /* step 29: a prefetch of this expert is still in flight: adopt it as one of this layer's fills */
+                if (!p.wanted[(uint32_t)d]) {
+                    p.wanted[(uint32_t)d] = 1; pending++; p.pf_adopted++; p.pf_slab[(uint32_t)d] = 0;
+                    if (p.pf_pending) p.pf_pending--;
+                    if (p.cold_job[(uint32_t)d]) cold_inflight++;
+                }
+                next++;
+                continue;
+            }
+            int h = p.hc.lookup(k, hot);
+            const bool read = h < 0;
+            const bool cold_tier = !ds4_k3_expert_source_is_primary(layer, e);
+            if (read) {
+                /* victim mode: the staging slab is transient and released once the fill is seen; otherwise cold-tier
+                   reads stay in the host cache (DS4_K3_CACHE_HOST_ALL=1: every read) */
+                const bool keep_host = !p.victim && hot && cold_tier;
+                h = p.hc.alloc(k, keep_host || (hot && host_all));
+                if (h < 0) break;
+            }
+            uint64_t evicted = K3_NOKEY;
+            d = p.dc.alloc(k, hot, &evicted);   /* no second chance in the device cache: its residency is ~1.7 tokens and the
+                                                   same-layer-next-token reuse falls off a cliff below one token (p3: hits 551 -> 60) */
+            if (d < 0) { if (read) p.hc.drop((uint32_t)h); break; }
+            p.hc.pinned[(uint32_t)h] = 1; p.dc.pinned[(uint32_t)d] = 1; p.dc.filling[(uint32_t)d] = 1;
+            p.dev_host[(uint32_t)d] = h; p.hhit[(uint32_t)d] = read ? 0 : 1;   /* step 75 */
+            if (p.victim && hot && !host_all && evicted != K3_NOKEY) k3_victim_copy(p, (uint32_t)d, evicted);
+            if (read) p.misses++; else p.hits_host++;
+            p.wanted[(uint32_t)d] = 1; p.cold_job[(uint32_t)d] = cold_tier ? 1 : 0;
+            if (cold_tier) cold_inflight++;
+            push_fill(layer, e, (uint32_t)d, h, read, false);
+            p.cv_job.notify_all();
+            pending++; next++;
+        }
+        /* decode: prefetch once the Samsung is free of this layer's reads; a prompt pass: once its last fill is
+           enqueued and the Samsung queue is draining (the next layer's cold reads then follow without a gap) */
+        if (!pf_done && (hot ? (p.pf_mode == 2 ? (next == n_union && pending <= p.pf_tail_pending) : cold_inflight == 0u)
+                             : next == n_union)) issue_prefetch();   /* bulk: queued behind this layer's cold reads */
+        if (launched == n_union) break;
+        if (pending == 0) { fprintf(stderr, "ds4: K3 expert caches: no slab free (layer %u)\n", layer); failed = 1; break; }
+        uint32_t ready[64], n_ready = 0;
+        {
+            std::unique_lock<std::mutex> lk(p.mu);
+            p.cv_done.wait(lk, [&] { return p.failed || !p.ready_q.empty(); });
+            while (!p.ready_q.empty() && n_ready < 64u) {
+                const uint32_t dq = p.ready_q.front(); p.ready_q.pop_front();
+                if (p.cold_job[dq] && p.cold_backlog) p.cold_backlog--;
+                ready[n_ready++] = dq;
+            }
+            if (p.failed) failed = 1;
+        }
+        for (uint32_t i = 0; i < n_ready; i++) {
+            const uint32_t d = ready[i];
+            const uint32_t e = (uint32_t)(p.dc.key[d] & 0xfffffu);
+            if (p.trace_fills) p.tf_rdy[d] = k3_now_sec();   /* step 68 */
+            const int h = p.dev_host[d];
+            if (h >= 0) { p.hc.pinned[(uint32_t)h] = 0; if (p.victim && !host_all && !(p.pool_keep && p.hhit[d])) p.hc.drop((uint32_t)h); }   /* exclusive unless step 75 keeps a host hit's copy */
+            p.dc.pinned[d] = (p.pf_slab[d] && !p.wanted[d]) ? 1 : 0; p.dc.filling[d] = 0; p.dev_host[d] = -1;
+            if (p.cold_job[d]) { p.cold_job[d] = 0; if (p.wanted[d] && cold_inflight) cold_inflight--; }
+            if (!p.wanted[d]) { if (p.pf_pending) p.pf_pending--; continue; }   /* a prefetch for the next layer: done */
+            p.wanted[d] = 0;
+            pending--; launched++;
+            if (!failed && !launch(d, e)) return 0;
+        }
+        if (!pf_done && (hot ? (p.pf_mode == 2 ? (next == n_union && pending <= p.pf_tail_pending) : cold_inflight == 0u)
+                             : next == n_union)) issue_prefetch();
+        if (failed) break;
+    }
+    if (failed) {
+        /* let every pending fill come back, then forget the slabs whose content is not trustworthy */
+        while (pending > 0) {
+            std::unique_lock<std::mutex> lk(p.mu);
+            p.cv_done.wait(lk, [&] { return !p.ready_q.empty(); });
+            while (!p.ready_q.empty()) {
+                const uint32_t d = p.ready_q.front(); p.ready_q.pop_front();
+                const int h = p.dev_host[d];
+                if (h >= 0) p.hc.pinned[(uint32_t)h] = 0;
+                p.dc.pinned[d] = 0; p.dc.filling[d] = 0; p.dev_host[d] = -1;
+                if (pending) pending--;
+            }
+        }
+        std::lock_guard<std::mutex> lk(p.mu);
+        for (uint32_t d : p.failed_slabs) { const int h = p.dev_host[d]; p.dc.drop(d); if (h >= 0) p.hc.drop((uint32_t)h); }
+        for (uint32_t i = next; i < n_union; i++) { (void)i; }
+        p.wait_s += k3_now_sec() - t0;
+        fprintf(stderr, "ds4: K3 expert pipeline failed (layer %u)\n", layer);
+        return 0;
+    }
+    if (p.trace_fills && hot && n_tok == 1u) {   /* step 68: one line per traced decode layer */
+        p.trace_fill_calls++;
+        if (p.trace_fill_calls > 1840u && p.trace_fill_printed < (uint64_t)p.trace_fills) {
+            p.trace_fill_printed++;
+            const double tn = k3_now_sec();
+            fprintf(stderr, "ds4: K3 fills L%u call %llu: union %u, layer %.2f ms |", layer, (unsigned long long)p.trace_fill_calls, n_union, (tn - t0) * 1e3);
+            for (uint32_t i = 0; i < n_union; i++) {
+                const int d = p.dc.lookup(layer_key | ulist[i], false);
+                if (d < 0 || p.tf_enq[(uint32_t)d] < t0) continue;   /* a device hit, or not this layer's fill */
+                const uint32_t dd = (uint32_t)d;
+                fprintf(stderr, " e%u t%d enq%.2f pick%.2f r%.2f-%.2f up%.2f rdy%.2f", ulist[i], (int)p.tf_tier[dd], (p.tf_enq[dd] - t0) * 1e3, (p.tf_pick[dd] - t0) * 1e3, (p.tf_r0[dd] - t0) * 1e3, (p.tf_r1[dd] - t0) * 1e3, (p.tf_up[dd] - t0) * 1e3, (p.tf_rdy[dd] - t0) * 1e3);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+    p.wait_s += k3_now_sec() - t0;
+    /* step 36: prefetches for this layer that it did not need are plain (transient) entries from here */
+    for (size_t i = 0; i < p.pf_list.size(); ) {
+        const uint32_t d = p.pf_list[i];
+        const bool mine = p.dc.key[d] != K3_NOKEY && (uint32_t)(p.dc.key[d] >> 20) == layer;
+        if (!p.pf_slab[d] || (mine && !p.dc.filling[d])) {
+            if (p.pf_slab[d]) { p.pf_slab[d] = 0; p.dc.pinned[d] = 0; }
+            p.pf_list[i] = p.pf_list.back(); p.pf_list.pop_back();
+            continue;
+        }
+        i++;
+    }
+    if (multi) {
+        for (uint32_t i = 0; i < p.ms_n; i++) {
+            if (cudaEventRecord(p.ms_join[i], p.ms_stream[i]) != cudaSuccess ||
+                cudaStreamWaitEvent(stream, p.ms_join[i], 0) != cudaSuccess) return cuda_ok(cudaGetLastError(), "K3 GEMV join");
+        }
+    }
+    if (use_part) k3_part_reduce_kernel<<<(unsigned)((n_tok * latent + 255u) / 256u), 256, 0, stream>>>((float *)out->ptr, p.dev_part, n_union, n_tok, latent);
+    else if (use_cpart) k3_tent_reduce_kernel<<<(unsigned)((n_tok * latent + 255u) / 256u), 256, 0, stream>>>((float *)out->ptr, p.dev_cpart, p.dev_tent, n_tok, n_used, latent);   /* step 76 */
+    return cuda_ok(cudaGetLastError(), "K3 raw MoE launch");
+}
+
+extern "C" int ds4_gpu_k3_moe_raw_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const int32_t *selected,
+                                         const float *weights, uint32_t n_used, uint32_t layer, uint32_t ff,
+                                         uint32_t latent, float beta, float beta_linear) {
+    return ds4_gpu_k3_moe_raw_batch_tensor(out, x, selected, weights, 1u, n_used, layer, ff, latent, beta, beta_linear);
+}
+
+extern "C" void ds4_gpu_k3_moe_raw_stats(double *wait_s, uint64_t *bytes) {
+    if (wait_s) *wait_s = k3_raw_get().wait_s;
+    if (bytes) *bytes = k3_raw_get().bytes.load();
+}
+extern "C" int ds4_gpu_k3_cache_grow(void) {
+    k3_raw_pool &p = k3_raw_get();
+    if (!p.ready || p.grown) return 1;
+    p.grown = true;
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) { cudaGetLastError(); return 1; }
+    const uint64_t reserve = (uint64_t)k3_env_u32("DS4_K3_CACHE_VRAM_RESERVE_MB", 4096u) << 20;   /* step 54: 4 GB again (long prompt passes chunk) */
+    uint64_t budget = free_b > reserve ? free_b - reserve : 0;
+    const uint32_t cap_gb = k3_env_u32("DS4_K3_CACHE_VRAM_GB", 0);
+    if (cap_gb && budget > (uint64_t)cap_gb << 30) budget = (uint64_t)cap_gb << 30;
+    uint32_t n_new = (uint32_t)(budget / p.file_bytes);
+    {   /* step 54: never below one token's working set + margin — the same-layer reuse of the next token needs it */
+        const uint32_t need = 92u * 16u + 64u;
+        if (p.dc.cap + n_new < need) {
+            const uint64_t floor_reserve = (uint64_t)1 << 30;
+            const uint64_t stretch = free_b > floor_reserve ? (free_b - floor_reserve) / p.file_bytes : 0;
+            const uint32_t n_stretch = (uint32_t)(stretch > need - p.dc.cap ? need - p.dc.cap : stretch);
+            if (n_stretch > n_new) { fprintf(stderr, "ds4: kimi-k3 device expert cache: taking %u slabs from the VRAM reserve to hold one token's working set (%u)\n", n_stretch - n_new, need); n_new = n_stretch; }
+            if (p.dc.cap + n_new < need) fprintf(stderr, "ds4: kimi-k3 WARNING: device expert cache (%u slabs) is below one token's working set (%u): decode hit rate will collapse\n", p.dc.cap + n_new, need);
+        }
+    }
+    if (p.dc.cap + n_new > 32768u) n_new = 32768u - p.dc.cap;
+    if (n_new < 16u) { fprintf(stderr, "ds4: kimi-k3 device expert cache stays at %u slabs (%.1f GB free)\n", p.dc.cap, (double)free_b / 1e9); return 1; }
+    uint8_t *region = nullptr;
+    while (n_new >= 16u && cudaMalloc(&region, p.file_bytes * n_new) != cudaSuccess) { cudaGetLastError(); n_new /= 2u; region = nullptr; }
+    if (!region) return 1;
+    const uint32_t n0 = p.dc.cap;
+    p.dev_ptr.resize(n0 + n_new);
+    for (uint32_t s = 0; s < n_new; s++) p.dev_ptr[n0 + s] = region + (size_t)s * p.file_bytes;
+    p.dev_free.resize(n0 + n_new); p.dev_ready.resize(n0 + n_new); p.dev_host.resize(n0 + n_new, -1); p.hhit.resize(n0 + n_new, 0);
+    p.wanted.resize(n0 + n_new, 0); p.cold_job.resize(n0 + n_new, 0); p.pf_slab.resize(n0 + n_new, 0); p.tf_enq.resize(n0 + n_new, 0.0); p.tf_pick.resize(n0 + n_new, 0.0); p.tf_r0.resize(n0 + n_new, 0.0); p.tf_r1.resize(n0 + n_new, 0.0); p.tf_up.resize(n0 + n_new, 0.0); p.tf_rdy.resize(n0 + n_new, 0.0); p.tf_tier.resize(n0 + n_new, -1); /* step 68 */ p.chunks_left.resize(n0 + n_new, 0); p.chunk_failed.resize(n0 + n_new, 0);
+    for (uint32_t s = n0; s < n0 + n_new; s++) {
+        if (cudaEventCreateWithFlags(&p.dev_free[s], cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&p.dev_ready[s], cudaEventDisableTiming) != cudaSuccess) return 0;
+    }
+    p.dc.grow(n_new);
+    fprintf(stderr, "ds4: kimi-k3 device expert cache grown to %u slabs (%.1f GB; %.1f GB was free)\n", p.dc.cap,
+            (double)p.dc.cap * p.file_bytes / 1e9, (double)free_b / 1e9);
+    return 1;
+}
+extern "C" uint64_t ds4_gpu_k3_cache_copydowns(void) { return k3_raw_get().copydowns.load(); }
+extern "C" void ds4_gpu_k3_prefetch_hint(uint32_t layer, const int32_t *experts, uint32_t n) {
+    k3_raw_pool &p = k3_raw_get();
+    if (!experts || n == 0u) { p.hint_layer = ~0u; p.hint_n = 0; return; }
+    if (n > 256u) n = 256u;
+    memcpy(p.hint_e, experts, n * sizeof(int32_t)); p.hint_n = n; p.hint_layer = layer;
+}
+extern "C" void ds4_gpu_k3_prefetch_stats(uint64_t *issued, uint64_t *adopted) {
+    k3_raw_pool &p = k3_raw_get();
+    if (issued) *issued = p.pf_issued.load();
+    if (adopted) *adopted = p.pf_adopted.load();
+}
+extern "C" void ds4_gpu_k3_set_verify(int on) { k3_raw_get().verify = on ? 1 : 0; }   /* step 44 */
+extern "C" int ds4_gpu_k3_skip_mode(void) { return k3_raw_get().skip_mode; }   /* step 57 */
+extern "C" void ds4_gpu_k3_skip_stats(uint64_t *skipped, double *mass, uint64_t *obs_n, uint64_t obs[6]) {   /* step 57 */
+    k3_raw_pool &p = k3_raw_get();
+    if (skipped) *skipped = p.skipped;
+    if (mass) *mass = (double)p.skip_mass_e6 / 1e6;
+    if (obs_n) *obs_n = p.skip_obs_n;
+    if (obs) for (int i = 0; i < 6; i++) obs[i] = p.skip_obs[i];
+}
+extern "C" void ds4_gpu_k3_queue_stats(double *wait_s, uint64_t *n_waits, uint64_t *pf_hit) {   /* step 44 */
+    k3_raw_pool &p = k3_raw_get();
+    if (wait_s) *wait_s = (double)p.q_wait_us.load() / 1e6;
+    if (n_waits) *n_waits = p.q_waits.load();
+    if (pf_hit) *pf_hit = p.pf_hit.load();
+}
+/* step 35: per-token top-k over sigmoid(logit)+bias, histogrammed over experts: a prompt pass's prediction of the next
+   layer's expert union (ties and rounding do not matter: it only orders prefetch candidates) */
+__global__ static void k3_route_hist_kernel(uint32_t *counts, const float *logits, const float *bias, uint32_t n_expert, uint32_t n_used) {
+    extern __shared__ float sc[];
+    __shared__ float bv[256];
+    __shared__ int bi[256];
+    const float *row = logits + (size_t)blockIdx.x * n_expert;
+    for (uint32_t e = threadIdx.x; e < n_expert; e += blockDim.x) sc[e] = 1.0f / (1.0f + __expf(-row[e])) + bias[e];
+    __syncthreads();
+    for (uint32_t k = 0; k < n_used; k++) {
+        float v = -INFINITY; int idx = -1;
+        for (uint32_t e = threadIdx.x; e < n_expert; e += blockDim.x) if (sc[e] > v) { v = sc[e]; idx = (int)e; }
+        bv[threadIdx.x] = v; bi[threadIdx.x] = idx;
+        __syncthreads();
+        for (uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (threadIdx.x < s) {
+                const float ov = bv[threadIdx.x + s]; const int oi = bi[threadIdx.x + s];
+                if (oi >= 0 && (bi[threadIdx.x] < 0 || ov > bv[threadIdx.x] || (ov == bv[threadIdx.x] && oi < bi[threadIdx.x]))) { bv[threadIdx.x] = ov; bi[threadIdx.x] = oi; }
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0 && bi[0] >= 0) { atomicAdd(&counts[bi[0]], 1u); sc[bi[0]] = -INFINITY; }
+        __syncthreads();
+    }
+}
+extern "C" int ds4_gpu_k3_route_hist(uint32_t *counts_out, const ds4_gpu_tensor *logits, const float *bias, uint32_t n_tok,
+                                     uint32_t n_expert, uint32_t n_used) {
+    if (!counts_out || !logits || !bias || n_tok == 0u || n_expert == 0u || n_expert > 1024u || n_used == 0u || n_used > 64u) return 0;
+    if (logits->bytes < (uint64_t)n_tok * n_expert * sizeof(float)) return 0;
+    static uint32_t *d_counts = nullptr;
+    static float *d_bias = nullptr;
+    if (!d_counts && (cudaMalloc(&d_counts, 1024u * sizeof(uint32_t)) != cudaSuccess ||
+                      cudaMalloc(&d_bias, 1024u * sizeof(float)) != cudaSuccess)) { cudaGetLastError(); return 0; }
+    cudaStream_t stream = cuda_decode_stream();
+    if (cudaMemcpyAsync(d_bias, bias, n_expert * sizeof(float), cudaMemcpyHostToDevice, stream) != cudaSuccess ||
+        cudaMemsetAsync(d_counts, 0, n_expert * sizeof(uint32_t), stream) != cudaSuccess) { cudaGetLastError(); return 0; }
+    k3_route_hist_kernel<<<n_tok, 256, n_expert * sizeof(float), stream>>>(d_counts, (const float *)logits->ptr, d_bias, n_expert, n_used);
+    if (cudaMemcpyAsync(counts_out, d_counts, n_expert * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+        cudaStreamSynchronize(stream) != cudaSuccess) { cudaGetLastError(); return 0; }
+    return 1;
+}
+extern "C" uint64_t ds4_gpu_k3_green_reads(void) { return k3_raw_get().green_reads.load(); }
+extern "C" void ds4_gpu_k3_argodrive_stats(uint64_t *chunks3, double *stream_gbps3) {
+    k3_raw_pool &p = k3_raw_get();
+    for (int t = 0; t < 3; t++) { if (chunks3) chunks3[t] = p.tier_chunks[t].load(); if (stream_gbps3) stream_gbps3[t] = p.meas_gbps[t]; }
+}
+extern "C" void ds4_gpu_k3_source_stats(uint64_t *bytes3, uint64_t *fallback_reads, uint64_t *fallback_bytes, int *tier_c_configured) {
+    k3_raw_pool &p = k3_raw_get();
+    for (int t = 0; t < 3; t++) if (bytes3) bytes3[t] = p.tier_bytes[t].load();
+    if (fallback_reads) *fallback_reads = p.fallback_reads.load();
+    if (fallback_bytes) *fallback_bytes = p.fallback_bytes.load();
+    if (tier_c_configured) *tier_c_configured = p.green_limit != 0u;
+}
+extern "C" void ds4_gpu_k3_cache_stats(uint64_t *hits_dev, uint64_t *hits_host, uint64_t *misses) {
+    k3_raw_pool &p = k3_raw_get();
+    if (hits_dev) *hits_dev = p.hits_dev.load();
+    if (hits_host) *hits_host = p.hits_host.load();
+    if (misses) *misses = p.misses.load();
+}
+
+/* ---- batched (prompt) variants of the per-token K3 attention kernels: the same kernels launched once per token
+   with row offsets, so the batched prompt pass computes exactly what the sequential pass computes. */
+extern "C" int ds4_gpu_k3_residual_mix_batch_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+                                                    const ds4_gpu_tensor *anchors, uint32_t n_anchor, uint32_t n_tok,
+                                                    const void *model_map, uint64_t model_size, uint64_t norm_offset,
+                                                    uint64_t proj_offset, uint32_t n, float eps) {
+    if (!out || !x || n == 0u || n_tok == 0u || n_anchor > 16u || (n_anchor != 0u && !anchors)) return 0;
+    if (out->bytes < (uint64_t)n_tok * n * sizeof(float) || x->bytes < (uint64_t)n_tok * n * sizeof(float) ||
+        (anchors && anchors->bytes < (uint64_t)n_tok * 16u * n * sizeof(float))) return 0;
+    const int tier = ds4_tensor_device_idx(out);
+    const float *norm = glm53_cuda_weight_f32(model_map, model_size, norm_offset, n, tier, "K3 residual norm");
+    const float *proj = glm53_cuda_weight_f32(model_map, model_size, proj_offset, n, tier, "K3 residual proj");
+    if (!norm || !proj) return 0;
+    cudaStream_t stream = cuda_decode_stream();
+    k3_residual_mix_batch_kernel<<<n_tok, 1024, 0, stream>>>((float *)out->ptr, (const float *)x->ptr,
+        anchors ? (const float *)anchors->ptr : nullptr, n_anchor, norm, proj, n, eps);
+    return cuda_ok(cudaGetLastError(), "K3 residual mix batch launch");
+}
+
+extern "C" int ds4_gpu_k3_anchor_push_batch_tensor(ds4_gpu_tensor *anchors, const ds4_gpu_tensor *cur, uint32_t slot,
+                                                   uint32_t n_tok, uint32_t n) {
+    if (!anchors || !cur || slot >= 16u || n_tok == 0u || n == 0u) return 0;
+    if (anchors->bytes < (uint64_t)n_tok * 16u * n * sizeof(float) || cur->bytes < (uint64_t)n_tok * n * sizeof(float)) return 0;
+    const size_t row = (size_t)n * sizeof(float);
+    if (cudaMemcpy2DAsync((char *)anchors->ptr + (size_t)slot * row, 16u * row, cur->ptr, row, row, n_tok,
+                          cudaMemcpyDeviceToDevice, cuda_decode_stream()) != cudaSuccess) {
+        return cuda_ok(cudaGetLastError(), "K3 anchor push batch");
+    }
+    return 1;
+}
+
+/* Strided row copy (device to device): n_rows rows of width floats, from stride src_stride to stride dst_stride. */
+extern "C" int ds4_gpu_k3_copy_rows_tensor(ds4_gpu_tensor *dst, uint32_t dst_stride, const ds4_gpu_tensor *src,
+                                           uint32_t src_stride, uint32_t width, uint32_t n_rows) {
+    if (!dst || !src || width == 0u || n_rows == 0u || dst_stride < width || src_stride < width) return 0;
+    if (dst->bytes < ((uint64_t)(n_rows - 1u) * dst_stride + width) * sizeof(float) ||
+        src->bytes < ((uint64_t)(n_rows - 1u) * src_stride + width) * sizeof(float)) return 0;
+    if (cudaMemcpy2DAsync(dst->ptr, (size_t)dst_stride * sizeof(float), src->ptr, (size_t)src_stride * sizeof(float),
+                          (size_t)width * sizeof(float), n_rows, cudaMemcpyDeviceToDevice, cuda_decode_stream()) != cudaSuccess) {
+        return cuda_ok(cudaGetLastError(), "K3 row copy");
+    }
+    return 1;
+}
+
+extern "C" int ds4_gpu_k3_split_kvb_batch_tensor(ds4_gpu_tensor *k_nope, ds4_gpu_tensor *value, const ds4_gpu_tensor *kvb,
+                                                 uint32_t n_tok, uint32_t heads, uint32_t nope, uint32_t vdim) {
+    if (!k_nope || !value || !kvb || n_tok == 0u) return 0;
+    const uint32_t n = heads * (nope + vdim);
+    cudaStream_t stream = cuda_decode_stream();
+    const dim3 grid((n + 255u) / 256u, n_tok, 1u);
+    k3_split_kvb_batch_kernel<<<grid, 256, 0, stream>>>((float *)k_nope->ptr, (float *)value->ptr, (const float *)kvb->ptr, heads, nope, vdim);
+    return cuda_ok(cudaGetLastError(), "K3 kv_b split batch launch");
+}
+
+extern "C" int ds4_gpu_k3_mla_store_batch_tensor(ds4_gpu_tensor *key_cache, ds4_gpu_tensor *value_cache,
+                                                 const ds4_gpu_tensor *k_nope, const ds4_gpu_tensor *kv_raw,
+                                                 const ds4_gpu_tensor *value, uint32_t pos0, uint32_t n_tok,
+                                                 uint32_t cache_cap, uint32_t heads, uint32_t nope, uint32_t rot,
+                                                 uint32_t kv_lora, uint32_t vdim) {
+    if (!key_cache || !value_cache || !k_nope || !kv_raw || !value || n_tok == 0u || pos0 + n_tok > cache_cap) return 0;
+    const uint32_t n = heads * (nope + rot) + heads * vdim;
+    cudaStream_t stream = cuda_decode_stream();
+    const dim3 grid((n + 255u) / 256u, n_tok, 1u);
+    const int cm = k3_mla_cache_mode();
+    if (cm == 1) k3_mla_store_batch_kernel_t<__half><<<grid, 256, 0, stream>>>((__half *)key_cache->ptr, (__half *)value_cache->ptr,
+        (const float *)k_nope->ptr, (const float *)kv_raw->ptr, (const float *)value->ptr, pos0, heads, nope, rot, kv_lora, vdim);
+    else if (cm == 2) k3_mla_store_batch_kernel_t<__nv_bfloat16><<<grid, 256, 0, stream>>>((__nv_bfloat16 *)key_cache->ptr, (__nv_bfloat16 *)value_cache->ptr,
+        (const float *)k_nope->ptr, (const float *)kv_raw->ptr, (const float *)value->ptr, pos0, heads, nope, rot, kv_lora, vdim);
+    else k3_mla_store_batch_kernel<<<grid, 256, 0, stream>>>((float *)key_cache->ptr, (float *)value_cache->ptr,
+        (const float *)k_nope->ptr, (const float *)kv_raw->ptr, (const float *)value->ptr, pos0, heads, nope, rot, kv_lora, vdim);
+    return cuda_ok(cudaGetLastError(), "K3 MLA cache store batch launch");
+}
+
+/* step 32: block (t, h) attends query t of the pass over positions [0, pos0 + t] — the per-token kernel's code */
+__global__ static void k3_mla_attend_batch_kernel(float *heads_out, const float *q, const float *key_cache,
+                                                  const float *value_cache, uint32_t pos0, uint32_t heads,
+                                                  uint32_t qk, uint32_t vdim, float scale) {
+    extern __shared__ float sc[];
+    __shared__ float red[32];
+    __shared__ float stats[2];
+    const uint32_t t_q = blockIdx.x, h = blockIdx.y;
+    const uint32_t n_pos = pos0 + t_q + 1u;
+    const float *qh = q + ((size_t)t_q * heads + h) * qk;
+    float local_max = -1e30f;
+    for (uint32_t t = threadIdx.x; t < n_pos; t += blockDim.x) {
+        const float *kt = key_cache + ((size_t)t * heads + h) * qk;
+        float s = 0.0f;
+        for (uint32_t d = 0; d < qk; d++) s += qh[d] * kt[d];
+        s *= scale;
+        sc[t] = s;
+        local_max = fmaxf(local_max, s);
+    }
+    for (int o = 16; o > 0; o >>= 1) local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, o));
+    if ((threadIdx.x & 31u) == 0u) red[threadIdx.x >> 5u] = local_max;
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        float m = -1e30f;
+        for (uint32_t w = 0; w < (blockDim.x >> 5u); w++) m = fmaxf(m, red[w]);
+        stats[0] = m;
+    }
+    __syncthreads();
+    const float m = stats[0];
+    float local_sum = 0.0f;
+    for (uint32_t t = threadIdx.x; t < n_pos; t += blockDim.x) { const float e = __expf(sc[t] - m); sc[t] = e; local_sum += e; }
+    local_sum = k3_warp_sum(local_sum);
+    if ((threadIdx.x & 31u) == 0u) red[threadIdx.x >> 5u] = local_sum;
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        float s = 0.0f;
+        for (uint32_t w = 0; w < (blockDim.x >> 5u); w++) s += red[w];
+        stats[1] = s;
+    }
+    __syncthreads();
+    const float inv = 1.0f / stats[1];
+    float *o = heads_out + ((size_t)t_q * heads + h) * vdim;
+    for (uint32_t v = threadIdx.x; v < vdim; v += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t t = 0; t < n_pos; t++) acc += sc[t] * value_cache[((size_t)t * heads + h) * vdim + v];
+        o[v] = acc * inv;
+    }
+}
+
+extern "C" int ds4_gpu_k3_mla_attend_batch_tensor(ds4_gpu_tensor *heads_out, const ds4_gpu_tensor *q,
+                                                  const ds4_gpu_tensor *key_cache, const ds4_gpu_tensor *value_cache,
+                                                  uint32_t pos0, uint32_t n_tok, uint32_t heads, uint32_t qk,
+                                                  uint32_t vdim) {
+    if (!heads_out || !q || !key_cache || !value_cache || n_tok == 0u || pos0 + n_tok > 8192u) return 0;
+    const float scale = 1.0f / sqrtf((float)qk);
+    cudaStream_t stream = cuda_decode_stream();
+    const dim3 grid(n_tok, heads, 1u);
+    const int cm = k3_mla_cache_mode();
+    if (cm == 1) k3_mla_attend_batch_kernel_t<__half><<<grid, 256, (size_t)(pos0 + n_tok) * sizeof(float), stream>>>((float *)heads_out->ptr,
+        (const float *)q->ptr, (const __half *)key_cache->ptr, (const __half *)value_cache->ptr, pos0, heads, qk, vdim, scale);
+    else if (cm == 2) k3_mla_attend_batch_kernel_t<__nv_bfloat16><<<grid, 256, (size_t)(pos0 + n_tok) * sizeof(float), stream>>>((float *)heads_out->ptr,
+        (const float *)q->ptr, (const __nv_bfloat16 *)key_cache->ptr, (const __nv_bfloat16 *)value_cache->ptr, pos0, heads, qk, vdim, scale);
+    else k3_mla_attend_batch_kernel<<<grid, 256, (size_t)(pos0 + n_tok) * sizeof(float), stream>>>((float *)heads_out->ptr,
+        (const float *)q->ptr, (const float *)key_cache->ptr, (const float *)value_cache->ptr, pos0, heads, qk, vdim, scale);
+    return cuda_ok(cudaGetLastError(), "K3 MLA attention batch launch");
+}
+
+extern "C" int ds4_gpu_k3_kda_decode_batch(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *conv_state, ds4_gpu_tensor *recurrent_state,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *raw_gate, const ds4_gpu_tensor *raw_beta, const ds4_gpu_tensor *output_gate,
+        const void *model_map, uint64_t model_size,
+        uint64_t q_conv_offset, uint64_t k_conv_offset, uint64_t v_conv_offset,
+        uint64_t a_log_offset, uint64_t dt_bias_offset, uint64_t output_norm_offset,
+        uint32_t n_heads, float gate_lower_bound, float norm_eps, int a_log_per_channel, uint32_t n_tok) {
+    if (!out || !conv_state || !recurrent_state || !q || !k || !v || !raw_gate || !raw_beta || !output_gate ||
+        n_heads == 0u || n_tok == 0u || gate_lower_bound >= 0.0f) {
+        return 0;
+    }
+    const uint64_t projection = (uint64_t)n_heads * K3_KDA_DIM;
+    const int tier = ds4_tensor_device_idx(out);
+    const float *qw = glm53_cuda_weight_f32(model_map, model_size, q_conv_offset, projection * 4u, tier, "K3 KDA q conv");
+    const float *kw = glm53_cuda_weight_f32(model_map, model_size, k_conv_offset, projection * 4u, tier, "K3 KDA k conv");
+    const float *vw = glm53_cuda_weight_f32(model_map, model_size, v_conv_offset, projection * 4u, tier, "K3 KDA v conv");
+    const float *a_log = glm53_cuda_weight_f32(model_map, model_size, a_log_offset,
+        a_log_per_channel ? K3_KDA_DIM : n_heads, tier, "K3 KDA A_log");
+    const float *dt_bias = glm53_cuda_weight_f32(model_map, model_size, dt_bias_offset, projection, tier, "K3 KDA dt bias");
+    const float *o_norm = glm53_cuda_weight_f32(model_map, model_size, output_norm_offset, K3_KDA_DIM, tier, "K3 KDA o norm");
+    if (!qw || !kw || !vw || !a_log || !dt_bias || !o_norm) return 0;
+    const dim3 grid(1u, n_heads, 1u);
+    cudaStream_t stream = cuda_decode_stream();
+    /* step 27b: split kernels per chunk of 512 tokens (DS4_K3_KDA_MODE=loop: one looping launch, token: a launch per token) */
+    static int kda_mode = -1;
+    if (kda_mode < 0) {
+        const char *m = getenv("DS4_K3_KDA_MODE");
+        kda_mode = getenv("DS4_K3_KDA_LOOP") ? 0 : (m && !strcmp(m, "loop")) ? 1 : (m && !strcmp(m, "token")) ? 0 : 2;
+    }
+    if (kda_mode == 2) {
+        static float *kbuf = nullptr;
+        static size_t kcap = 0;
+        const uint32_t chunk_max = 512u;
+        const size_t need = (size_t)4u * chunk_max * projection * sizeof(float);
+        if (kcap < need) {
+            if (kbuf) { cudaStreamSynchronize(stream); cudaFree(kbuf); kbuf = nullptr; kcap = 0; }
+            if (cudaMalloc(&kbuf, need) != cudaSuccess) {
+                cudaGetLastError();
+                fprintf(stderr, "ds4: K3 KDA prompt buffers (%.0f MB) unavailable: using the looping launch\n", (double)need / 1e6);
+                kda_mode = 1;
+            } else {
+                kcap = need;
+            }
+        }
+        if (kda_mode == 2) {
+            float *pq = kbuf, *pk = pq + (size_t)chunk_max * projection, *pv = pk + (size_t)chunk_max * projection,
+                  *pd = pv + (size_t)chunk_max * projection;
+            for (uint32_t t0 = 0; t0 < n_tok; t0 += chunk_max) {
+                const uint32_t nt = n_tok - t0 < chunk_max ? n_tok - t0 : chunk_max;
+                const dim3 pgrid(nt, n_heads, 1u), rgrid(n_heads, K3_KDA_DIM / 4u, 1u);
+                if (a_log_per_channel) {
+                    k3_kda_prep_kernel<true><<<pgrid, K3_KDA_DIM, 0, stream>>>(pq, pk, pv, pd, (const float *)q->ptr, (const float *)k->ptr,
+                        (const float *)v->ptr, (const float *)raw_gate->ptr, (const float *)conv_state->ptr, qw, kw, vw, a_log, dt_bias,
+                        n_heads, t0, nt, gate_lower_bound);
+                } else {
+                    k3_kda_prep_kernel<false><<<pgrid, K3_KDA_DIM, 0, stream>>>(pq, pk, pv, pd, (const float *)q->ptr, (const float *)k->ptr,
+                        (const float *)v->ptr, (const float *)raw_gate->ptr, (const float *)conv_state->ptr, qw, kw, vw, a_log, dt_bias,
+                        n_heads, t0, nt, gate_lower_bound);
+                }
+                k3_kda_recur_kernel<<<rgrid, 128, 0, stream>>>((float *)out->ptr, (float *)recurrent_state->ptr, pq, pk, pv, pd,
+                    (const float *)raw_beta->ptr, n_heads, t0, nt);
+                k3_kda_out_kernel<<<pgrid, K3_KDA_DIM, 0, stream>>>((float *)out->ptr, (const float *)output_gate->ptr, o_norm, n_heads,
+                    t0, nt, norm_eps);
+            }
+            k3_kda_conv_update_kernel<<<(unsigned)((projection + 255u) / 256u), 256, 0, stream>>>((float *)conv_state->ptr,
+                (const float *)q->ptr, (const float *)k->ptr, (const float *)v->ptr, (uint32_t)projection, n_tok);
+            return cuda_ok(cudaGetLastError(), "K3 KDA prompt pass launch (split)");
+        }
+    }
+    static int per_token = -1;
+    if (per_token < 0) per_token = kda_mode == 0 ? 1 : 0;   /* 1 = a launch per token */
+    if (!per_token) {
+        if (a_log_per_channel) {
+            k3_kda_prefill_kernel<true><<<grid, K3_KDA_DIM, 0, stream>>>(
+                (float *)out->ptr, (float *)conv_state->ptr, (float *)recurrent_state->ptr, (const float *)q->ptr, (const float *)k->ptr,
+                (const float *)v->ptr, (const float *)raw_gate->ptr, (const float *)raw_beta->ptr, (const float *)output_gate->ptr,
+                qw, kw, vw, a_log, dt_bias, o_norm, n_heads, gate_lower_bound, norm_eps, n_tok);
+        } else {
+            k3_kda_prefill_kernel<false><<<grid, K3_KDA_DIM, 0, stream>>>(
+                (float *)out->ptr, (float *)conv_state->ptr, (float *)recurrent_state->ptr, (const float *)q->ptr, (const float *)k->ptr,
+                (const float *)v->ptr, (const float *)raw_gate->ptr, (const float *)raw_beta->ptr, (const float *)output_gate->ptr,
+                qw, kw, vw, a_log, dt_bias, o_norm, n_heads, gate_lower_bound, norm_eps, n_tok);
+        }
+        return cuda_ok(cudaGetLastError(), "K3 KDA prefill launch");
+    }
+    for (uint32_t t = 0; t < n_tok; t++) {
+        float *o = (float *)out->ptr + (size_t)t * projection;
+        const float *qt = (const float *)q->ptr + (size_t)t * projection;
+        const float *kt = (const float *)k->ptr + (size_t)t * projection;
+        const float *vt = (const float *)v->ptr + (size_t)t * projection;
+        const float *gt = (const float *)raw_gate->ptr + (size_t)t * projection;
+        const float *bt = (const float *)raw_beta->ptr + (size_t)t * n_heads;
+        const float *ot = (const float *)output_gate->ptr + (size_t)t * projection;
+        if (a_log_per_channel) {
+            k3_kda_decode_kernel<true><<<grid, K3_KDA_DIM, 0, stream>>>(
+                o, (float *)conv_state->ptr, (float *)recurrent_state->ptr, qt, kt, vt, gt, bt, ot,
+                qw, kw, vw, a_log, dt_bias, o_norm, n_heads, 1u, gate_lower_bound, norm_eps);
+        } else {
+            k3_kda_decode_kernel<false><<<grid, K3_KDA_DIM, 0, stream>>>(
+                o, (float *)conv_state->ptr, (float *)recurrent_state->ptr, qt, kt, vt, gt, bt, ot,
+                qw, kw, vw, a_log, dt_bias, o_norm, n_heads, 1u, gate_lower_bound, norm_eps);
+        }
+    }
+    return cuda_ok(cudaGetLastError(), "K3 KDA decode batch launch");
+}
+
+#include "ds4_k3_draft.cuh"

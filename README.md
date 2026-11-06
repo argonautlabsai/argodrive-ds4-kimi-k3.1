@@ -1,3 +1,46 @@
+# argodrive-ds4-kimi-k3.1
+
+Kimi K3.1 Pro (2.8T parameters, 1.45 TB of experts) at about 2 tok/s on one 96 GB GPU, with the experts streamed off NVMe
+as the router asks for them.
+
+This is Salvatore Sanfilippo's [ds4](https://github.com/antirez/ds4) at commit c97964b with a Kimi K3 / K3.1 Pro port on top.
+The spine sits in VRAM as Q8_0. The 82,432 MXFP4 expert files stay on disk and move through a VRAM cache and a pinned RAM
+pool. There's no drafter and no expert skipping.
+
+What we measured on 6 November:
+
+| | |
+|---|---|
+| decode, 128 generated tokens | 2.04 tok/s |
+| decode, 512 generated tokens | 1.94 tok/s |
+| decode, 200 tokens after a 270-token chat prompt | 1.93–1.96 tok/s |
+| prompt pass, 270 tokens | 25 s (10.6 tok/s) |
+| prompt pass, 618 tokens | 32 s (19.5 tok/s) |
+| prompt pass, 1,533 tokens | 37 s (41 tok/s) |
+| expert reads per decode token | about 13 GB at 32 GB/s, roughly 750 files of 17.5 MB |
+
+The machine is one RTX PRO 6000 Blackwell (96 GB) in a 70 GiB VM. A RAID0 of three NVMe drives (19 GB/s) has the 79,365
+hottest experts, a second NVMe (6.2 GB/s) has the rest plus some copies, and a Thunderbolt NVMe (3.7 GB/s) has another 74,000
+copies.
+
+The prompt pass is the interesting part. Once a prompt is a few hundred tokens long it hits most of the experts in every
+layer, so the pass reads most of the model once and the time barely changes with length. For this model, prefill is a
+bandwidth problem.
+
+K3.1's DSA indexer isn't implemented yet. We use dense attention instead, which should compute the same thing as long as you
+stay within 2,048 tokens, so run it with `-c 2048`.
+
+Weight layout, knobs, how we measured and what is and isn't bit-identical are all in
+[tools/kimi-k3/README.md](tools/kimi-k3/README.md).
+
+    git clone https://github.com/argonautlabsai/argodrive-ds4-kimi-k3.1.git
+    cd argodrive-ds4-kimi-k3.1 && git checkout kimi-k3
+    make ds4 CUDA_ARCH=sm_120
+
+---
+
+*Everything below this line is upstream's ds4 README.*
+
 <p align="center">
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>
