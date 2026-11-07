@@ -84,10 +84,18 @@ numbers below don't use it.
 | `DS4_K3_POOL_KEEP`, `DS4_K3_POOL_EVICT_BIAS` | 0, 0 | a host hit keeps its host copy; prefer evicting a slab the pool still holds (neutral to negative on this rig; kept for other cache geometries) |
 | `DS4_K3_POOL_LAZY` | unset | create the expert pool at the first token instead of at load |
 | `DS4_K3_PREFILL_SEQUENTIAL` | unset | process the prompt through the decode path one token at a time, about 0.7 s per token: 29 s vs 36 s fresh-process wall on the 5-token prompt, 192 s vs 39 s for a 286-token prompt pass. A different float path from the batched pass |
+| `DS4_K3_PREFILL_PREFETCH`, `_DIV`, `_MIN`, `_N`, `_INFLIGHT` | 2, 5, 0, 96, 96 | prompt pass: read ahead the next layer's predicted experts from any tier (1: the cold tier only, 0: off), n_tok / `_DIV` per layer but at least `_MIN` and at most `_N` |
+| `DS4_K3_BULK_MIN` | 64 | a prompt of at most this many tokens reads like decode (split reads, least expected completion) |
+| `DS4_K3_SPINE_LAZY`, `DS4_K3_SPINE_THREADS`, `DS4_K3_POOL_REGION_SLABS` | unset, 8, 16 | a fresh process reads the spine with 8 threads before the first forward, beside the host pool's pinned memory, which comes in regions of 16 slabs so other CUDA calls run between them; `_LAZY=1` stages the spine during the first forward instead |
 | `DS4_K3_PROMPT_COMPACT`, `DS4_K3_CPART_MB` | 1, 512 | fixed-order accumulation for long prompt passes, so they repeat exactly; the compact buffer's cap in MB (512 covers the 2,048-token context) |
 | `DS4_K3_QWEN`, `DS4_K3_QWEN_PY`, `DS4_K3_QWEN_SCRIPT`, `DS4_K3_QWEN_DIR`, `DS4_K3_QWEN_META`, `DS4_K3_QWEN_CONF` | off, -, -, -, -, 0.6 | the optional Qwen drafter ([below](#the-optional-qwen-drafter)) |
-| `DS4_K3_QWEN_CHAT` | unset | allow the drafter on chat prompts (slower on what we tested) |
-| `DS4_K3_VERIFY_ADMIT` | 2 | in a verification block, a fill used by fewer rows stays transient: recycled first, never copied down. 0: every fill goes to the hot end |
+| `DS4_K3_QWEN_CHAT` | unset | allow the drafter on chat prompts; use it with the chat settings [below](#the-optional-qwen-drafter) |
+| `DS4_K3_QWEN_ROWS`, `DS4_K3_QWEN_KMIN` | 16, 2 | the most rows a verification block may take (2 to 16), and the fewest drafts worth a block |
+| `DS4_K3_QWEN_SPEC` | 17,3 | rows the sidecar prepares past the text while Kimi works, after a block and after a plain step; `0,0` turns it off |
+| `DS4_K3_QWEN_ADAPT` | unset | `lo,hi,down,up`: the gate drops by `down` after a proposal whose drafts were all kept and rises by `up` after one that kept fewer than half, within [`lo`, `hi`] |
+| `DS4_K3_VERIFY_ADMIT`, `DS4_K3_VERIFY_AUTO` | auto, 4,3,2 | in a verification block, a fill used by fewer rows than the threshold stays transient: recycled first, never copied down. `auto` uses 4 for blocks of 7 rows or more, 3 for 5 or 6 and 2 for 4 or fewer (`DS4_K3_VERIFY_AUTO` sets the three); a number fixes it; 0: every fill goes to the hot end |
+| `DS4_K3_VERIFY_WARM` | 0 | a block's fill used by at least this many rows, but fewer than the threshold, is copied down to the host pool when it is evicted |
+| `DS4_K3_ROWS_GEMV`, `DS4_K3_ROWS_GEMV_CHECK` | 1, unset | Q8_0 spine matmuls of 2 to 64 rows (verification blocks, short prompt passes) load each weight block once per 8 rows instead of once per row; every row is bit-identical to the single-row call. `_CHECK=<n>` compares the first n calls with the per-row loop on the GPU |
 | `DS4_K3_TRACE_HASH`, `DS4_K3_TRACE_HASH_LAYERS` | unset | FNV-1a of each position's logits, and of its attention result, routed output and hidden state per layer; compare two runs with `hash_compare.py` |
 | `DS4_K3_TRACE_TIMING` | unset | per-token timing, cache and tier statistics on stderr |
 | `DS4_K3_TRACE_FILLS` | unset | per-fill timeline of n decode layers (diagnostic) |
@@ -96,7 +104,8 @@ numbers below don't use it.
 ## What we measured (6 November 2026, Kimi K3.1 Pro)
 
 We built this from a fresh clone with the commands above and ran it on the defaults, plus `DS4_K3_EXPERT_DIR_C` for the third
-drive. That means a full-precision attention cache, the drafter off and no expert skipping. Monitoring was off. The plain path is unchanged since: the drafter commit's plain runs give the same token ids.
+drive. That means a full-precision attention cache, the drafter off and no expert skipping. Monitoring was off.
+The plain path is unchanged since: the plain runs at both drafter commits, c0dcf69 and 6808130, give the same token ids.
 
 The machine is one RTX PRO 6000 Blackwell (96 GB) in a 70 GiB VM on a Threadripper host, with a 27.5 GB device cache and a
 53.7 GB pinned host pool. The experts live in three places:
@@ -144,13 +153,34 @@ The prompt pass runs at the drives' combined rate, 37 GB/s, and reads each route
 reads 86 % of all expert bytes. So past a few hundred tokens the pass costs about the same whatever the length, and only more
 bandwidth or a cached prefix helps.
 
+### Start-up and prompt pass in this release (7 November 2026)
+
+One fresh process per run, 2 generated, drafter off, the previous release (c0dcf69) and this one (6808130) alternating. The first token is timed from process
+start the same way for both: every output line is stamped against a clock read just before the process starts.
+
+| prompt | first token, previous | first token, this release | prompt pass, this release |
+|---|---|---|---|
+| "The three main financial statements are" (6 tokens, raw) | 25.3 / 28.0 s | 20.1 / 22.3 s | 3.0 / 3.1 s |
+| a chat prompt of 286 tokens | 49.1 / 49.3 s | 42.0 / 44.5 s | 24.7 s |
+| a chat prompt of 1,549 tokens | 56.9 / 57.4 s | 51.3 / 51.5 s | 34.1 / 34.2 s |
+
+A fresh process now reads the 56.65 GiB spine with 8 threads before the first forward, beside the pool's pinned memory, which takes about 16.6 s
+reading at 3.7 GB/s from the second NVMe. The previous release read most of the spine during the first prompt pass, so its prompt-pass times in a
+fresh process include that read and aren't comparable. Then the prompt pass reads the next layer's predicted experts ahead from any tier, and a
+prompt of up to 64 tokens reads like decode. Runs of the same prompt differ by up to 2.7 s, mostly before the prompt pass starts. The first token's
+logits hash the same in every run of a prompt, in both releases.
+
+With the drafter on, the sidecar loads during the spine read and both slow down. In the drafter runs below the spine came in at 2.6 to 3.2 GB/s
+instead of 3.6 to 3.7, the sidecar was ready after 19 to 24 s instead of 2.5 to 2.7 s in the previous release, and the record prompt's first token
+came after 22.8 to 27.4 s instead of 20.0 to 20.3 s with the drafter off (the release's own counter, which agrees with the stamped clock to 0.04 s).
+
 ## The optional Qwen drafter
 
-Off by default. Raw completions and greedy decoding only, unless you set `DS4_K3_QWEN_CHAT=1`.
+Off by default. Greedy decoding only, and raw completions only unless you set `DS4_K3_QWEN_CHAT=1`.
 
-At each position `tools/kimi-k3/qwen_sidecar.py` runs Qwen3-0.6B-Base on the text so far, translates its continuation back to Kimi tokens and answers with 7 tokens or nothing. It answers
-only if all 7 come from Qwen tokens at or above the confidence gate (`DS4_K3_QWEN_CONF`, default 0.6). With 7 tokens the engine runs one verification block of 8 rows, the current token plus
-the 7 drafts, and keeps the drafts up to the first one Kimi disagrees with. With nothing it takes an ordinary plain step. So the emitted tokens are always Kimi's own choices.
+At each position `tools/kimi-k3/qwen_sidecar.py` runs Qwen3-0.6B-Base on the text so far, translates its continuation back to Kimi tokens and answers with up to 15 tokens or nothing. A proposal
+stops at the first Qwen token below the confidence gate (`DS4_K3_QWEN_CONF`, default 0.6), and one shorter than 2 tokens is dropped. With n tokens the engine runs one verification block of 1 + n
+rows, the current token plus the drafts, and keeps the drafts up to the first one Kimi disagrees with. With nothing it takes an ordinary plain step. So the emitted tokens are always Kimi's own choices.
 
     # needs torch with CUDA, transformers, tokenizers, tiktoken and regex, and the Qwen/Qwen3-0.6B-Base checkpoint (revision da87bfb6)
     DS4_K3_QWEN=1 DS4_K3_QWEN_PY=/path/to/venv/bin/python DS4_K3_QWEN_SCRIPT=tools/kimi-k3/qwen_sidecar.py \
@@ -158,34 +188,58 @@ the 7 drafts, and keeps the drafts up to the first one Kimi disagrees with. With
     ./ds4 -m k3-spine.gguf --cuda --raw --ssd-streaming --ssd-streaming-cold --ssd-streaming-cache-experts 16 \
           --temp 0 -c 2048 -n 512 -p "..."
 
-The recipe comes from the deltafin Kimi K3 work. Two things changed for this engine. Its width ladder loses here, because small blocks are expensive (2 rows cost 2.3 plain steps), so a block is
-8 rows or nothing. And the cache needed a change: an 8-row block touches about 6,400 to 6,800 experts while the two caches hold about 4,600, and blocks walk the layers in a fixed cycle, so plain LRU got no
-hits at all. Keeping only the experts that at least two rows use (`DS4_K3_VERIFY_ADMIT`) cut a block's disk reads by a quarter to a third.
+The recipe comes from the deltafin Kimi K3 work. Three things changed for this engine.
 
-Measured 7 November 2026 on the machine below, at commit c0dcf69, fresh process per run, threshold 0.6, third drive on, monitoring off:
+- The cache. A block touches more experts than the two caches hold (an 8-row block about 6,400 to 6,800, against about 4,600), and blocks walk the layers
+  in a fixed cycle, so plain LRU got no hits at all. Keeping only the experts that enough of the block's rows use (`DS4_K3_VERIFY_ADMIT`, which follows the
+  block's size) cut a block's disk reads by a quarter to a third.
+- The spine. A block's rows used to run the single-row GEMV one after another, so every Q8_0 weight was streamed once per row. One kernel now loads each
+  weight block once for up to 8 rows (`DS4_K3_ROWS_GEMV`), with each row's arithmetic unchanged. With perfect drafts on the record prompt that took an
+  8-row block from 2.37 s to 2.21 s, and Qwen's own drafts on 200 tokens from 2.81 to 2.97 tok/s.
+- The width. Once rows got cheaper, both short and wide blocks paid. With perfect drafts, blocks of 8, 12 and 16 rows gave 3.45, 3.75 and 3.68 tok/s. With
+  Qwen's drafts on the record prompt, 200 tokens, up to 8 rows gave 2.98 tok/s, up to 12 rows 2.97 and up to 16 rows 3.10, so a block may now take up to
+  16 rows (`DS4_K3_QWEN_ROWS`). A full 16-row block takes about 3.8 s, against about 8 s for sixteen plain steps.
+
+Measured 7 November 2026 on the machine above, at commit 6808130, fresh process per run, gate 0.6, third drive on, monitoring off:
 
 | prompt | generated | plain tok/s | with Qwen tok/s | blocks | drafts accepted | tokens from blocks | wall per run, plain | wall per run, Qwen |
 |---|---|---|---|---|---|---|---|---|
-| "The three main financial statements are" | 128 | 2.00 / 2.02 | 2.34 | 8 | 54 of 56 | 49 % | 91 to 93 s | 85 s |
-| same | 200 | 1.98 | 2.52 | 17 | 117 of 119 | 67 % | 129 s | 110 s |
-| same | 512 | 1.92 | 2.61 | 53 | 363 of 371 | 81 % | 294 s | 227 s |
-| `prompt-512-tokens.txt` from the deltafin benchmark | 200 | 1.58 | 2.29 | 24 | 168 of 168 | 96 % | 179 to 180 s | 143 to 144 s |
+| "The three main financial statements are" | 128 | 2.02 | 2.90 / 2.92 | 19 | 97 of 107 | 91 % | 86 s | 70 to 73 s |
+| same | 200 | 1.98 / 1.99 | 3.10 / 3.11 | 24 | 164 of 174 | 94 % | 124 s | 90 to 93 s |
+| same | 512 | 1.88 | 3.11 | 46 | 443 of 459 | 96 % | 295 to 296 s | 191 to 196 s |
+| `prompt-512-tokens.txt` from the deltafin benchmark | 200 | 1.52 / 1.53 | 2.64 / 2.67 | 13 | 185 of 185 | 99 % | 178 to 179 s | 126 to 130 s |
 
-A full block takes about 2.60 s on the record prompt, against 3.95 s for eight plain steps. The sidecar uses about 2 GB of VRAM and 1.7 GB of host memory, starts in 2.5 s, and costs about 25 to 37 ms per call, 2 to 4 % of
-decode time. The device cache gives up about 20 slabs. Plain rates here are 1 to 2 % below the 6 November table. Another VM on the host was busier that day, and these runs had logit hashing on, which costs under 1 ms per position.
+The sidecar uses about 2 GB of VRAM and 1.7 GB of host memory and costs 47 to 150 ms per call on the prompts above, 2.6 to 3.2 % of decode time. In a fresh
+process it loads during the spine read ([start-up](#start-up-and-prompt-pass-in-this-release-7-november-2026)). While Kimi works on a block or a plain
+step it prepares the next rows (`DS4_K3_QWEN_SPEC`) and stops as soon as the next request arrives. France, the 5-token prompt, fires 2 blocks: 2.17 / 2.19 / 2.20 tok/s against 1.95 plain.
 
-What it doesn't help: on a 286-token chat prompt it made decoding slower, 1.80 tok/s with threshold 0.7 and 1.90 with threshold 0.9 (no block fired), against 1.95. Qwen is rarely right seven tokens in a row on chat
-text, so we leave it off there. France doesn't gain either: no block fires in 17 tokens.
+Chat text is harder to predict. With the raw settings the drafter made chat slower (1.80 tok/s at a gate of 0.7 against 1.95 plain, on the 286-token
+prompt below), so it stays off for chat unless you ask for it. With a stricter gate that adapts it gains instead, by 4 to 63 % on the three chat prompts
+below: the gate starts at 0.9, drops by 0.02 after a proposal that was kept whole and rises by 0.1 after one that kept fewer than half of its
+drafts, within 0.6 to 0.95.
+
+    DS4_K3_QWEN_CHAT=1 DS4_K3_QWEN_CONF=0.9 DS4_K3_QWEN_ADAPT=0.6,0.95,0.02,0.1
+
+| chat prompt, 200 generated | plain tok/s | with Qwen tok/s | blocks | drafts accepted |
+|---|---|---|---|---|
+| a 286-token prompt | 1.92 / 1.94 | 2.01 / 2.02 | 12 | 35 of 39 |
+| a general question | 1.98 | 2.13 | 34 | 79 of 98 |
+| another general question | 1.86 | 3.03 | 19 | 171 of 174 |
 
 ## What is identical and what is not
 
-A verification block matches plain decoding bit for bit. Its rows run the plain path's kernels: attention and KDA launch per row, and an expert used by more than four rows runs in chunks on the same GEMV kernels. A rejection restores
-the KDA snapshot and replays the kept rows through the same kernel. We checked this with `DS4_K3_TRACE_HASH`: on the record prompt every layer of 40 positions (10,842 hashes), and the logits of 5,325 positions
-across the runs with the drafter, including forced rejections of the first, a middle and the last draft, show no differing bit against plain decoding. That's evidence from these runs on this GPU and driver, not a proof for every input.
+A verification block matches plain decoding bit for bit. Its rows run the plain path's arithmetic: attention and KDA launch per row, an expert used by more than four rows runs in chunks on the same GEMV
+kernels, and the multi-row spine GEMV computes each row with the single-row kernel's arithmetic, in the same order. A rejection restores the KDA snapshot and replays the kept rows through the same kernel.
+We checked the spine kernel on the GPU against the per-row loop (16,183 calls, all identical) and the whole path with `DS4_K3_TRACE_HASH`: in this release's runs with the drafter, the logits of 3,416
+positions show no differing bit against plain decoding, including forced rejections of the first, a middle and the last draft, short proposals, a sidecar that dies or answers garbage, and end-of-text
+inside a block. The first drafter release's checks covered every layer of 40 positions (10,842 hashes) and the logits of 5,325 positions. That's evidence from these runs on this GPU and driver, not a
+proof for every input.
 
 The expert path doesn't touch the arithmetic. Caches, read scheduling, chunked reads, prefetch and enqueue order only change
 when an expert's bytes arrive. Per-layer traces on a 5-token prompt plus 2 generated tokens match a reference run line for line,
-and the 128- and 512-token id files are the same with and without pool-first.
+and the 128- and 512-token id files are the same with and without pool-first. This release's start-up and prompt-pass changes are of the same
+kind: on prompts of 6, 286 and 1,549 tokens the first token's logits hash the same as with the previous release, and plain decoding gives the
+same token ids as the previous release on the record and public prompts.
 
 A given setup repeats exactly. Every repeat in the tables above gave the same token ids, or the same text on the chat endpoint.
 Long prompt passes keep one weighted row per (token, slot) in a compact buffer and sum the slots in the router's order.
