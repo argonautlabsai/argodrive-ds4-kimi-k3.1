@@ -1,14 +1,29 @@
 # Kimi K3.1 Pro on one 96 GB GPU
 
 **argodrive-ds4-kimi-k3.1** runs Kimi K3.1 Pro (2.8T parameters, 1.45 TB of experts) on one 96 GB GPU, with the experts streamed off NVMe as the router asks
-for them: about 2 tok/s decode, up to 3.11 tok/s on raw completions with an optional Qwen drafter that doesn't change the answer, and
-prefill from 10.6 tok/s on a 270-token prompt up to 41 tok/s on a 1,533-token one.
+for them: 3.1 tok/s decode on raw completions with its Qwen drafter, which gives the same tokens as plain decoding, and prefill
+from 10.6 tok/s on a 270-token prompt up to 41 tok/s on a 1,533-token one.
 
 This is Salvatore Sanfilippo's [ds4](https://github.com/antirez/ds4) at commit c97964b with a Kimi K3 / K3.1 Pro port on top.
 The spine sits in VRAM as Q8_0. The 82,432 MXFP4 expert files stay on disk and move through a VRAM cache and a pinned RAM
-pool. There's no expert skipping. The drafter is optional and off by default.
+pool. There's no expert skipping. The drafter is off by default; `DS4_K3_QWEN=1` turns it on
+([setup](tools/kimi-k3/README.md#the-optional-qwen-drafter)).
 
-What we measured on 6 November:
+Decode with the Qwen drafter, measured on 7 November at commit 6808130. Greedy, with the same tokens as plain decoding:
+
+| prompt | generated | with Qwen tok/s | plain tok/s | gain |
+|---|---|---|---|---|
+| "The three main financial statements are" | 128 | 2.90 / 2.92 | 2.02 | +44 % |
+| same | 200 | 3.10 / 3.11 | 1.98 / 1.99 | +56 % |
+| same | 512 | 3.11 | 1.88 | +65 % |
+| the public 512-token benchmark prompt | 200 | 2.64 / 2.67 | 1.52 / 1.53 | +74 % |
+| a 286-token chat prompt, chat settings | 200 | 2.01 / 2.02 | 1.92 / 1.94 | +4 % |
+
+The gain depends on how predictable the text is. The record prompt and the public prompt are predictable. Chat text is much less so: with a stricter gate
+that adapts (the chat settings in [tools/kimi-k3/README.md](tools/kimi-k3/README.md#the-optional-qwen-drafter)) the drafter gains a little there instead of
+losing, and it stays off for chat unless you ask for it. France, the 5-token prompt, fires 2 blocks: 2.17 / 2.19 / 2.20 tok/s against 1.95 plain.
+
+Plain decoding and the prompt pass, measured on 6 November:
 
 | | |
 |---|---|
@@ -19,20 +34,6 @@ What we measured on 6 November:
 | prompt pass, 618 tokens | 32 s (19.5 tok/s) |
 | prompt pass, 1,533 tokens | 37 s (41 tok/s) |
 | expert reads per decode token | about 13 GB at 32 GB/s, roughly 750 files of 17.5 MB |
-
-And with the Qwen drafter on, measured on 7 November at commit 6808130. Greedy, with the same tokens as plain decoding:
-
-| prompt | generated | plain tok/s | with Qwen tok/s | gain |
-|---|---|---|---|---|
-| "The three main financial statements are" | 128 | 2.02 | 2.90 / 2.92 | +44 % |
-| same | 200 | 1.98 / 1.99 | 3.10 / 3.11 | +56 % |
-| same | 512 | 1.88 | 3.11 | +65 % |
-| the public 512-token benchmark prompt | 200 | 1.52 / 1.53 | 2.64 / 2.67 | +74 % |
-| a 286-token chat prompt, chat settings | 200 | 1.92 / 1.94 | 2.01 / 2.02 | +4 % |
-
-The gain depends on how predictable the text is. The record prompt and the public prompt are predictable. Chat text is much less so: with a stricter gate
-that adapts (the chat settings in [tools/kimi-k3/README.md](tools/kimi-k3/README.md#the-optional-qwen-drafter)) the drafter gains a little there instead of
-losing, and it stays off for chat unless you ask for it. France, the 5-token prompt, fires 2 blocks: 2.17 / 2.19 / 2.20 tok/s against 1.95 plain.
 
 What changed since the first drafter release: a block's spine matmuls load each weight once for up to 8 rows instead of once per row, and a block can
 take from 2 to 16 rows. With the drafter off, a fresh process also gets to its first token sooner: 21.2 s instead of 26.7 s on the record prompt and
