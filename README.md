@@ -4,7 +4,7 @@
 
 **argodrive-ds4-kimi-k3.1** runs Kimi K3.1 Pro (2.8T parameters, 1.45 TB of experts) on one 96 GB GPU, with the experts streamed off NVMe as the router asks
 for them: 3.1 tok/s decode on raw completions with its Qwen drafter, which gives the same tokens as plain decoding, and prefill
-at up to 45 tok/s.
+at up to 44 tok/s.
 
 This is Salvatore Sanfilippo's [ds4](https://github.com/antirez/ds4) at commit c97964b with a Kimi K3 / K3.1 Pro port on top.
 The spine sits in VRAM as Q8_0. The 82,432 MXFP4 expert files stay on disk and move through a VRAM cache and a pinned RAM
@@ -14,16 +14,17 @@ pool. There's no expert skipping. The drafter is off by default; `DS4_K3_QWEN=1`
 <p align="center"><img src="tools/kimi-k3/images/workstation.jpg" width="760" alt="Inside the workstation: two NVIDIA RTX PRO 6000 Blackwell cards above a Hyper M.2 x16 Gen5 card"></p>
 <p align="center"><em>The workstation. The port runs on one of its two RTX PRO 6000 Blackwell cards (96 GB).</em></p>
 
-Measured on 7 November at commit 6808130, one fresh process per run:
+Measured on 7 November at commit 6808130, one fresh process per run, greedy, raw prompts, with the Qwen drafter:
 
-| | speed |
-|---|---|
-| decode, 512 tokens | 3.11 tok/s |
-| prefill, 1,549-token prompt | 45 tok/s |
+| test | prefill | decode |
+|---|---|---|
+| 512-token prompt, 128 generated (pp512 / tg128) | 18.6 tok/s | 2.68 tok/s |
+| 1,512-token prompt, 128 generated (pp1512 / tg128) | 44 tok/s | 2.43 tok/s |
+| "The three main financial statements are", 512 generated | — | 3.11 tok/s |
 
-Decode is greedy, with the Qwen drafter, on raw completions of "The three main financial statements are". It gives the same tokens as
-plain decoding: a block's rows run the same arithmetic as plain steps, and the logits of 3,416 positions showed no differing bit. The
-speed depends on how predictable the text is, and chat runs at about 2 tok/s.
+The drafter gives the same tokens as plain decoding: a block's rows run the same arithmetic as plain steps, and the logits of 3,416
+positions showed no differing bit. Decode depends on how predictable the text is, and chat runs at about 2 tok/s. The 512-token
+prompt is `prompt-512-tokens.txt` from the deltafin Kimi K3 benchmark.
 
 The machine is one RTX PRO 6000 Blackwell (96 GB) in a 70 GiB VM. A RAID0 of three NVMe drives (19 GB/s) has the 79,365
 hottest experts, a second NVMe (6.2 GB/s) has the rest plus some copies, and a Thunderbolt NVMe (3.7 GB/s) has another 74,000
