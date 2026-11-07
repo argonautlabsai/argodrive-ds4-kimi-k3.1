@@ -85,6 +85,10 @@ numbers below don't use it.
 | `DS4_K3_POOL_LAZY` | unset | create the expert pool at the first token instead of at load |
 | `DS4_K3_PREFILL_SEQUENTIAL` | unset | process the prompt through the decode path one token at a time, about 0.7 s per token: 29 s vs 36 s fresh-process wall on the 5-token prompt, 192 s vs 39 s for a 286-token prompt pass. A different float path from the batched pass |
 | `DS4_K3_PROMPT_COMPACT`, `DS4_K3_CPART_MB` | 1, 512 | fixed-order accumulation for long prompt passes, so they repeat exactly; the compact buffer's cap in MB (512 covers the 2,048-token context) |
+| `DS4_K3_QWEN`, `DS4_K3_QWEN_PY`, `DS4_K3_QWEN_SCRIPT`, `DS4_K3_QWEN_DIR`, `DS4_K3_QWEN_META`, `DS4_K3_QWEN_CONF` | off, -, -, -, -, 0.6 | the optional Qwen drafter ([below](#the-optional-qwen-drafter)) |
+| `DS4_K3_QWEN_CHAT` | unset | allow the drafter on chat prompts (slower on what we tested) |
+| `DS4_K3_VERIFY_ADMIT` | 2 | in a verification block, a fill used by fewer rows stays transient: recycled first, never copied down. 0: every fill goes to the hot end |
+| `DS4_K3_TRACE_HASH`, `DS4_K3_TRACE_HASH_LAYERS` | unset | FNV-1a of each position's logits, and of its attention result, routed output and hidden state per layer; compare two runs with `hash_compare.py` |
 | `DS4_K3_TRACE_TIMING` | unset | per-token timing, cache and tier statistics on stderr |
 | `DS4_K3_TRACE_FILLS` | unset | per-fill timeline of n decode layers (diagnostic) |
 | `DS4_K3_EXPERT_SKIP` | 0 | experimental, lossy: drop low-weight experts that are disk misses. Off; never used for the reported numbers |
@@ -92,7 +96,7 @@ numbers below don't use it.
 ## What we measured (6 November 2026, Kimi K3.1 Pro)
 
 We built this from a fresh clone with the commands above and ran it on the defaults, plus `DS4_K3_EXPERT_DIR_C` for the third
-drive. That means a full-precision attention cache, no drafter and no expert skipping. Monitoring was off.
+drive. That means a full-precision attention cache, the drafter off and no expert skipping. Monitoring was off. The plain path is unchanged since: the drafter commit's plain runs give the same token ids.
 
 The machine is one RTX PRO 6000 Blackwell (96 GB) in a 70 GiB VM on a Threadripper host, with a 27.5 GB device cache and a
 53.7 GB pinned host pool. The experts live in three places:
@@ -140,7 +144,44 @@ The prompt pass runs at the drives' combined rate, 37 GB/s, and reads each route
 reads 86 % of all expert bytes. So past a few hundred tokens the pass costs about the same whatever the length, and only more
 bandwidth or a cached prefix helps.
 
+## The optional Qwen drafter
+
+Off by default. Raw completions and greedy decoding only, unless you set `DS4_K3_QWEN_CHAT=1`.
+
+At each position `tools/kimi-k3/qwen_sidecar.py` runs Qwen3-0.6B-Base on the text so far, translates its continuation back to Kimi tokens and answers with 7 tokens or nothing. It answers
+only if all 7 come from Qwen tokens at or above the confidence gate (`DS4_K3_QWEN_CONF`, default 0.6). With 7 tokens the engine runs one verification block of 8 rows, the current token plus
+the 7 drafts, and keeps the drafts up to the first one Kimi disagrees with. With nothing it takes an ordinary plain step. So the emitted tokens are always Kimi's own choices.
+
+    # needs torch with CUDA, transformers, tokenizers, tiktoken and regex, and the Qwen/Qwen3-0.6B-Base checkpoint (revision da87bfb6)
+    DS4_K3_QWEN=1 DS4_K3_QWEN_PY=/path/to/venv/bin/python DS4_K3_QWEN_SCRIPT=tools/kimi-k3/qwen_sidecar.py \
+    DS4_K3_QWEN_DIR=/path/to/qwen3-0.6b-base DS4_K3_QWEN_META=/path/to/kimi-tokenizer-files \
+    ./ds4 -m k3-spine.gguf --cuda --raw --ssd-streaming --ssd-streaming-cold --ssd-streaming-cache-experts 16 \
+          --temp 0 -c 2048 -n 512 -p "..."
+
+The recipe comes from the deltafin Kimi K3 work. Two things changed for this engine. Its width ladder loses here, because small blocks are expensive (2 rows cost 2.3 plain steps), so a block is
+8 rows or nothing. And the cache needed a change: an 8-row block touches about 6,400 to 6,800 experts while the two caches hold about 4,600, and blocks walk the layers in a fixed cycle, so plain LRU got no
+hits at all. Keeping only the experts that at least two rows use (`DS4_K3_VERIFY_ADMIT`) cut a block's disk reads by a quarter to a third.
+
+Measured 7 November 2026 on the machine below, at commit c0dcf69, fresh process per run, threshold 0.6, third drive on, monitoring off:
+
+| prompt | generated | plain tok/s | with Qwen tok/s | blocks | drafts accepted | tokens from blocks | wall per run, plain | wall per run, Qwen |
+|---|---|---|---|---|---|---|---|---|
+| "The three main financial statements are" | 128 | 2.00 / 2.02 | 2.34 | 8 | 54 of 56 | 49 % | 91 to 93 s | 85 s |
+| same | 200 | 1.98 | 2.52 | 17 | 117 of 119 | 67 % | 129 s | 110 s |
+| same | 512 | 1.92 | 2.61 | 53 | 363 of 371 | 81 % | 294 s | 227 s |
+| `prompt-512-tokens.txt` from the deltafin benchmark | 200 | 1.58 | 2.29 | 24 | 168 of 168 | 96 % | 179 to 180 s | 143 to 144 s |
+
+A full block takes about 2.60 s on the record prompt, against 3.95 s for eight plain steps. The sidecar uses about 2 GB of VRAM and 1.7 GB of host memory, starts in 2.5 s, and costs about 25 to 37 ms per call, 2 to 4 % of
+decode time. The device cache gives up about 20 slabs. Plain rates here are 1 to 2 % below the 6 November table. Another VM on the host was busier that day, and these runs had logit hashing on, which costs under 1 ms per position.
+
+What it doesn't help: on a 286-token chat prompt it made decoding slower, 1.80 tok/s with threshold 0.7 and 1.90 with threshold 0.9 (no block fired), against 1.95. Qwen is rarely right seven tokens in a row on chat
+text, so we leave it off there. France doesn't gain either: no block fires in 17 tokens.
+
 ## What is identical and what is not
+
+A verification block matches plain decoding bit for bit. Its rows run the plain path's kernels: attention and KDA launch per row, and an expert used by more than four rows runs in chunks on the same GEMV kernels. A rejection restores
+the KDA snapshot and replays the kept rows through the same kernel. We checked this with `DS4_K3_TRACE_HASH`: on the record prompt every layer of 40 positions (10,842 hashes), and the logits of 5,325 positions
+across the runs with the drafter, including forced rejections of the first, a middle and the last draft, show no differing bit against plain decoding. That's evidence from these runs on this GPU and driver, not a proof for every input.
 
 The expert path doesn't touch the arithmetic. Caches, read scheduling, chunked reads, prefetch and enqueue order only change
 when an expert's bytes arrive. Per-layer traces on a 5-token prompt plus 2 generated tokens match a reference run line for line,
@@ -173,9 +214,8 @@ Two comparisons with the published Kimi K3 text from deltafin on Apple silicon. 
 with the half-precision cache gives the same 17 ids (" Paris. The Eiffel Tower is located in Paris. The Louvre Museum is also").
 On the record prompt all our runs differ at character 91 ("an overview" against "a snapshot"), and we don't know why yet.
 
-So to be clear about what we're claiming: no drafter, no expert skipping, and no quantisation beyond the Q8_0 spine (itself a
-quantisation of the BF16 spine) and the MXFP4 experts the checkpoint ships with. The output isn't bit-identical across arithmetic
-paths, and we haven't compared any of this with Moonshot's own implementation.
+So to be clear about what we're claiming: no expert skipping, and no quantisation beyond the Q8_0 spine (itself a quantisation of the BF16 spine) and the MXFP4 experts the checkpoint ships with. The
+optional drafter doesn't change the output. The output isn't bit-identical across the other arithmetic paths above, and we haven't compared any of this with Moonshot's own implementation.
 
 ## Tools
 
@@ -183,4 +223,4 @@ paths, and we haven't compared any of this with Moonshot's own implementation.
 `k31_diff.py` (two checkpoints compared), `gguf_header.py` (spine header dump), `k3_tokenize.py` /
 `k3_cpu_forward.c` / `k3src_test.c` (reference checks), `readbench*.c` (per-file read latency and throughput),
 `cache_sim*.py`, `sim*.py`, `lru_test.cpp` (cache policy simulators on recorded routes), `serve_summary.py` /
-`tier_summary.py` (log summaries).
+`tier_summary.py` (log summaries), `qwen_sidecar.py` (the drafter), `hash_compare.py` (bit-level comparison of two runs).

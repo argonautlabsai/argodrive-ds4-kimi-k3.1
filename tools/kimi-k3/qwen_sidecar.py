@@ -48,7 +48,7 @@ q_encode = lambda t: QT.encode(t, add_special_tokens=False).ids
 q_decode = lambda ids: QT.decode(ids, skip_special_tokens=False)
 model = AutoModelForCausalLM.from_pretrained(QW, dtype=torch.float16, local_files_only=True).to(dev).eval()
 class Qwen:
-    """Greedy rows over one growing sequence (reviewer's lever 5, step 82). The KV cache and the rows already predicted stay valid for as long as the new prefix agrees with what was
+    """Greedy rows over one growing sequence (step 82). The KV cache and the rows already predicted stay valid for as long as the new prefix agrees with what was
     consumed, so a position usually costs one forward. pred[i] is the greedy (token, probability) after the first i tokens. Numerics can differ from a full forward in the last bits, which can
     only change whether a block is tried: every emitted token is still the target's own."""
     def __init__(s):

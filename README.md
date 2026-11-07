@@ -1,11 +1,12 @@
 # Kimi K3.1 Pro on one 96 GB GPU
 
 **argodrive-ds4-kimi-k3.1** runs Kimi K3.1 Pro (2.8T parameters, 1.45 TB of experts) on one 96 GB GPU, with the experts streamed off NVMe as the router asks
-for them: about 2 tok/s decode, and prefill from 10.6 tok/s on a 270-token prompt up to 41 tok/s on a 1,533-token one.
+for them: about 2 tok/s decode, up to 2.61 tok/s on raw completions with an optional Qwen drafter that doesn't change the answer, and
+prefill from 10.6 tok/s on a 270-token prompt up to 41 tok/s on a 1,533-token one.
 
 This is Salvatore Sanfilippo's [ds4](https://github.com/antirez/ds4) at commit c97964b with a Kimi K3 / K3.1 Pro port on top.
 The spine sits in VRAM as Q8_0. The 82,432 MXFP4 expert files stay on disk and move through a VRAM cache and a pinned RAM
-pool. There's no drafter and no expert skipping.
+pool. There's no expert skipping. The drafter is optional and off by default.
 
 What we measured on 6 November:
 
@@ -18,6 +19,20 @@ What we measured on 6 November:
 | prompt pass, 618 tokens | 32 s (19.5 tok/s) |
 | prompt pass, 1,533 tokens | 37 s (41 tok/s) |
 | expert reads per decode token | about 13 GB at 32 GB/s, roughly 750 files of 17.5 MB |
+
+And with the Qwen drafter on, measured on 7 November. Raw completions only, greedy, with the same tokens as plain decoding:
+
+| prompt | generated | plain tok/s | with Qwen tok/s | gain |
+|---|---|---|---|---|
+| "The three main financial statements are" | 128 | 2.00 / 2.02 | 2.34 | +16 % |
+| same | 200 | 1.98 | 2.52 | +27 % |
+| same | 512 | 1.92 | 2.61 | +36 % |
+| the public 512-token benchmark prompt | 200 | 1.58 | 2.29 | +45 % |
+
+The gain depends on how predictable the text is. These two prompts are predictable. Chat is not: on a 286-token chat prompt the drafter made decoding slower, so it stays off for chat
+and chat stays at about 2 tok/s. France, the 5-token prompt, fires no blocks and doesn't gain.
+
+The drafter doesn't change the answer: a block's rows run the same kernels as plain steps. We hashed every layer of 40 positions and the logits of 5,325 positions, in both paths, and found no differing bit.
 
 The machine is one RTX PRO 6000 Blackwell (96 GB) in a 70 GiB VM. A RAID0 of three NVMe drives (19 GB/s) has the 79,365
 hottest experts, a second NVMe (6.2 GB/s) has the rest plus some copies, and a Thunderbolt NVMe (3.7 GB/s) has another 74,000
