@@ -18,9 +18,10 @@ Measured on 7 November at commit 6808130, one fresh process per run, greedy, raw
 
 | test | prefill | decode |
 |---|---|---|
+| "The three main financial statements are" (6 tokens), 128 generated (tg128) | — | 2.91 tok/s |
 | 512-token prompt, 128 generated (pp512 / tg128) | 18.6 tok/s | 2.68 tok/s |
 | 1,512-token prompt, 128 generated (pp1512 / tg128) | 44 tok/s | 2.43 tok/s |
-| "The three main financial statements are", 512 generated | — | 3.11 tok/s |
+| the same 6-token prompt, 512 generated | — | 3.11 tok/s |
 
 The drafter gives the same tokens as plain decoding: a block's rows run the same arithmetic as plain steps, and the logits of 3,416
 positions showed no differing bit. Decode depends on how predictable the text is, and chat runs at about 2 tok/s. The 512-token
