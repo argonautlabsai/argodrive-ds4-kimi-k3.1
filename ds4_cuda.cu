@@ -37523,6 +37523,7 @@ struct k3_lru {
        default 0.9; a token = 92 layer calls) found by sampling 64 unpinned slabs; the list order is then unused.
        Simulated on eight chat prompts at 1,584 slabs: LRU 30 %, decayed 35 % hits (Belady 55 %). */
     bool decay_mode = false;
+    bool last_evicted_transient = false;            /* step 78: the slab alloc() just took was transient */
     double tick = 0.0, lb = 0.0;                    /* tick advances per layer call; lb = -ln(decay) / 92 */
     std::vector<float> score;
     uint32_t rng = 12345u;
@@ -37607,7 +37608,7 @@ struct k3_lru {
         }
         if (victim < 0) return -1;
         const uint32_t s = (uint32_t)victim;
-        if (evicted) *evicted = key[s];
+        if (evicted) { *evicted = key[s]; last_evicted_transient = transient[s] != 0; }   /* step 78 */
         drop(s);
         key[s] = k; map[k] = s; transient[s] = hot ? 0 : 1;
         chance[s] = protect ? cold_chance : 0;
@@ -38473,6 +38474,11 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
        behaviour are the decode path's */
     const bool verify = p.verify != 0;
     const bool hot = n_tok == 1u || prefill_hot || verify;
+    static int verify_admit = -1;   /* step 78: DS4_K3_VERIFY_ADMIT=<n>, a block's fill used by fewer than n rows stays transient */
+    if (verify_admit < 0) {
+        verify_admit = getenv("DS4_K3_VERIFY_ADMIT") ? atoi(getenv("DS4_K3_VERIFY_ADMIT")) : 2;   /* 0: every fill goes to the hot end, as a plain step's */
+        if (verify_admit > 1) fprintf(stderr, "ds4: kimi-k3 verification block admission (step 78): fills used by fewer than %d rows stay transient\n", verify_admit);
+    }
     const bool bulk = n_tok > 1u && !verify;   /* step 35: a prompt pass's fills may use tier C and prefetch the next layer */
     const uint64_t layer_key = (uint64_t)layer << 20;
     if (n_tok == 1u || verify) { p.dc.tick += 1.0; p.hc.tick += 1.0; }
@@ -38594,6 +38600,14 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
                 beta, beta_linear);
             k3_raw_down_v2_kernel<K3_GEMV2_MAX_TOK><<<d_grid, 256, k3_gemv2_smem_down_n(ff, count[e]), ls>>>(
                 acc_out, slab, mid_buf, orow, p.dev_tw + off[e], count[e], ff, latent, p.w2p, p.w2s);
+        } else if (gemv_v2 && verify) {   /* step 80: more than K3_GEMV2_MAX_TOK rows: chunks on the plain path's kernels */
+            for (uint32_t k0 = 0; k0 < count[e]; k0 += (uint32_t)K3_GEMV2_MAX_TOK) {
+                const uint32_t m = count[e] - k0 < (uint32_t)K3_GEMV2_MAX_TOK ? count[e] - k0 : (uint32_t)K3_GEMV2_MAX_TOK;
+                k3_raw_gate_up_v2_kernel<K3_GEMV2_MAX_TOK><<<gu_grid, 256, k3_gemv2_smem_gate_up_n(latent, m), ls>>>(
+                    mid_buf, slab, (const float *)x->ptr, p.dev_tok + off[e] + k0, m, ff, latent, p.w1p, p.w1s, p.w3p, p.w3s, beta, beta_linear);
+                k3_raw_down_v2_kernel<K3_GEMV2_MAX_TOK><<<d_grid, 256, k3_gemv2_smem_down_n(ff, m), ls>>>(
+                    acc_out, slab, mid_buf, orow + k0, p.dev_tw + off[e] + k0, m, ff, latent, p.w2p, p.w2s);
+            }
         } else {
             k3_raw_gate_up_multi_kernel<<<gu_grid, 256, 0, stream>>>(p.dev_mid, slab, (const float *)x->ptr, p.dev_tok + off[e],
                                                                      count[e], ff, latent, p.w1p, p.w1s, p.w3p, p.w3s,
@@ -38745,12 +38759,13 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
                 if (h < 0) break;
             }
             uint64_t evicted = K3_NOKEY;
-            d = p.dc.alloc(k, hot, &evicted);   /* no second chance in the device cache: its residency is ~1.7 tokens and the
+            const bool fill_hot = hot && !(verify && n_tok > 1u && verify_admit > 1 && count[e] < (uint32_t)verify_admit);   /* step 78 */
+            d = p.dc.alloc(k, fill_hot, &evicted);   /* no second chance in the device cache: its residency is ~1.7 tokens and the
                                                    same-layer-next-token reuse falls off a cliff below one token (p3: hits 551 -> 60) */
             if (d < 0) { if (read) p.hc.drop((uint32_t)h); break; }
             p.hc.pinned[(uint32_t)h] = 1; p.dc.pinned[(uint32_t)d] = 1; p.dc.filling[(uint32_t)d] = 1;
             p.dev_host[(uint32_t)d] = h; p.hhit[(uint32_t)d] = read ? 0 : 1;   /* step 75 */
-            if (p.victim && hot && !host_all && evicted != K3_NOKEY) k3_victim_copy(p, (uint32_t)d, evicted);
+            if (p.victim && hot && !host_all && evicted != K3_NOKEY && !(verify_admit > 1 && verify && p.dc.last_evicted_transient)) k3_victim_copy(p, (uint32_t)d, evicted);   /* step 78 */
             if (read) p.misses++; else p.hits_host++;
             p.wanted[(uint32_t)d] = 1; p.cold_job[(uint32_t)d] = cold_tier ? 1 : 0;
             if (cold_tier) cold_inflight++;
@@ -39114,6 +39129,15 @@ extern "C" int ds4_gpu_k3_mla_attend_batch_tensor(ds4_gpu_tensor *heads_out, con
                                                   uint32_t pos0, uint32_t n_tok, uint32_t heads, uint32_t qk,
                                                   uint32_t vdim) {
     if (!heads_out || !q || !key_cache || !value_cache || n_tok == 0u || pos0 + n_tok > 8192u) return 0;
+    if (k3_raw_get().verify) {   /* step 80: verification rows take the plain path's attention launch, row by row */
+        for (uint32_t t = 0; t < n_tok; t++) {
+            ds4_gpu_tensor ho = *heads_out, qo = *q;
+            ho.ptr = (char *)heads_out->ptr + (size_t)t * heads * vdim * sizeof(float); ho.bytes = (uint64_t)heads * vdim * sizeof(float);
+            qo.ptr = (char *)q->ptr + (size_t)t * heads * qk * sizeof(float); qo.bytes = (uint64_t)heads * qk * sizeof(float);
+            if (!ds4_gpu_k3_mla_attend_tensor(&ho, &qo, key_cache, value_cache, pos0 + t + 1u, heads, qk, vdim)) return 0;
+        }
+        return 1;
+    }
     const float scale = 1.0f / sqrtf((float)qk);
     cudaStream_t stream = cuda_decode_stream();
     const dim3 grid(n_tok, heads, 1u);
@@ -39140,6 +39164,19 @@ extern "C" int ds4_gpu_k3_kda_decode_batch(
         return 0;
     }
     const uint64_t projection = (uint64_t)n_heads * K3_KDA_DIM;
+    if (k3_raw_get().verify) {   /* step 80: verification rows take the plain path's KDA launch, row by row */
+        const uint64_t pb = projection * sizeof(float);
+        for (uint32_t t = 0; t < n_tok; t++) {
+            ds4_gpu_tensor ov = *out, qv = *q, kv = *k, vv = *v, gv = *raw_gate, bv = *raw_beta, ogv = *output_gate;
+            ov.ptr = (char *)out->ptr + t * pb; ov.bytes = pb; qv.ptr = (char *)q->ptr + t * pb; qv.bytes = pb; kv.ptr = (char *)k->ptr + t * pb; kv.bytes = pb;
+            vv.ptr = (char *)v->ptr + t * pb; vv.bytes = pb; gv.ptr = (char *)raw_gate->ptr + t * pb; gv.bytes = pb;
+            bv.ptr = (char *)raw_beta->ptr + (uint64_t)t * n_heads * sizeof(float); bv.bytes = (uint64_t)n_heads * sizeof(float);
+            ogv.ptr = (char *)output_gate->ptr + t * pb; ogv.bytes = pb;
+            if (!ds4_gpu_k3_kda_decode(&ov, conv_state, recurrent_state, &qv, &kv, &vv, &gv, &bv, &ogv, model_map, model_size, q_conv_offset, k_conv_offset, v_conv_offset,
+                                       a_log_offset, dt_bias_offset, output_norm_offset, n_heads, gate_lower_bound, norm_eps, a_log_per_channel)) return 0;
+        }
+        return 1;
+    }
     const int tier = ds4_tensor_device_idx(out);
     const float *qw = glm53_cuda_weight_f32(model_map, model_size, q_conv_offset, projection * 4u, tier, "K3 KDA q conv");
     const float *kw = glm53_cuda_weight_f32(model_map, model_size, k_conv_offset, projection * 4u, tier, "K3 KDA k conv");

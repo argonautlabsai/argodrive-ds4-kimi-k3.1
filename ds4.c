@@ -41,6 +41,8 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <spawn.h>   /* step 79 */
+#include <signal.h>   /* step 79 */
 
 #include "ds4.h"
 #include "ds4_tool_text.h"
@@ -61521,8 +61523,20 @@ static bool k3_gpu_matmul_n(ds4_gpu_tensor *out, const ds4_model *model, const d
     return ok;
 }
 
+static int g_k3_verify_on;   /* step 80: tentative, defined below */
 static bool k3_gpu_matmul_n_impl(ds4_gpu_tensor *out, const ds4_model *model, const ds4_tensor *w, const ds4_gpu_tensor *x,
                                  uint32_t n_tok) {
+    if (w->type == DS4_TENSOR_F32 && g_k3_verify_on && n_tok > 1u) {   /* step 80: the single-row call, as a plain step makes it */
+        const uint64_t in_bytes = (uint64_t)w->dim[0] * sizeof(float), out_bytes = (uint64_t)w->dim[1] * sizeof(float);
+        if (x->bytes < in_bytes * n_tok || out->bytes < out_bytes * n_tok) return false;
+        for (uint32_t t = 0; t < n_tok; t++) {
+            ds4_gpu_tensor xv = *x, ov = *out;
+            xv.ptr = (char *)x->ptr + (size_t)t * in_bytes; xv.bytes = in_bytes;
+            ov.ptr = (char *)out->ptr + (size_t)t * out_bytes; ov.bytes = out_bytes;
+            if (!ds4_gpu_matmul_f32_tensor(&ov, model->map, model->size, w->abs_offset, w->dim[0], w->dim[1], &xv, 1)) return false;
+        }
+        return true;
+    }
     if (w->type == DS4_TENSOR_F32) {
         return ds4_gpu_matmul_f32_tensor(out, model->map, model->size, w->abs_offset, w->dim[0], w->dim[1], x, n_tok) != 0;
     }
@@ -61835,6 +61849,13 @@ static void k3_gpu_batch_free(k3_gpu_batch *bb) {
 }
 
 static double g_k3_pf_attn = 0.0, g_k3_pf_route = 0.0, g_k3_pf_moe = 0.0;
+static uint64_t k3_fnv(const void *p, size_t len) {   /* step 80: bit-level comparison of two paths */
+    const uint8_t *b = p; uint64_t h = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < len; i++) { h ^= b[i]; h *= 0x100000001b3ull; }
+    return h;
+}
+static bool k3_hash_on(void) { static int on = -1; if (on < 0) on = getenv("DS4_K3_TRACE_HASH") ? 1 : 0; return on != 0; }
+static bool k3_hash_layers_on(void) { static int on = -1; if (on < 0) on = getenv("DS4_K3_TRACE_HASH_LAYERS") ? 1 : 0; return on != 0; }
 static int g_k3_verify_on = 0;   /* step 44: a verification block is running (no prompt-pass hints) */
 /* trace-only: drain the decode stream (a 4-byte readback) and return the clock */
 static double k3_pf_mark(const ds4_gpu_tensor *t) {
@@ -63073,6 +63094,288 @@ static int k3_draft_run(k3_gpu_buffers *b, const ds4_model *model, const ds4_voc
     return produced;
 }
 
+/* step 79 (experimental, off unless DS4_K3_QWEN=1): Qwen proposals from deltafin's recipe; qwen_sidecar.py holds the gate and the token translation. */
+static void k3_hash_row(const char *what, uint32_t pos, uint32_t il, const ds4_gpu_tensor *t, uint32_t row, uint32_t n) {
+    float *h = xmalloc((size_t)n * sizeof(float));
+    if (ds4_gpu_tensor_read(t, (uint64_t)row * n * sizeof(float), h, (uint64_t)n * sizeof(float)) != 0)
+        fprintf(stderr, "ds4: K3 hash layer %s pos %u il %u %016llx\n", what, pos, il, (unsigned long long)k3_fnv(h, (size_t)n * sizeof(float)));
+    free(h);
+}
+extern char **environ;
+static struct {
+    bool tried, on, active;
+    pid_t pid; int to_fd, from_fd;
+    int *pending; uint32_t n_pending, cap_pending;
+    /* per request */
+    bool bufs; k3_gpu_batch vb; k3_kda_inputs *kin; ds4_gpu_tensor **snap_state, **snap_conv, *vlg; float *vlog;
+    double t_rpc, t_side, t_block, t_fwd, t_replay, t_snap;
+    uint64_t n_rpc, n_fired, n_none, n_soft, n_conf, n_retry, q_steps, n_blocks, n_zero, n_partial, n_full, n_drafts, n_acc, n_blk_tokens;
+} g_k3_qwen;
+static void k3_qwen_fail(const char *what) {
+    fprintf(stderr, "ds4: K3 Qwen: %s; drafting off, decoding continues plain\n", what);
+    g_k3_qwen.active = false; g_k3_qwen.on = false;
+    if (g_k3_qwen.to_fd >= 0) close(g_k3_qwen.to_fd);
+    if (g_k3_qwen.from_fd >= 0) close(g_k3_qwen.from_fd);
+    g_k3_qwen.to_fd = g_k3_qwen.from_fd = -1;
+    if (g_k3_qwen.pid > 0) { (void)waitpid(g_k3_qwen.pid, NULL, WNOHANG); g_k3_qwen.pid = 0; }
+}
+static bool k3_qwen_write(const void *p, size_t len) {
+    const uint8_t *q = p;
+    while (len) { const ssize_t w = write(g_k3_qwen.to_fd, q, len); if (w < 0 && errno == EINTR) continue; if (w <= 0) return false; q += w; len -= (size_t)w; }
+    return true;
+}
+static bool k3_qwen_read(void *p, size_t len) {
+    uint8_t *q = p;
+    while (len) { const ssize_t r = read(g_k3_qwen.from_fd, q, len); if (r < 0 && errno == EINTR) continue; if (r <= 0) return false; q += r; len -= (size_t)r; }
+    return true;
+}
+static bool k3_qwen_start(void) {
+    if (g_k3_qwen.tried) return g_k3_qwen.on;
+    g_k3_qwen.tried = true; g_k3_qwen.to_fd = g_k3_qwen.from_fd = -1;
+    const char *on = getenv("DS4_K3_QWEN");
+    if (!on || !on[0] || !strcmp(on, "0")) return false;
+    const char *py = getenv("DS4_K3_QWEN_PY"), *script = getenv("DS4_K3_QWEN_SCRIPT");
+    if (!py || !py[0] || !script || !script[0]) { fprintf(stderr, "ds4: K3 Qwen: DS4_K3_QWEN_PY and DS4_K3_QWEN_SCRIPT are needed; plain decode\n"); return false; }
+    signal(SIGPIPE, SIG_IGN);
+    int to[2], from[2];
+    if (pipe(to) != 0 || pipe(from) != 0) { fprintf(stderr, "ds4: K3 Qwen: pipe failed; plain decode\n"); return false; }
+    (void)fcntl(to[1], F_SETFD, FD_CLOEXEC); (void)fcntl(from[0], F_SETFD, FD_CLOEXEC);
+    const double t0 = now_sec();
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, to[0], 0);
+    posix_spawn_file_actions_adddup2(&fa, from[1], 1);
+    posix_spawn_file_actions_addclose(&fa, to[0]);
+    posix_spawn_file_actions_addclose(&fa, from[1]);
+    char *const argv[] = {(char *)py, (char *)script, NULL};
+    const int rc = posix_spawn(&g_k3_qwen.pid, py, &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(to[0]); close(from[1]);
+    if (rc != 0) { fprintf(stderr, "ds4: K3 Qwen: could not start %s (%s); plain decode\n", py, strerror(rc)); close(to[1]); close(from[0]); return false; }
+    g_k3_qwen.to_fd = to[1]; g_k3_qwen.from_fd = from[0];
+    uint8_t rep[9]; float load_s = 0.0f; uint32_t vram = 0;
+    const uint8_t hello = 'H';
+    if (!k3_qwen_write(&hello, 1) || !k3_qwen_read(rep, 9) || rep[0] != 'h') { k3_qwen_fail("the sidecar did not answer"); return false; }
+    memcpy(&load_s, rep + 1, 4); memcpy(&vram, rep + 5, 4);
+    g_k3_qwen.on = true;
+    fprintf(stderr, "ds4: K3 Qwen: sidecar ready in %.1f s (its own load %.1f s, %u MB reserved by torch); blocks of 8 rows when 7 drafts pass its gate, plain steps otherwise\n", now_sec() - t0, load_s, vram);
+    return true;
+}
+static void k3_qwen_push(int id) {
+    if (g_k3_qwen.n_pending == g_k3_qwen.cap_pending) {
+        g_k3_qwen.cap_pending = g_k3_qwen.cap_pending ? g_k3_qwen.cap_pending * 2u : 8192u;
+        g_k3_qwen.pending = realloc(g_k3_qwen.pending, sizeof(int) * g_k3_qwen.cap_pending);
+        if (!g_k3_qwen.pending) ds4_die("K3 Qwen history allocation failed");
+    }
+    g_k3_qwen.pending[g_k3_qwen.n_pending++] = id;
+}
+/* a new request: the sidecar starts from an empty history and gets the whole prompt with the first proposal */
+static void k3_qwen_begin(const ds4_vocab *vocab, const int *ids, int n_ids) {
+    g_k3_qwen.active = false;
+    if (!k3_qwen_start()) return;
+    if (g_k3_sampling.temperature > 0.0f) { fprintf(stderr, "ds4: K3 Qwen: greedy decoding only; plain decode for this request\n"); return; }
+    if (g_k3_blocks.enabled && !getenv("DS4_K3_QWEN_CHAT")) return;
+    const int id_open = vocab_lookup_optional(vocab, "<|open|>");
+    bool chat = false;
+    for (int i = 0; i < n_ids && !chat; i++) chat = ids[i] == id_open;
+    if (chat && !getenv("DS4_K3_QWEN_CHAT")) { fprintf(stderr, "ds4: K3 Qwen: raw completions only (DS4_K3_QWEN_CHAT=1 allows chat); plain decode for this request\n"); return; }
+    const uint8_t c = 'B'; uint8_t r = 0;
+    if (!k3_qwen_write(&c, 1) || !k3_qwen_read(&r, 1) || r != 'b') { k3_qwen_fail("the sidecar did not take the new request"); return; }
+    g_k3_qwen.n_pending = 0;
+    for (int i = 0; i < n_ids; i++) k3_qwen_push(ids[i]);
+    g_k3_qwen.t_rpc = g_k3_qwen.t_side = g_k3_qwen.t_block = g_k3_qwen.t_fwd = g_k3_qwen.t_replay = g_k3_qwen.t_snap = 0.0;
+    g_k3_qwen.n_rpc = g_k3_qwen.n_fired = g_k3_qwen.n_none = g_k3_qwen.n_soft = g_k3_qwen.n_conf = g_k3_qwen.n_retry = g_k3_qwen.q_steps = 0;
+    g_k3_qwen.n_blocks = g_k3_qwen.n_zero = g_k3_qwen.n_partial = g_k3_qwen.n_full = g_k3_qwen.n_drafts = g_k3_qwen.n_acc = g_k3_qwen.n_blk_tokens = 0;
+    g_k3_qwen.active = true;
+}
+/* the proposal for the anchor just pushed: *nd is 7 (block) or 0 (plain step). False: the sidecar failed and drafting is off. */
+static bool k3_qwen_propose(int out[7], uint32_t *nd) {
+    const double t0 = now_sec();
+    uint8_t hdr[5]; hdr[0] = 'Q'; memcpy(hdr + 1, &g_k3_qwen.n_pending, 4);
+    const uint32_t requested = 7u;
+    if (!k3_qwen_write(hdr, 5) || !k3_qwen_write(g_k3_qwen.pending, sizeof(int) * g_k3_qwen.n_pending) || !k3_qwen_write(&requested, 4)) { k3_qwen_fail("the sidecar stopped taking proposals"); return false; }
+    g_k3_qwen.n_pending = 0;
+    uint8_t rep[5]; uint32_t n = 0;
+    if (!k3_qwen_read(rep, 5) || rep[0] != 'q') { k3_qwen_fail("no answer to a proposal"); return false; }
+    memcpy(&n, rep + 1, 4);
+    if (n != 0u && n != 7u) { k3_qwen_fail("malformed proposal"); return false; }
+    uint32_t buf[7]; uint8_t tail[16]; float side = 0.0f; uint32_t steps = 0, flags = 0;
+    if ((n && !k3_qwen_read(buf, sizeof(uint32_t) * n)) || !k3_qwen_read(tail, 16)) { k3_qwen_fail("short answer to a proposal"); return false; }
+    for (uint32_t i = 0; i < n; i++) {
+        if (buf[i] >= (uint32_t)DS4_N_VOCAB) { k3_qwen_fail("a draft outside the vocabulary"); return false; }
+        out[i] = (int)buf[i];
+    }
+    memcpy(&side, tail + 4, 4); memcpy(&steps, tail + 8, 4); memcpy(&flags, tail + 12, 4);
+    *nd = n;
+    g_k3_qwen.t_rpc += now_sec() - t0; g_k3_qwen.t_side += side; g_k3_qwen.n_rpc++; g_k3_qwen.q_steps += steps;
+    if (n) g_k3_qwen.n_fired++; else g_k3_qwen.n_none++;
+    if (flags & 1u) g_k3_qwen.n_soft++;
+    if (flags & 2u) g_k3_qwen.n_conf++;
+    if (flags & 4u) g_k3_qwen.n_retry++;
+    return true;
+}
+static void k3_qwen_bufs(void) {
+    if (g_k3_qwen.bufs) return;
+    const uint32_t L = DS4_N_LAYER, width = 8u, proj = DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM;
+    const uint64_t state_floats = (uint64_t)DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM * DS4_N_KDA_HEAD_DIM, conv_floats = (uint64_t)3 * 3 * proj;
+    k3_gpu_batch_alloc(&g_k3_qwen.vb, width);
+    g_k3_qwen.kin = xcalloc(L, sizeof(*g_k3_qwen.kin));
+    g_k3_qwen.snap_state = xcalloc(L, sizeof(*g_k3_qwen.snap_state)); g_k3_qwen.snap_conv = xcalloc(L, sizeof(*g_k3_qwen.snap_conv));
+    for (uint32_t il = 0; il < L; il++) {
+        if (!ds4_k3_layer_is_kda(il)) continue;
+        k3_kda_inputs *k = &g_k3_qwen.kin[il];
+        k->q = k3_gpu_alloc_f32((uint64_t)width * proj); k->k = k3_gpu_alloc_f32((uint64_t)width * proj);
+        k->v = k3_gpu_alloc_f32((uint64_t)width * proj); k->raw_gate = k3_gpu_alloc_f32((uint64_t)width * proj);
+        k->beta = k3_gpu_alloc_f32((uint64_t)width * DS4_N_KDA_HEAD); k->ogate = k3_gpu_alloc_f32((uint64_t)width * proj);
+        g_k3_qwen.snap_state[il] = k3_gpu_alloc_f32(state_floats); g_k3_qwen.snap_conv[il] = k3_gpu_alloc_f32(conv_floats);
+    }
+    g_k3_qwen.vlg = k3_gpu_alloc_f32((uint64_t)width * DS4_N_VOCAB);
+    g_k3_qwen.vlog = xmalloc((size_t)width * DS4_N_VOCAB * sizeof(float));
+    g_k3_qwen.bufs = true;
+}
+/* one verification block: the anchor + 7 drafts. False: a GPU step failed and the target's state cannot be trusted. */
+static bool k3_qwen_block(k3_gpu_buffers *b, const ds4_model *model, const ds4_vocab *vocab, const ds4_weights *weights, uint32_t *pos_io, int *token_io, const int *drafts,
+                          int n_left, ds4_token_emit_fn emit, void *emit_ud, int special_base, int *produced_io, bool *stop_io) {
+    const uint32_t n = DS4_N_EMBD, L = DS4_N_LAYER, nb = 8u;
+    const uint64_t state_bytes = (uint64_t)DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM * DS4_N_KDA_HEAD_DIM * sizeof(float);
+    const uint64_t conv_bytes = (uint64_t)3 * 3 * DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM * sizeof(float);
+    k3_qwen_bufs();
+    k3_gpu_batch *vb = &g_k3_qwen.vb; k3_kda_inputs *kin = g_k3_qwen.kin;
+    const uint32_t pos = *pos_io;
+    const double t0 = now_sec();
+    double wait0 = 0.0; uint64_t bytes0 = 0, cd0 = 0, ch0 = 0, cm0 = 0;
+    ds4_gpu_k3_moe_raw_stats(&wait0, &bytes0); ds4_gpu_k3_cache_stats(&cd0, &ch0, &cm0);
+    int blk[8], am[8]; int32_t tok32[8];
+    blk[0] = *token_io; for (uint32_t i = 0; i < 7u; i++) blk[1 + i] = drafts[i];
+    for (uint32_t i = 0; i < nb; i++) tok32[i] = (int32_t)blk[i];
+    bool ok = true;
+    const double ts0 = now_sec();
+    for (uint32_t il = 0; il < L && ok; il++) {
+        if (!ds4_k3_layer_is_kda(il)) continue;
+        ok = ds4_gpu_tensor_copy(g_k3_qwen.snap_state[il], 0, b->kda_state[il], 0, state_bytes) != 0 && ds4_gpu_tensor_copy(g_k3_qwen.snap_conv[il], 0, b->kda_conv[il], 0, conv_bytes) != 0;
+    }
+    g_k3_qwen.t_snap += now_sec() - ts0;
+    if (!ok) { fprintf(stderr, "ds4: K3 Qwen: KDA snapshot failed\n"); return false; }
+    ds4_gpu_k3_set_verify(1);
+    g_k3_verify_on = 1;
+    vb->n_tok = nb;
+    ok = ds4_gpu_tensor_write(vb->tokens, 0, tok32, sizeof(int32_t) * nb) != 0;
+    if (ok) ok = ds4_gpu_embed_tokens_quant_tensor(vb->cur, vb->tokens, model->map, model->size, weights->token_embd->abs_offset, weights->token_embd->type, DS4_N_VOCAB, nb, n) != 0;
+    ds4_gpu_tensor *vb_q = vb->kda_q, *vb_k = vb->kda_k, *vb_v = vb->kda_v, *vb_rg = vb->kda_raw_gate, *vb_beta = vb->kda_beta, *vb_og = vb->kda_ogate;
+    uint32_t n_anchor = 0;
+    for (uint32_t il = 0; il < L && ok; il++) {
+        if (ds4_k3_layer_is_kda(il)) {   /* this layer's KDA inputs land in its own buffers, kept for a replay */
+            vb->kda_q = kin[il].q; vb->kda_k = kin[il].k; vb->kda_v = kin[il].v;
+            vb->kda_raw_gate = kin[il].raw_gate; vb->kda_beta = kin[il].beta; vb->kda_ogate = kin[il].ogate;
+        }
+        ok = k3_gpu_layer_batch(b, vb, model, &weights->layer[il], il, pos, &n_anchor, 0u, NULL, NULL);
+        if (ok && k3_hash_layers_on()) {
+            for (uint32_t i = 0; i < nb; i++) {
+                k3_hash_row("prefix", pos + i, il, vb->prefix, i, n);
+                if (il >= DS4_N_LEADING_DENSE) k3_hash_row("routed", pos + i, il, vb->routed, i, g_ds4_shape.n_routed_latent);
+                k3_hash_row("cur", pos + i, il, vb->cur, i, n);
+            }
+        }
+    }
+    vb->kda_q = vb_q; vb->kda_k = vb_k; vb->kda_v = vb_v; vb->kda_raw_gate = vb_rg; vb->kda_beta = vb_beta; vb->kda_ogate = vb_og;
+    if (ok) ok = ds4_gpu_k3_residual_mix_batch_tensor(vb->mixed, vb->cur, vb->anchors, n_anchor, nb, model->map, model->size, weights->output_res_norm->abs_offset, weights->output_res_proj->abs_offset, n, DS4_RMS_EPS) != 0;
+    if (ok) ok = k3_gpu_rms_norm_rows(vb->normed, vb->mixed, model, weights->output_norm, n, nb);
+    if (ok) ok = k3_gpu_matmul_n(g_k3_qwen.vlg, model, weights->output, vb->normed, nb);
+    if (ok) ok = ds4_gpu_tensor_read(g_k3_qwen.vlg, 0, g_k3_qwen.vlog, (uint64_t)nb * DS4_N_VOCAB * sizeof(float)) != 0;
+    if (!ok) { g_k3_verify_on = 0; ds4_gpu_k3_set_verify(0); fprintf(stderr, "ds4: K3 Qwen: block forward failed at pos %u\n", pos); return false; }
+    const double dt = now_sec() - t0;
+    g_k3_qwen.t_fwd += dt;
+    for (uint32_t i = 0; i < nb; i++) am[i] = sample_argmax(g_k3_qwen.vlog + (size_t)i * DS4_N_VOCAB, DS4_N_VOCAB);
+    if (getenv("DS4_K3_QWEN_TRACE_TOP")) {   /* diagnostics: each row's two best tokens */
+        for (uint32_t i = 0; i < nb; i++) {
+            const float *lg = g_k3_qwen.vlog + (size_t)i * DS4_N_VOCAB;
+            int t2 = -1; float v2 = -INFINITY;
+            for (uint32_t v = 0; v < DS4_N_VOCAB; v++) if ((int)v != am[i] && lg[v] > v2) { v2 = lg[v]; t2 = (int)v; }
+            fprintf(stderr, "ds4: K3 Qwen row pos %u: top %d %.4f, second %d %.4f, margin %.4f\n", pos + i, am[i], lg[am[i]], t2, v2, lg[am[i]] - v2);
+        }
+    }
+    uint32_t acc = 0;
+    while (acc + 1u < nb && am[acc] == blk[acc + 1u]) acc++;
+    const uint32_t commit = acc + 1u;   /* the anchor and the accepted drafts */
+    if (commit < nb) {
+        /* the KDA states go back to the snapshot and forward over the committed rows; the MLA caches follow the position */
+        const double tr0 = now_sec();
+        for (uint32_t il = 0; il < L && ok; il++) {
+            if (!ds4_k3_layer_is_kda(il)) continue;
+            const ds4_layer_weights *l = &weights->layer[il];
+            ok = ds4_gpu_tensor_copy(b->kda_state[il], 0, g_k3_qwen.snap_state[il], 0, state_bytes) != 0 &&
+                 ds4_gpu_tensor_copy(b->kda_conv[il], 0, g_k3_qwen.snap_conv[il], 0, conv_bytes) != 0 &&
+                 ds4_gpu_k3_kda_decode_batch(vb->kda_out, b->kda_conv[il], b->kda_state[il], kin[il].q, kin[il].k, kin[il].v, kin[il].raw_gate, kin[il].beta, kin[il].ogate, model->map, model->size,
+                     l->kda_q_conv->abs_offset, l->kda_k_conv->abs_offset, l->kda_v_conv->abs_offset, l->kda_a_log->abs_offset, l->kda_dt_bias->abs_offset, l->kda_o_norm->abs_offset,
+                     DS4_N_KDA_HEAD, DS4_KDA_GATE_LOWER_BOUND, DS4_RMS_EPS, g_ds4_shape.kda_a_log_per_channel ? 1 : 0, commit) != 0;
+        }
+        g_k3_qwen.t_replay += now_sec() - tr0;
+        if (!ok) { g_k3_verify_on = 0; ds4_gpu_k3_set_verify(0); fprintf(stderr, "ds4: K3 Qwen: KDA replay failed at pos %u\n", pos); return false; }
+        if (acc == 0u) g_k3_qwen.n_zero++; else g_k3_qwen.n_partial++;
+    } else g_k3_qwen.n_full++;
+    g_k3_verify_on = 0;
+    ds4_gpu_k3_set_verify(0);
+    if (k3_hash_on()) for (uint32_t i = 0; i < commit; i++) fprintf(stderr, "ds4: K3 hash logits pos %u %016llx\n", pos + i, (unsigned long long)k3_fnv(g_k3_qwen.vlog + (size_t)i * DS4_N_VOCAB, (size_t)DS4_N_VOCAB * sizeof(float)));
+    for (uint32_t i = 0; i < commit; i++) k3_session_push(blk[i]);
+    int next_tokens[8]; uint32_t n_next = 0;
+    for (uint32_t i = 1; i < commit; i++) next_tokens[n_next++] = blk[i];
+    const int bonus = am[acc];
+    next_tokens[n_next++] = bonus;
+    int produced = *produced_io; bool stop = false;
+    for (uint32_t i = 0; i < n_next && !stop; i++) {
+        const int nx = next_tokens[i];
+        if (g_k3_blocks.enabled) {
+            int visible = 0;
+            if (nx == vocab->eos_id || k3_blocks_feed(vocab, nx, &visible)) { stop = true; break; }
+            if (emit && ((visible && nx < special_base) || g_k3_blocks.response_closed)) emit(emit_ud, nx);
+        } else {
+            if (vocab_token_is_generation_stop(vocab, nx)) { stop = true; break; }
+            if (emit && nx < special_base) emit(emit_ud, nx);
+        }
+        produced++;
+        k3_qwen_push(nx);
+        if (g_k3_rec) { fprintf(g_k3_rec, "%d\n", nx); fflush(g_k3_rec); }
+        if (produced - *produced_io >= n_left) stop = true;
+    }
+    g_k3_qwen.n_blocks++; g_k3_qwen.n_drafts += 7u; g_k3_qwen.n_acc += acc; g_k3_qwen.n_blk_tokens += (uint64_t)(produced - *produced_io);
+    *produced_io = produced; *stop_io = stop; *pos_io = pos + commit; *token_io = bonus;
+    g_k3_qwen.t_block += now_sec() - t0;
+    if (getenv("DS4_K3_TRACE_TIMING")) {
+        double wait1 = 0.0; uint64_t bytes1 = 0, cd1 = 0, ch1 = 0, cm1 = 0;
+        ds4_gpu_k3_moe_raw_stats(&wait1, &bytes1); ds4_gpu_k3_cache_stats(&cd1, &ch1, &cm1);
+        fprintf(stderr, "ds4: K3 Qwen block %llu: 8 rows at pos %u, accepted %u of 7, %.3f s (forward %.3f), waited %.3f s for %.2f GB; expert cache device %llu, host %llu, disk %llu\n",
+                (unsigned long long)g_k3_qwen.n_blocks, pos, acc, now_sec() - t0, dt, wait1 - wait0, (double)(bytes1 - bytes0) / 1e9,
+                (unsigned long long)(cd1 - cd0), (unsigned long long)(ch1 - ch0), (unsigned long long)(cm1 - cm0));
+    }
+    return true;
+}
+static void k3_qwen_end(void) {
+    if (g_k3_qwen.n_rpc || g_k3_qwen.n_blocks) {
+        fprintf(stderr, "ds4: K3 Qwen: %llu proposals in %.2f s (%.1f ms per call, %.2f s inside the sidecar, %.2f rows per call): %llu blocks, %llu no proposal (%llu confidence stops, %llu soft skips, %llu retries)\n",
+                (unsigned long long)g_k3_qwen.n_rpc, g_k3_qwen.t_rpc, g_k3_qwen.n_rpc ? 1e3 * g_k3_qwen.t_rpc / (double)g_k3_qwen.n_rpc : 0.0, g_k3_qwen.t_side,
+                g_k3_qwen.n_rpc ? (double)g_k3_qwen.q_steps / (double)g_k3_qwen.n_rpc : 0.0, (unsigned long long)g_k3_qwen.n_fired, (unsigned long long)g_k3_qwen.n_none,
+                (unsigned long long)g_k3_qwen.n_conf, (unsigned long long)g_k3_qwen.n_soft, (unsigned long long)g_k3_qwen.n_retry);
+        fprintf(stderr, "ds4: K3 Qwen: %llu blocks in %.2f s (forward %.2f s, replay %.2f s, snapshots %.2f s) gave %llu tokens: drafts %llu, accepted %llu (%.1f %%), full %llu, partial %llu, zero %llu\n",
+                (unsigned long long)g_k3_qwen.n_blocks, g_k3_qwen.t_block, g_k3_qwen.t_fwd, g_k3_qwen.t_replay, g_k3_qwen.t_snap, (unsigned long long)g_k3_qwen.n_blk_tokens,
+                (unsigned long long)g_k3_qwen.n_drafts, (unsigned long long)g_k3_qwen.n_acc, g_k3_qwen.n_drafts ? 100.0 * (double)g_k3_qwen.n_acc / (double)g_k3_qwen.n_drafts : 0.0,
+                (unsigned long long)g_k3_qwen.n_full, (unsigned long long)g_k3_qwen.n_partial, (unsigned long long)g_k3_qwen.n_zero);
+    }
+    g_k3_qwen.active = false;
+    if (g_k3_qwen.bufs) {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            k3_kda_inputs *k = &g_k3_qwen.kin[il];
+            if (k->q) { ds4_gpu_tensor_free(k->q); ds4_gpu_tensor_free(k->k); ds4_gpu_tensor_free(k->v); ds4_gpu_tensor_free(k->raw_gate); ds4_gpu_tensor_free(k->beta); ds4_gpu_tensor_free(k->ogate); }
+            if (g_k3_qwen.snap_state[il]) ds4_gpu_tensor_free(g_k3_qwen.snap_state[il]);
+            if (g_k3_qwen.snap_conv[il]) ds4_gpu_tensor_free(g_k3_qwen.snap_conv[il]);
+        }
+        free(g_k3_qwen.kin); free(g_k3_qwen.snap_state); free(g_k3_qwen.snap_conv);
+        k3_gpu_batch_free(&g_k3_qwen.vb);
+        ds4_gpu_tensor_free(g_k3_qwen.vlg);
+        free(g_k3_qwen.vlog);
+        g_k3_qwen.bufs = false;
+    }
+}
+
 static int generate_k3_cuda_argmax(
         const ds4_model   * model,
         const ds4_vocab   * vocab,
@@ -63267,6 +63570,7 @@ static int generate_k3_cuda_argmax(
         if (k3_draft_truncate(pos0) && g_k3_draft.len == pos0) g_k3_draft.active = true;
         else fprintf(stderr, "ds4: K3 drafter: sidecar holds %u rows, the request starts at %u: drafting off for this request\n", g_k3_draft.len, pos0);
     }
+    k3_qwen_begin(vocab, ids, n_ids);   /* step 79 */
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     uint32_t pos = 0;
     int token = ids[0];
@@ -63332,6 +63636,11 @@ static int generate_k3_cuda_argmax(
             k3_rows_begin(1u, n);
             for (uint32_t il = 0; il < L && ok; il++) {
                 ok = k3_gpu_layer(&b, model, &weights->layer[il], il, pos, &n_anchor);
+                if (ok && k3_hash_layers_on()) {
+                    k3_hash_row("prefix", pos, il, b.prefix, 0u, n);
+                    if (il >= DS4_N_LEADING_DENSE) k3_hash_row("routed", pos, il, b.routed, 0u, latent);
+                    k3_hash_row("cur", pos, il, b.cur, 0u, n);
+                }
                 if (ok) k3_rows_capture(k3_rows_index(il), b.cur, 1u);
                 if (ok && trace) {
                     float *h = xmalloc((size_t)n * sizeof(float));
@@ -63351,6 +63660,7 @@ static int generate_k3_cuda_argmax(
         if (ok) ok = k3_gpu_matmul(b.logits, model, weights->output, b.normed);
         if (ok) ok = ds4_gpu_tensor_read(b.logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
         if (!ok) { fprintf(stderr, "ds4: K3 output head failed\n"); ok_session_keep = false; break; }
+        if (k3_hash_on()) fprintf(stderr, "ds4: K3 hash logits pos %u %016llx\n", pos, (unsigned long long)k3_fnv(logits, (size_t)DS4_N_VOCAB * sizeof(float)));
         const int next = pos + 1u >= (uint32_t)n_ids ? k3_sample_next(logits, DS4_N_VOCAB) : sample_argmax(logits, DS4_N_VOCAB);
         if (k3_verbose) {
             fprintf(stderr, "ds4: K3 pos %u token %d -> argmax %d (%.*s) %.2f s\n", pos, token, next,
@@ -63465,6 +63775,17 @@ static int generate_k3_cuda_argmax(
         token = next;
         if (oracle && oracle_width >= 1u) break;   /* step 44: the rest of the answer goes through the block verifier */
         if (g_k3_draft.active) break;              /* step 45: the rest of the answer is drafted and verified in blocks */
+        if (g_k3_qwen.active) {                    /* step 79: blocks while the gate passes; otherwise the next plain step, as ever */
+            k3_qwen_push(next);
+            bool qstop = false;
+            while (g_k3_qwen.active && !qstop && n_predict - produced >= 8 && pos + 8u < cache_cap && !g_k3_cancel) {
+                int prop[7]; uint32_t nd = 0;
+                if (!k3_qwen_propose(prop, &nd) || nd != 7u) break;
+                if (!k3_qwen_block(&b, model, vocab, weights, &pos, &token, prop, n_predict - produced, emit, emit_ud, special_base, &produced, &qstop)) { ok_session_keep = false; qstop = true; }
+                if (produced >= n_predict) qstop = true;
+            }
+            if (qstop || g_k3_cancel) break;
+        }
     }
     if (g_k3_draft.active && !oracle && produced > 0 && produced < n_predict && !g_k3_cancel && ok_session_keep) {
         produced += k3_draft_run(&b, model, vocab, weights, &pos, &token, n_predict - produced, emit, emit_ud, special_base);
@@ -63473,6 +63794,7 @@ static int generate_k3_cuda_argmax(
         produced += k3_oracle_verify_run(&b, model, vocab, weights, &pos, &token, oracle, n_oracle, oracle_width,
                                          n_predict - produced, emit, emit_ud, special_base);
     }
+    k3_qwen_end();   /* step 79 */
     if (oracle_rec) fclose(oracle_rec);
     g_k3_rec = NULL;
     free(oracle);
