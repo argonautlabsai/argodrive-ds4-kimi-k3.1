@@ -1,3 +1,5 @@
+<p align="center"><img src="tools/kimi-k3/images/argodrive-mark.svg" width="88" alt="ARGODRIVE"></p>
+
 # Kimi K3.1 Pro on one 96 GB GPU
 
 **argodrive-ds4-kimi-k3.1** runs Kimi K3.1 Pro (2.8T parameters, 1.45 TB of experts) on one 96 GB GPU, with the experts streamed off NVMe as the router asks
@@ -8,6 +10,9 @@ This is Salvatore Sanfilippo's [ds4](https://github.com/antirez/ds4) at commit c
 The spine sits in VRAM as Q8_0. The 82,432 MXFP4 expert files stay on disk and move through a VRAM cache and a pinned RAM
 pool. There's no expert skipping. The drafter is off by default; `DS4_K3_QWEN=1` turns it on
 ([setup](tools/kimi-k3/README.md#the-optional-qwen-drafter)).
+
+<p align="center"><img src="tools/kimi-k3/images/workstation.jpg" width="760" alt="Inside the workstation: two NVIDIA RTX PRO 6000 Blackwell cards above a Hyper M.2 x16 Gen5 card"></p>
+<p align="center"><em>The workstation. The port runs on one of its two RTX PRO 6000 Blackwell cards (96 GB).</em></p>
 
 Decode with the Qwen drafter, measured on 7 November at commit 6808130. Greedy, with the same tokens as plain decoding:
 
