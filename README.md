@@ -4,7 +4,7 @@
 
 **argodrive-ds4-kimi-k3.1** runs Kimi K3.1 Pro (2.8T parameters, 1.45 TB of experts) on one 96 GB GPU, with the experts streamed off NVMe as the router asks
 for them: 3.1 tok/s decode on raw completions with its Qwen drafter, which gives the same tokens as plain decoding, and prefill
-from 10.6 tok/s on a 270-token prompt up to 41 tok/s on a 1,533-token one.
+at up to 45 tok/s.
 
 This is Salvatore Sanfilippo's [ds4](https://github.com/antirez/ds4) at commit c97964b with a Kimi K3 / K3.1 Pro port on top.
 The spine sits in VRAM as Q8_0. The 82,432 MXFP4 expert files stay on disk and move through a VRAM cache and a pinned RAM
@@ -14,40 +14,16 @@ pool. There's no expert skipping. The drafter is off by default; `DS4_K3_QWEN=1`
 <p align="center"><img src="tools/kimi-k3/images/workstation.jpg" width="760" alt="Inside the workstation: two NVIDIA RTX PRO 6000 Blackwell cards above a Hyper M.2 x16 Gen5 card"></p>
 <p align="center"><em>The workstation. The port runs on one of its two RTX PRO 6000 Blackwell cards (96 GB).</em></p>
 
-Decode with the Qwen drafter, measured on 7 November at commit 6808130. Greedy, with the same tokens as plain decoding:
+Measured on 7 November at commit 6808130, one fresh process per run:
 
-| prompt | generated | with Qwen tok/s | plain tok/s | gain |
-|---|---|---|---|---|
-| "The three main financial statements are" | 128 | 2.90 / 2.92 | 2.02 | +44 % |
-| same | 200 | 3.10 / 3.11 | 1.98 / 1.99 | +56 % |
-| same | 512 | 3.11 | 1.88 | +65 % |
-| the public 512-token benchmark prompt | 200 | 2.64 / 2.67 | 1.52 / 1.53 | +74 % |
-| a 286-token chat prompt, chat settings | 200 | 2.01 / 2.02 | 1.92 / 1.94 | +4 % |
-
-The gain depends on how predictable the text is. The record prompt and the public prompt are predictable. Chat text is much less so: with a stricter gate
-that adapts (the chat settings in [tools/kimi-k3/README.md](tools/kimi-k3/README.md#the-optional-qwen-drafter)) the drafter gains a little there instead of
-losing, and it stays off for chat unless you ask for it. France, the 5-token prompt, fires 2 blocks: 2.17 / 2.19 / 2.20 tok/s against 1.95 plain.
-
-Plain decoding and the prompt pass, measured on 6 November:
-
-| | |
+| | speed |
 |---|---|
-| decode, 128 generated tokens | 2.04 tok/s |
-| decode, 512 generated tokens | 1.94 tok/s |
-| decode, 200 tokens after a 270-token chat prompt | 1.93–1.96 tok/s |
-| prompt pass, 270 tokens | 25 s (10.6 tok/s) |
-| prompt pass, 618 tokens | 32 s (19.5 tok/s) |
-| prompt pass, 1,533 tokens | 37 s (41 tok/s) |
-| expert reads per decode token | about 13 GB at 32 GB/s, roughly 750 files of 17.5 MB |
+| decode, 512 tokens | 3.11 tok/s |
+| prefill, 1,549-token prompt | 45 tok/s |
 
-What changed since the first drafter release: a block's spine matmuls load each weight once for up to 8 rows instead of once per row, and a block can
-take from 2 to 16 rows. With the drafter off, a fresh process also gets to its first token sooner: 21.2 s instead of 26.7 s on the record prompt and
-51.4 s instead of 57.1 s on a 1,549-token chat prompt. With it on, the sidecar's load slows the spine read and the record prompt's first token comes
-after 23 to 27 s ([details](tools/kimi-k3/README.md#start-up-and-prompt-pass-in-this-release-7-november-2026)).
-
-The drafter doesn't change the answer: a block's rows run the same arithmetic as plain steps. For this release we compared the logits of 3,416 positions
-with plain decoding, forced rejections and a failing sidecar included, and found no differing bit. The first drafter release's checks covered 5,325 positions
-and every layer of 40.
+Decode is greedy, with the Qwen drafter, on raw completions of "The three main financial statements are". It gives the same tokens as
+plain decoding: a block's rows run the same arithmetic as plain steps, and the logits of 3,416 positions showed no differing bit. The
+speed depends on how predictable the text is, and chat runs at about 2 tok/s.
 
 The machine is one RTX PRO 6000 Blackwell (96 GB) in a 70 GiB VM. A RAID0 of three NVMe drives (19 GB/s) has the 79,365
 hottest experts, a second NVMe (6.2 GB/s) has the rest plus some copies, and a Thunderbolt NVMe (3.7 GB/s) has another 74,000
