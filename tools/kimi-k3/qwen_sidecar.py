@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
-"""Qwen proposal sidecar for ds4's Kimi K3 decode (step 79, experimental). ds4 sends the committed K3 token ids; this answers with up to `requested` K3 ids or none.
+"""Qwen proposal sidecar for ds4's Kimi K3 decode (steps 79, 82, 86 and 89, experimental). ds4 sends the committed K3 token ids; this answers with up to `requested` K3 ids or none.
 Rules from deltafin's qwen_draft.rs and provider_qwen.cpp: greedy; generated rows stop at, and include, end-of-text; a proposal is cut at the first row below the
 confidence gate; translation goes through the decoded K3 text and must keep the history as an exact prefix; a failed round trip gives no proposal (soft skip);
 budget requested + 2 clamped to [3, 20], with one retry at 20 when the budget ran out short of `requested`. Generation stops early at the first row below the gate,
-because nothing after it can be used, and the KV cache and predicted rows are reused as long as the text agrees. Binary protocol on stdin/stdout, little endian:
+because nothing after it can be used, and the KV cache and predicted rows are reused as long as the text agrees. A proposal shorter than DS4_K3_QWEN_KMIN drafts is
+dropped, and ds4 runs a block of 1 + n rows for any other. While ds4 works on a block or a plain step, the sidecar can carry its greedy sequence on past the history
+(DS4_K3_QWEN_SPEC) and stops as soon as the next request arrives. Binary protocol on stdin/stdout, little endian:
   H                                          -> h  f32 load_seconds, u32 vram_mb
   B                                          -> b  (a new request: empty history)
   Q  u32 n_new, n_new * u32 ids, u32 requested -> q  u32 nd, nd * u32 ids, f32 min_conf, f32 seconds, u32 steps, u32 flags (1 soft skip, 2 confidence stop, 4 retried)
   X                                          -> exits
 Environment: DS4_K3_QWEN_DIR (the Qwen3-0.6B-Base checkpoint), DS4_K3_QWEN_META (the folder with K3's tiktoken.model and tokenizer_config.json), DS4_K3_QWEN_CONF (gate, default 0.6),
-DS4_K3_QWEN_TOKENIZE (k3_tokenize.py, default: next to this file), DS4_K3_QWEN_DEVICE (default cuda). Needs torch with CUDA, transformers, tokenizers, tiktoken and regex.
+DS4_K3_QWEN_ADAPT=lo,hi,down,up (off unless set: the gate starts at DS4_K3_QWEN_CONF, drops by `down` after a proposal whose drafts were all kept and rises by `up` after
+one that kept fewer than half, within [lo, hi]), DS4_K3_QWEN_KMIN (fewest drafts worth a block, default 2), DS4_K3_QWEN_SPEC=after_block,after_step (rows to have
+ready past the history, default 17,3), DS4_K3_QWEN_TOKENIZE (k3_tokenize.py, default: next to this file), DS4_K3_QWEN_DEVICE (default cuda).
+Needs torch with CUDA, transformers, tokenizers, tiktoken and regex.
 Test fixtures, never set in a real run: DS4_K3_QWEN_TRUTH=<ids file> proposes the true continuation (prompt ids are not in the file: the first id of the file follows the
-prompt), DS4_K3_QWEN_CORRUPT=<every>:<index> wrongs draft <index> of every <every>-th proposal, DS4_K3_QWEN_BAD=<n> answers malformed at proposal n, DS4_K3_QWEN_DIE=<n> exits at proposal n."""
-import importlib.util, json, os, re, struct, sys, time
+prompt), DS4_K3_QWEN_FLEN=<n> makes those proposals n drafts long, DS4_K3_QWEN_CORRUPT=<every>:<index> wrongs draft <index> of every <every>-th proposal, DS4_K3_QWEN_BAD=<n> answers malformed at proposal n, DS4_K3_QWEN_DIE=<n> exits at proposal n."""
+import importlib.util, json, os, re, select, struct, sys, time
 t_load0 = time.time()
-proto_in = sys.stdin.buffer
+proto_in = os.fdopen(0, "rb", 0)   # unbuffered, so the idle check below sees every waiting byte
 proto_out = os.fdopen(os.dup(1), "wb", 0)
 os.dup2(2, 1)   # anything else that prints goes to ds4's stderr, never into the protocol
 import torch
@@ -24,6 +29,9 @@ from transformers import AutoModelForCausalLM
 QW = os.environ["DS4_K3_QWEN_DIR"]; META = os.environ["DS4_K3_QWEN_META"]
 TOKPY = os.environ.get("DS4_K3_QWEN_TOKENIZE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "k3_tokenize.py")
 GATE = float(os.environ.get("DS4_K3_QWEN_CONF", "0.6"))
+ADAPT = [float(x) for x in os.environ["DS4_K3_QWEN_ADAPT"].split(",")] if os.environ.get("DS4_K3_QWEN_ADAPT") else None
+KMIN = int(os.environ.get("DS4_K3_QWEN_KMIN", "2"))
+SPEC = [int(x) for x in os.environ.get("DS4_K3_QWEN_SPEC", "17,3").split(",")]
 SLACK, MAX_NEW, EOS = 2, 20, 151643
 dev = os.environ.get("DS4_K3_QWEN_DEVICE", "cuda")
 spec = importlib.util.spec_from_file_location("k3tok", TOKPY); kt = importlib.util.module_from_spec(spec); spec.loader.exec_module(kt); kt.META = META
@@ -71,6 +79,13 @@ class Qwen:
                 for k in [k for k in s.pred if k > lcp]: del s.pred[k]
         if lcp < len(prefix): s._forward(prefix[lcp:])
     @torch.inference_mode()
+    def speculate(s, upto):
+        """While no request waits on stdin, extend the greedy sequence towards row `upto`; the next request reuses what it can and crops the rest."""
+        while len(s.ids) < upto and s.kv is not None and not select.select([0], [], [], 0)[0]:
+            t, _ = s.pred[len(s.ids)]
+            if t == EOS: return
+            s._forward([t])
+    @torch.inference_mode()
     def rows(s, start, budget, gate):
         """Rows from position start, up to budget, stopping at end-of-text and at the first row under the gate."""
         g, p = [], []; i = start
@@ -107,14 +122,19 @@ def propose(h, requested, gate=None):
     if stopped: flags |= 2
     return d, (min(p) if p else None), len(g), flags
 def rd(n):
-    b = proto_in.read(n)
-    if len(b) != n: sys.exit(0)
+    b = b""
+    while len(b) < n:
+        c = proto_in.read(n - len(b))
+        if not c: sys.exit(0)
+        b += c
     return b
 FX_T = [int(x) for x in open(os.environ["DS4_K3_QWEN_TRUTH"]).read().split()] if os.environ.get("DS4_K3_QWEN_TRUTH") else None
 FX_C = os.environ.get("DS4_K3_QWEN_CORRUPT"); FX_EV, FX_IX = (int(x) for x in FX_C.split(":")) if FX_C else (0, 0)
-FX_BAD = int(os.environ.get("DS4_K3_QWEN_BAD", "0")); FX_DIE = int(os.environ.get("DS4_K3_QWEN_DIE", "0"))
+FX_BAD = int(os.environ.get("DS4_K3_QWEN_BAD", "0")); FX_DIE = int(os.environ.get("DS4_K3_QWEN_DIE", "0")); FX_LEN = int(os.environ.get("DS4_K3_QWEN_FLEN", "0"))
+def prefix_len(h):
+    return len(q_encode(k3_decode(h)))
 def main():
-    h = []; n_q = 0; n_prompt = None
+    h = []; n_q = 0; n_prompt = None; gate = GATE; last = []
     QW_STATE.seek(q_encode("Warm-up of the model: the first call compiles nothing but allocates a lot.")); QW_STATE.rows(len(QW_STATE.ids), 4, 0.0)
     QW_STATE.kv = None; QW_STATE.ids = []; QW_STATE.pred = {}
     if dev == "cuda": torch.cuda.synchronize()
@@ -123,7 +143,7 @@ def main():
         if c == b"H":
             proto_out.write(b"h" + struct.pack("<fI", time.time() - t_load0, int(torch.cuda.memory_reserved() >> 20) if dev == "cuda" else 0))
         elif c == b"B":
-            h = []; n_q = 0; n_prompt = None; QW_STATE.kv = None; QW_STATE.ids = []; QW_STATE.pred = {}; proto_out.write(b"b")
+            h = []; n_q = 0; n_prompt = None; gate = GATE; last = []; QW_STATE.kv = None; QW_STATE.ids = []; QW_STATE.pred = {}; proto_out.write(b"b")
         elif c == b"Q":
             t0 = time.time()
             n = struct.unpack("<I", rd(4))[0]
@@ -131,17 +151,25 @@ def main():
             req = struct.unpack("<I", rd(4))[0]
             if n_prompt is None: n_prompt = len(new) - 1
             h.extend(new); n_q += 1
+            if ADAPT and last:     # new holds the drafts that were kept and the next anchor
+                a = 0
+                while a < len(last) and a < len(new) and new[a] == last[a]: a += 1
+                if a == len(last): gate = max(ADAPT[0], gate - ADAPT[2])
+                elif 2 * a < len(last): gate = min(ADAPT[1], gate + ADAPT[3])
             if FX_DIE and n_q == FX_DIE: os._exit(3)
             if FX_T is not None:
                 k = len(h) - n_prompt     # generated so far, the anchor included
-                d = FX_T[k:k + req]; mc, st, fl = 1.0, 0, 0
-                if len(d) < req: d = []
+                m = min(FX_LEN, req) if FX_LEN else req
+                d = FX_T[k:k + m]; mc, st, fl = 1.0, 0, 0
+                if len(d) < m: d = []
                 elif FX_EV and n_q % FX_EV == 0 and FX_IX < len(d): d = list(d); d[FX_IX] = 13 if d[FX_IX] != 13 else 11
             else:
-                d, mc, st, fl = propose(h, req)
-            if len(d) != req: d = []
+                d, mc, st, fl = propose(h, req, gate)
+            if len(d) < min(KMIN, req): d = []
+            last = list(d)
             if FX_BAD and n_q == FX_BAD: proto_out.write(b"q" + struct.pack("<I", 99)); continue
             proto_out.write(b"q" + struct.pack(f"<I{len(d)}IffII", len(d), *d, -1.0 if mc is None else mc, time.time() - t0, st, fl))
+            if FX_T is None and (SPEC[0] or SPEC[1]) and QW_STATE.ids: QW_STATE.speculate(prefix_len(h) + (SPEC[0] if d else SPEC[1]))
         elif c == b"X":
             return
         else:

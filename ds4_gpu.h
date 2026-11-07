@@ -1139,6 +1139,13 @@ int ds4_gpu_qkv_pair_quad_compressor_store_tensor(
         uint32_t              ratio,
         uint32_t              pos);
 
+/* step 91: K3 spine matmuls over several rows, each row bit-identical to the single-row call (1 done, 0 failed,
+   -1 not applicable: loop the single-row call instead) */
+int ds4_gpu_k3_matmul_q8_0_rows_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset,
+                                       uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok);
+int ds4_gpu_k3_matmul_f32_rows_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset,
+                                      uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok);
+
 int ds4_gpu_matmul_f32_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -3731,6 +3738,7 @@ void ds4_gpu_k3_argodrive_stats(uint64_t *chunks3, double *stream_gbps3);   /* s
 void ds4_gpu_k3_source_stats(uint64_t *bytes3, uint64_t *fallback_reads, uint64_t *fallback_bytes, int *tier_c_configured);   /* step 42 */
 /* Batched prompt pass: n_tok rows at once (n_tok = 1 is the decode step). */
 int ds4_gpu_k3_pool_prepare(uint32_t ff, uint32_t latent, uint32_t n_tok, uint32_t n_used);   /* step 77 */
+int ds4_gpu_k3_pool_prepare_staging(uint32_t ff, uint32_t latent, uint32_t n_tok, uint32_t n_used, const void *model_map, const uint64_t *offsets, const uint64_t *sizes, uint32_t n_ranges);   /* step 87 */
 int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const int32_t *selected,
                                     const float *weights, uint32_t n_tok, uint32_t n_used, uint32_t layer, uint32_t ff,
                                     uint32_t latent, float beta, float beta_linear);
