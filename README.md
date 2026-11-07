@@ -1,4 +1,4 @@
-<p align="center"><img src="tools/kimi-k3/images/argodrive-mark.svg" width="88" alt="ARGODRIVE"></p>
+<p align="center"><a href="https://argonautlabs.ai/"><img src="tools/kimi-k3/images/argodrive-mark.svg" width="112" alt="Argonaut Labs"></a></p>
 
 # Kimi K3.1 Pro on one 96 GB GPU
 
