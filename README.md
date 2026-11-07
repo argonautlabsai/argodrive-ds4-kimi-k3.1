@@ -6,7 +6,7 @@
 for them: 3.1 tok/s decode on raw completions with its Qwen drafter, which gives the same tokens as plain decoding, and prefill
 at up to 44 tok/s.
 
-This is Salvatore Sanfilippo's [ds4](https://github.com/antirez/ds4) at commit c97964b with a Kimi K3 / K3.1 Pro port on top.
+[Argonaut Labs](https://argonautlabs.ai) built this Kimi K3 / K3.1 Pro port on top of Salvatore Sanfilippo's [ds4](https://github.com/antirez/ds4) at commit c97964b.
 The spine sits in VRAM as Q8_0. The 82,432 MXFP4 expert files stay on disk and move through a VRAM cache and a pinned RAM
 pool. There's no expert skipping. The drafter is off by default; `DS4_K3_QWEN=1` turns it on
 ([setup](tools/kimi-k3/README.md#the-optional-qwen-drafter)).
