@@ -2,11 +2,27 @@
 
 # Argodrive DS4 Kimi K3.1
 
-## Run Kimi 3.1 locally on one GPU
+## Run Kimi K3.1 Pro locally on one GPU
 
 **This repository is the inference engine.** It already includes the ds4-based runtime, the Kimi K3/K3.1 CUDA port, NVMe expert streaming, expert caches and weight-preparation tools. Clone and build this repository; **no separate upstream ds4 installation or Argodrive Mac app is needed**.
 
 This is a **source release**. Model weights, NVIDIA drivers, CUDA build tools and Python dependencies are separate; there is currently no prebuilt installer.
+
+### Measured results at a glance
+
+| Workload | Measured speed | Version and scope |
+|---|---:|---|
+| Short-prompt chat: 286 prompt / 200 output tokens | **2.01–2.02 tok/s decode** | 7 November, chat drafter settings |
+| Raw financial text: 6 prompt / 512 output tokens | **3.05 tok/s decode** | 8 November, Qwen drafter, fp32 activations |
+| Prompt processing: 1,512-token prompt | **43 tok/s prefill** | 8 November; not output generation speed |
+| Long chat prompts: 6,769 / 13,167 tokens | **1.51 / 1.48 tok/s decode** | 8 November, 8k / 16k context caches |
+
+**Tested hardware, not minimum requirements:**
+- One RTX PRO 6000 Blackwell GPU with **96 GB VRAM**; **70 GiB RAM** assigned to the Ubuntu VM.
+- **Five physical NVMe devices** in three storage tiers; **1.45 TB of unique MXFP4 experts**, plus spine, checkpoint and replicas.
+- Context caches measured up to **16,384 tokens** using sparse attention. **Equivalence to Moonshot’s reference implementation remains unvalidated.**
+
+Different prompts and engine versions are separate experiments, not a single controlled speed comparison. [All measurements, definitions and limits](https://argonautlabs.ai/research/kimi-k31-single-gpu.html).
 
 ### Get started
 
@@ -18,13 +34,13 @@ This is a **source release**. Model weights, NVIDIA drivers, CUDA build tools an
 
 [Full setup and tested hardware](https://argonautlabs.ai/research/kimi-k31-single-gpu.html#reproduce) · [Configuration guide](tools/kimi-k3/README.md)
 
-### Measured performance and scope
+### Engine architecture and full measurements
 
 **argodrive-ds4-kimi-k3.1** runs Kimi K3.1 Pro (2.8T parameters, 1.45 TB of experts) on one 96 GB GPU, with the experts streamed off NVMe as the router asks
 for them: 3.05 tok/s decode on raw completions with its Qwen drafter, which gives the same tokens as plain decoding, prefill
 at up to 43 tok/s, and contexts up to 16,384 tokens with K3.1's sparse attention.
 
-**Start here:** [Run Kimi 3.1 locally on one GPU — hardware, build guide and benchmarks](https://argonautlabs.ai/research/kimi-k31-single-gpu.html). The tested setup uses one RTX PRO 6000 Blackwell (96 GB), 70 GiB of VM RAM and five physical NVMe devices. The 3.05 tok/s result is raw-text decode with the drafter; 43 tok/s is prefill. Contexts up to 16,384 tokens use K3.1's sparse attention (measured at 4k, 8k and 16k), and equivalence to Moonshot’s reference implementation has not been validated.
+**Start here:** [Run Kimi K3.1 Pro locally on one GPU — hardware, build guide and benchmarks](https://argonautlabs.ai/research/kimi-k31-single-gpu.html). The tested setup uses one RTX PRO 6000 Blackwell (96 GB), 70 GiB of VM RAM and five physical NVMe devices. The 3.05 tok/s result is raw-text decode with the drafter; 43 tok/s is prefill. Contexts up to 16,384 tokens use K3.1's sparse attention (measured at 4k, 8k and 16k), and equivalence to Moonshot’s reference implementation has not been validated.
 
 [Argonaut Labs](https://argonautlabs.ai) built this Kimi K3 / K3.1 Pro port on top of Salvatore Sanfilippo's [ds4](https://github.com/antirez/ds4) at commit c97964b.
 The spine sits in VRAM as Q8_0, and its matmuls take fp32 activations. The 82,432 MXFP4 expert files stay on disk and move through a VRAM cache and a pinned RAM
@@ -74,6 +90,19 @@ Weight layout, knobs, how we measured and what is and isn't bit-identical are al
     cd argodrive-ds4-kimi-k3.1 && git checkout kimi-k3
     make ds4 CUDA_ARCH=sm_120
 
+
+## Where to find the Kimi code
+
+The default branch, `kimi-k3`, contains the **Kimi K3.1 Pro** port as well as K3 support. Its name is not a model-version limit. For a fixed reproduction target, use the [8 November source tag](https://github.com/argonautlabsai/argodrive-ds4-kimi-k3.1/tree/k31-cuda-20261108).
+
+| Start here | What it contains |
+|---|---|
+| [Installation guide](https://argonautlabs.ai/guides/install-kimi-k31.html) | Build, weight download and preparation, first run, troubleshooting |
+| [Kimi configuration and tools](tools/kimi-k3/README.md) | Weight layout, reader settings, optional drafter, sparse attention and validation |
+| [Measured results](https://argonautlabs.ai/research/kimi-k31-single-gpu.html) | Hardware, dates, workloads, timing definitions and raw JSON |
+| [Upstream documentation](UPSTREAM_README.md) | The original ds4 engine and other-model instructions |
+
+Shared engine and backend directories remain in the source tree. For this Kimi CUDA setup, follow the Kimi guide above. The separate Argodrive Mac monitoring app is optional and is not part of the installation.
 
 ## Upstream credits and documentation
 
