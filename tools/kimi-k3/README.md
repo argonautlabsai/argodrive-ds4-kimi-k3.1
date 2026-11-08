@@ -226,8 +226,8 @@ the spine's GEMMs on cuBLAS's fp32 path, at about 42 TFLOPS where the int8 matmu
 hides behind the reads. Decode at long context rebuilds only the positions sparse attention selects, which more than pays for
 fp32 at 16k.
 
-Through the server at an 8k cache, the 6,753-token request took 77.7 s. The same question again took 27.5 s from the saved
-prefix, and 27.6 s after another request in between, with identical logits.
+Through the server at an 8k cache, the 6,753-token request took 77.7 s. Asked again, it took 27.5 s from the saved prefix and
+gave the same answer; a third time, after another request in between, 27.6 s with logits identical to the second.
 
 With short prompts the difference is a few percent:
 
