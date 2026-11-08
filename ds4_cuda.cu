@@ -3113,6 +3113,7 @@ extern "C" int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int device_id,
     int ok = 0;
     WITH_DEVICE(g_gpu[device_id].device_id) {
         ok = cuda_ok(cudaMalloc(&t->ptr, (size_t)bytes), "tensor alloc");
+        if (!ok) (void)cudaGetLastError();   /* step 99 */
     }
     if (!ok) return 3;
     t->bytes = bytes;
@@ -37316,12 +37317,43 @@ extern "C" int ds4_gpu_k3_mla_store_tensor(ds4_gpu_tensor *key_cache, ds4_gpu_te
     return cuda_ok(cudaGetLastError(), "K3 MLA cache store launch");
 }
 
+/* step 99: the attention kernels keep one score per visible position in shared memory; the device's opt-in limit (less 1 KB for
+   their static shared memory) sets how many positions they take, and each kernel raises its allowance once a launch needs more than
+   the 48 KB a launch gets without asking. Nothing else changes, so the arithmetic is the same at every length. */
+static int k3_attn_optin(void) {
+    static int optin = 0;
+    if (!optin) {
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess ||
+            optin < (48 << 10)) { cudaGetLastError(); optin = 48 << 10; }
+    }
+    return optin;
+}
+extern "C" uint32_t ds4_gpu_k3_attn_max_pos(void) {
+    const uint32_t m = (uint32_t)((k3_attn_optin() - 1024) / (int)sizeof(float));
+    return m > 8192u ? m : 8192u;
+}
+static bool k3_attn_smem(const void *fn, uint8_t *raised, size_t bytes) {
+    if (bytes <= ((size_t)48 << 10) || *raised) return true;
+    if (cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, k3_attn_optin() - 1024) != cudaSuccess) {
+        fprintf(stderr, "ds4: K3 attention: cannot raise the shared memory limit (%s)\n", cudaGetErrorString(cudaGetLastError()));
+        return false;
+    }
+    *raised = 1;
+    return true;
+}
 extern "C" int ds4_gpu_k3_mla_attend_tensor(ds4_gpu_tensor *heads_out, const ds4_gpu_tensor *q,
                                             const ds4_gpu_tensor *key_cache, const ds4_gpu_tensor *value_cache,
                                             uint32_t n_pos, uint32_t heads, uint32_t qk, uint32_t vdim) {
-    if (!heads_out || !q || !key_cache || !value_cache || n_pos == 0u || n_pos > 8192u) return 0;
+    if (!heads_out || !q || !key_cache || !value_cache || n_pos == 0u || n_pos > ds4_gpu_k3_attn_max_pos()) return 0;
     const float scale = 1.0f / sqrtf((float)qk);
     const int cm = k3_mla_cache_mode();
+    {   /* step 99 */
+        static uint8_t r[3] = {0, 0, 0};
+        const void *fn = cm == 1 ? (const void *)k3_mla_attend_batch_kernel_t<__half> : cm == 2 ? (const void *)k3_mla_attend_batch_kernel_t<__nv_bfloat16>
+                                                                                                  : (const void *)k3_mla_attend_kernel;
+        if (!k3_attn_smem(fn, &r[cm == 1 ? 1 : cm == 2 ? 2 : 0], (size_t)n_pos * sizeof(float))) return 0;
+    }
     if (cm == 1) k3_mla_attend_batch_kernel_t<__half><<<dim3(1u, heads, 1u), 256, n_pos * sizeof(float), cuda_decode_stream()>>>((float *)heads_out->ptr,
         (const float *)q->ptr, (const __half *)key_cache->ptr, (const __half *)value_cache->ptr, n_pos - 1u, heads, qk, vdim, scale);
     else if (cm == 2) k3_mla_attend_batch_kernel_t<__nv_bfloat16><<<dim3(1u, heads, 1u), 256, n_pos * sizeof(float), cuda_decode_stream()>>>((float *)heads_out->ptr,
@@ -37421,6 +37453,7 @@ extern "C" int ds4_gpu_k3_moe_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *
  * lands; the GEMVs consume the raw planes, so nothing is repacked on the host.
  * ------------------------------------------------------------------------------------------------------------ */
 #include <condition_variable>
+#include <chrono>   /* step 97 */
 #include <list>
 #include <deque>
 #include <mutex>
@@ -37805,6 +37838,13 @@ struct k3_lru {
         transient[s] = 1;
         order.erase(pos[s]); order.push_back(s); pos[s] = std::prev(order.end());
     }
+    /* step 97: slabs n.. leave the cache (the caller dropped them and owns their memory) */
+    void shrink(uint32_t n) {
+        for (uint32_t s = n; s < cap; s++) { drop(s); order.erase(pos[s]); }
+        for (auto it = map.begin(); it != map.end(); ) { if (it->second >= n) it = map.erase(it); else ++it; }
+        cap = n; key.resize(n); pinned.resize(n); filling.resize(n); transient.resize(n); warm.resize(n); chance.resize(n);
+        score.resize(n); pos.resize(n);
+    }
 };
 
 struct k3_raw_pool {
@@ -37814,6 +37854,7 @@ struct k3_raw_pool {
     std::vector<uint8_t *> host_region; uint32_t host_per_region = 16u;   /* step 87b */
     std::vector<uint8_t *> dev_ptr;                 /* device slab -> address (several regions: the cache grows once) */
     bool grown = false;
+    uint8_t *grow_region = nullptr; uint32_t grow_base = 0;   /* step 97: the growth's region (slabs grow_base..) */
     k3_lru hc, dc;                                  /* host (pinned) and device caches */
     std::vector<cudaEvent_t> host_free, dev_free, dev_ready;
     std::vector<int> dev_host;                      /* device slab -> host slab of its pending job */
@@ -38763,11 +38804,11 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
     /* step 76: a prompt pass whose dense partials do not fit keeps one weighted row per (token, slot) in a compact
        buffer [n_list x latent] and reduces each token's slots in the router's order: bit-stable long prompt passes */
     static int cpart_on = -1; static uint32_t cpart_cap_mb = 0;
-    if (cpart_on < 0) { cpart_on = getenv("DS4_K3_PROMPT_COMPACT") ? (atoi(getenv("DS4_K3_PROMPT_COMPACT")) != 0) : 1;   /* default on (5 Nov 2026) */ cpart_cap_mb = k3_env_u32("DS4_K3_CPART_MB", 512u); }
+    if (cpart_on < 0) { cpart_on = getenv("DS4_K3_PROMPT_COMPACT") ? (atoi(getenv("DS4_K3_PROMPT_COMPACT")) != 0) : 1;   /* default on (5 Nov 2026) */ cpart_cap_mb = k3_env_u32("DS4_K3_CPART_MB", 0u); }   /* step 97: 0 = no cap */
     bool use_cpart = determ && !use_part && n_tok > 1u && cpart_on;
     if (use_cpart) {
         const size_t cfloats = (size_t)n_list * latent;
-        if (cfloats * sizeof(float) > ((size_t)cpart_cap_mb << 20)) {
+        if (cpart_cap_mb && cfloats * sizeof(float) > ((size_t)cpart_cap_mb << 20)) {
             static int warned = 0;
             if (!warned) { warned = 1; fprintf(stderr, "ds4: K3 compact partials: %zu MB needed, cap %u MB (DS4_K3_CPART_MB); this pass accumulates in arrival order\n", (size_t)((cfloats * sizeof(float)) >> 20), cpart_cap_mb); }
             use_cpart = false;
@@ -39139,9 +39180,38 @@ extern "C" void ds4_gpu_k3_moe_raw_stats(double *wait_s, uint64_t *bytes) {
     if (wait_s) *wait_s = k3_raw_get().wait_s;
     if (bytes) *bytes = k3_raw_get().bytes.load();
 }
+/* step 97: every fill in flight lands; completed fills become plain entries, prefetch pins go, failed fills are forgotten.
+   Afterwards no slab is pinned or filling and the readers are idle, so the per-slab vectors may change size. */
+static bool k3_raw_quiesce(k3_raw_pool &p) {
+    std::unique_lock<std::mutex> lk(p.mu);
+    const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    for (;;) {
+        while (!p.ready_q.empty()) {
+            const uint32_t d = p.ready_q.front(); p.ready_q.pop_front();
+            const int h = p.dev_host[d];
+            if (h >= 0) p.hc.pinned[(uint32_t)h] = 0;
+            if (p.chunk_failed[d]) { p.dc.drop(d); if (h >= 0) p.hc.drop((uint32_t)h); p.chunk_failed[d] = 0; }
+            p.dc.pinned[d] = 0; p.dc.filling[d] = 0; p.dev_host[d] = -1; p.cold_job[d] = 0; p.wanted[d] = 0;
+        }
+        bool busy = false;
+        for (uint32_t s = 0; s < p.dc.cap && !busy; s++) busy = p.dc.filling[s] != 0;
+        if (!busy) break;
+        if (!p.cv_done.wait_until(lk, limit, [&] { return !p.ready_q.empty(); })) {
+            fprintf(stderr, "ds4: kimi-k3 expert pool: fills still in flight after 60 s\n");
+            return false;
+        }
+    }
+    for (uint32_t d : p.pf_list) { p.pf_slab[d] = 0; p.dc.pinned[d] = 0; }
+    p.pf_list.clear(); p.pf_pending = 0; p.cold_backlog = 0; p.failed_slabs.clear(); p.failed = 0;
+    return true;
+}
 extern "C" int ds4_gpu_k3_cache_grow(void) {
     k3_raw_pool &p = k3_raw_get();
     if (!p.ready || p.grown) return 1;
+    if (!k3_raw_quiesce(p)) {   /* step 104: readers still busy, so no resize under them; the next generation start tries again */
+        fprintf(stderr, "ds4: kimi-k3 device expert cache: not grown this time (fills still in flight)\n");
+        return 1;
+    }
     p.grown = true;
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) { cudaGetLastError(); return 1; }
@@ -39166,6 +39236,7 @@ extern "C" int ds4_gpu_k3_cache_grow(void) {
     while (n_new >= 16u && cudaMalloc(&region, p.file_bytes * n_new) != cudaSuccess) { cudaGetLastError(); n_new /= 2u; region = nullptr; }
     if (!region) return 1;
     const uint32_t n0 = p.dc.cap;
+    p.grow_region = region; p.grow_base = n0;   /* step 97 */
     p.dev_ptr.resize(n0 + n_new);
     for (uint32_t s = 0; s < n_new; s++) p.dev_ptr[n0 + s] = region + (size_t)s * p.file_bytes;
     p.dev_free.resize(n0 + n_new); p.dev_ready.resize(n0 + n_new); p.dev_host.resize(n0 + n_new, -1); p.hhit.resize(n0 + n_new, 0);
@@ -39178,6 +39249,44 @@ extern "C" int ds4_gpu_k3_cache_grow(void) {
     fprintf(stderr, "ds4: kimi-k3 device expert cache grown to %u slabs (%.1f GB; %.1f GB was free)\n", p.dc.cap,
             (double)p.dc.cap * p.file_bytes / 1e9, (double)free_b / 1e9);
     return 1;
+}
+/* step 97: a prompt pass that does not fit the free VRAM borrows the grown region: the pool quiesces, the GPU idles, the slabs
+   the growth added are dropped and their region freed; ds4_gpu_k3_cache_grow (the driver calls it when generation starts)
+   sizes the cache again from what is free then. Returns the bytes freed (0: nothing to lend). */
+extern "C" uint64_t ds4_gpu_k3_cache_lend(void) {
+    k3_raw_pool &p = k3_raw_get();
+    if (!p.ready || !p.grown || !p.grow_region || p.grow_base >= p.dc.cap) return 0;
+    const double t0 = k3_now_sec();
+    if (!k3_raw_quiesce(p)) return 0;
+    if (cudaDeviceSynchronize() != cudaSuccess) { fprintf(stderr, "ds4: kimi-k3 device expert cache: cannot lend (%s)\n", cudaGetErrorString(cudaGetLastError())); return 0; }
+    const uint32_t n0 = p.grow_base, n1 = p.dc.cap;
+    uint32_t held = 0;
+    for (uint32_t s = n0; s < n1; s++) held += p.dc.key[s] != K3_NOKEY;
+    p.dc.shrink(n0);
+    for (uint32_t s = n0; s < n1; s++) { cudaEventDestroy(p.dev_free[s]); cudaEventDestroy(p.dev_ready[s]); }
+    p.dev_ptr.resize(n0); p.dev_free.resize(n0); p.dev_ready.resize(n0); p.dev_host.resize(n0); p.hhit.resize(n0);
+    p.wanted.resize(n0); p.cold_job.resize(n0); p.pf_slab.resize(n0); p.tf_enq.resize(n0); p.tf_pick.resize(n0); p.tf_r0.resize(n0);
+    p.tf_r1.resize(n0); p.tf_up.resize(n0); p.tf_rdy.resize(n0); p.tf_tier.resize(n0); p.chunks_left.resize(n0); p.chunk_failed.resize(n0);
+    const uint64_t bytes = (uint64_t)(n1 - n0) * p.file_bytes;
+    cudaFree(p.grow_region);
+    p.grow_region = nullptr; p.grown = false;
+    fprintf(stderr, "ds4: kimi-k3 device expert cache lends %u slabs (%.1f GB, %u experts dropped) to the prompt pass in %.2f s; it grows again when generation starts\n",
+            n1 - n0, (double)bytes / 1e9, held, k3_now_sec() - t0);
+    return bytes;
+}
+/* step 97: what a prompt pass of n_tok rows would add to the pool's scratch, which grows on demand and is kept: the compact
+   partials, the expert GEMM scratch, the mid rows and the token lists (each is freed before it is made larger) */
+extern "C" uint64_t ds4_gpu_k3_pass_scratch_need(uint32_t n_tok, uint32_t n_used, uint32_t ff, uint32_t latent) {
+    k3_raw_pool &p = k3_raw_get();
+    uint64_t need = 0;
+    const uint64_t cp = (uint64_t)n_tok * n_used * latent;
+    if (cp > p.cpart_cap) need += (cp - p.cpart_cap) * sizeof(float);
+    const uint32_t gt = g_k3_gemm ? g_k3_gemm->cap_tok : 0u;
+    if (n_tok > gt) need += (uint64_t)(n_tok - gt) * ((uint64_t)latent * 6u + (uint64_t)ff * 10u) + (gt ? 0u : (uint64_t)ff * latent * 6u);
+    if (n_tok > p.max_tok) need += (uint64_t)(n_tok - p.max_tok) * ff * sizeof(float);
+    const uint64_t nl = (uint64_t)n_tok * n_used;
+    if (nl > p.list_cap) need += (nl - p.list_cap) * 4u * sizeof(uint32_t);
+    return need;
 }
 extern "C" uint64_t ds4_gpu_k3_cache_copydowns(void) { return k3_raw_get().copydowns.load(); }
 extern "C" void ds4_gpu_k3_prefetch_hint(uint32_t layer, const int32_t *experts, uint32_t n) {
@@ -39388,11 +39497,16 @@ __global__ static void k3_mla_attend_batch_kernel(float *heads_out, const float 
     }
 }
 
+static bool k3_attn_gemm(float *heads_out, const float *q, const float *key, const float *val, const uint8_t *mask, uint32_t mask_stride,
+                         uint32_t pos0, uint32_t n_tok, uint32_t heads, uint32_t qk, uint32_t vdim, float scale, cudaStream_t st);   /* step 103 */
+static int k3_attn_gemm_mode(void);
+static bool k3_attn_check(const float *out, const float *ref, size_t cnt, const char *what, cudaStream_t st);
+static float *k3_attn_ref(size_t cnt, cudaStream_t st);
 extern "C" int ds4_gpu_k3_mla_attend_batch_tensor(ds4_gpu_tensor *heads_out, const ds4_gpu_tensor *q,
                                                   const ds4_gpu_tensor *key_cache, const ds4_gpu_tensor *value_cache,
                                                   uint32_t pos0, uint32_t n_tok, uint32_t heads, uint32_t qk,
                                                   uint32_t vdim) {
-    if (!heads_out || !q || !key_cache || !value_cache || n_tok == 0u || pos0 + n_tok > 8192u) return 0;
+    if (!heads_out || !q || !key_cache || !value_cache || n_tok == 0u || pos0 + n_tok > ds4_gpu_k3_attn_max_pos()) return 0;   /* step 99 */
     if (k3_raw_get().verify) {   /* step 80: verification rows take the plain path's attention launch, row by row */
         for (uint32_t t = 0; t < n_tok; t++) {
             ds4_gpu_tensor ho = *heads_out, qo = *q;
@@ -39406,6 +39520,25 @@ extern "C" int ds4_gpu_k3_mla_attend_batch_tensor(ds4_gpu_tensor *heads_out, con
     cudaStream_t stream = cuda_decode_stream();
     const dim3 grid(n_tok, heads, 1u);
     const int cm = k3_mla_cache_mode();
+    if (cm == 0 && k3_attn_gemm_mode() != 0 && k3_attn_gemm((float *)heads_out->ptr, (const float *)q->ptr, (const float *)key_cache->ptr,
+                                                            (const float *)value_cache->ptr, nullptr, 0u, pos0, n_tok, heads, qk, vdim, scale, stream)) {   /* step 103 */
+        if (k3_attn_gemm_mode() == 2) {
+            const size_t cnt = (size_t)n_tok * heads * vdim;
+            float *ref = k3_attn_ref(cnt, stream);
+            if (!ref) return 0;
+            { static uint8_t r = 0; if (!k3_attn_smem((const void *)k3_mla_attend_batch_kernel, &r, (size_t)(pos0 + n_tok) * sizeof(float))) return 0; }
+            k3_mla_attend_batch_kernel<<<grid, 256, (size_t)(pos0 + n_tok) * sizeof(float), stream>>>(ref, (const float *)q->ptr,
+                (const float *)key_cache->ptr, (const float *)value_cache->ptr, pos0, heads, qk, vdim, scale);
+            if (!k3_attn_check((const float *)heads_out->ptr, ref, cnt, "unmasked)", stream)) return 0;
+        }
+        return 1;
+    }
+    {   /* step 99 */
+        static uint8_t r[3] = {0, 0, 0};
+        const void *fn = cm == 1 ? (const void *)k3_mla_attend_batch_kernel_t<__half> : cm == 2 ? (const void *)k3_mla_attend_batch_kernel_t<__nv_bfloat16>
+                                                                                                  : (const void *)k3_mla_attend_batch_kernel;
+        if (!k3_attn_smem(fn, &r[cm == 1 ? 1 : cm == 2 ? 2 : 0], (size_t)(pos0 + n_tok) * sizeof(float))) return 0;
+    }
     if (cm == 1) k3_mla_attend_batch_kernel_t<__half><<<grid, 256, (size_t)(pos0 + n_tok) * sizeof(float), stream>>>((float *)heads_out->ptr,
         (const float *)q->ptr, (const __half *)key_cache->ptr, (const __half *)value_cache->ptr, pos0, heads, qk, vdim, scale);
     else if (cm == 2) k3_mla_attend_batch_kernel_t<__nv_bfloat16><<<grid, 256, (size_t)(pos0 + n_tok) * sizeof(float), stream>>>((float *)heads_out->ptr,
@@ -39413,6 +39546,697 @@ extern "C" int ds4_gpu_k3_mla_attend_batch_tensor(ds4_gpu_tensor *heads_out, con
     else k3_mla_attend_batch_kernel<<<grid, 256, (size_t)(pos0 + n_tok) * sizeof(float), stream>>>((float *)heads_out->ptr,
         (const float *)q->ptr, (const float *)key_cache->ptr, (const float *)value_cache->ptr, pos0, heads, qk, vdim, scale);
     return cuda_ok(cudaGetLastError(), "K3 MLA attention batch launch");
+}
+
+/* step 95: K3.1 sparse attention (DSA). The indexer's weights are registered as their own device range, so the plain
+   f32 matmul serves them. These add the index keys' LayerNorm and store, the exact f32 scores (whatever the quality flag),
+   the selection mask, and the two attention kernels restricted to the selected positions: with every visible position
+   selected they do exactly what k3_mla_attend_kernel and k3_mla_attend_batch_kernel do. */
+extern "C" int ds4_gpu_k3_register_aux_weights(const void *host, uint64_t bytes) {
+    if (!host || bytes == 0u) return 0;
+    for (const cuda_model_range &r : g_model_ranges) if (r.host_base == host) return 1;
+    void *dev = NULL;
+    if (!cuda_ok(cudaMalloc(&dev, bytes), "K3 DSA weights alloc")) return 0;
+    if (!cuda_ok(cudaMemcpy(dev, host, bytes, cudaMemcpyHostToDevice), "K3 DSA weights upload")) { (void)cudaFree(dev); return 0; }
+    g_model_ranges.push_back({host, 0u, bytes, (char *)dev, NULL, NULL, 0, 0, 0});   /* not in the offset index: the main model's lookups stay as they were */
+    return 1;
+}
+
+extern "C" int ds4_gpu_k3_dsa_matmul_tensor(ds4_gpu_tensor *out, const void *aux, uint64_t aux_size, uint64_t offset, uint32_t in_dim,
+                                            uint32_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok) {
+    if (!out || !x || !aux || n_tok == 0u) return 0;
+    if (n_tok == 1u || !k3_raw_get().verify) return ds4_gpu_matmul_f32_tensor(out, aux, aux_size, offset, in_dim, out_dim, x, n_tok);
+    for (uint32_t r = 0; r < n_tok; r++) {   /* verification rows take the single-row call, as plain steps do (step 80) */
+        ds4_gpu_tensor o = *out, xi = *x;
+        o.ptr = (char *)out->ptr + (size_t)r * out_dim * sizeof(float); o.bytes = (uint64_t)out_dim * sizeof(float);
+        xi.ptr = (char *)x->ptr + (size_t)r * in_dim * sizeof(float); xi.bytes = (uint64_t)in_dim * sizeof(float);
+        if (!ds4_gpu_matmul_f32_tensor(&o, aux, aux_size, offset, in_dim, out_dim, &xi, 1)) return 0;
+    }
+    return 1;
+}
+
+__global__ static void k3_dsa_ln_store_kernel(float *cache, const float *raw, const float *w, const float *bias, uint32_t pos0, float eps) {
+    __shared__ float red[128];
+    const uint32_t t = blockIdx.x, i = threadIdx.x;
+    const float v = raw[(size_t)t * 128u + i];
+    red[i] = v;
+    __syncthreads();
+    for (uint32_t s = 64u; s > 0u; s >>= 1u) { if (i < s) red[i] += red[i + s]; __syncthreads(); }
+    const float mean = red[0] * (1.0f / 128.0f);
+    __syncthreads();
+    const float d = v - mean;
+    red[i] = d * d;
+    __syncthreads();
+    for (uint32_t s = 64u; s > 0u; s >>= 1u) { if (i < s) red[i] += red[i + s]; __syncthreads(); }
+    const float rstd = rsqrtf(red[0] * (1.0f / 128.0f) + eps);
+    cache[(size_t)(pos0 + t) * 128u + i] = d * rstd * w[i] + bias[i];
+}
+
+extern "C" int ds4_gpu_k3_dsa_ln_store_tensor(ds4_gpu_tensor *cache, const ds4_gpu_tensor *raw, const void *aux, uint64_t aux_size,
+                                              uint64_t w_off, uint64_t b_off, uint32_t pos0, uint32_t n_tok, uint32_t cap, float eps) {
+    if (!cache || !raw || !aux || n_tok == 0u || pos0 + n_tok > cap || w_off + 512u > aux_size || b_off + 512u > aux_size ||
+        raw->bytes < (uint64_t)n_tok * 128u * sizeof(float) || cache->bytes < (uint64_t)cap * 128u * sizeof(float)) return 0;
+    const int tier = ds4_tensor_device_idx(cache);
+    const float *w = (const float *)cuda_resolve_weight_ptr(aux, w_off, 128u * sizeof(float), tier, "f32");
+    const float *b = (const float *)cuda_resolve_weight_ptr(aux, b_off, 128u * sizeof(float), tier, "f32");
+    if (!w || !b) return 0;
+    k3_dsa_ln_store_kernel<<<n_tok, 128, 0, cuda_decode_stream()>>>((float *)cache->ptr, (const float *)raw->ptr, w, b, pos0, eps);
+    return cuda_ok(cudaGetLastError(), "K3 DSA key store launch");
+}
+
+/* step 101: one warp per (position, token); the GLM kernel's arithmetic, step for step (see patch_step101.py) */
+__global__ static void k3_dsa_scores_warp_kernel(float *scores, const float *q, const float *weights, const float *key, uint32_t n_rows,
+                                                 uint32_t n_tokens, uint32_t pos0, uint32_t n_head, float scale) {
+    extern __shared__ float k3_dsa_qs[];   /* n_head x 128 query values, then n_head weights */
+    const uint32_t token = blockIdx.y, lane = threadIdx.x & 31u, warp = threadIdx.x >> 5u;
+    if (token >= n_tokens) return;
+    float *ws = k3_dsa_qs + (size_t)n_head * 128u;
+    for (uint32_t i = threadIdx.x; i < n_head * 128u; i += blockDim.x) k3_dsa_qs[i] = q[(size_t)token * n_head * 128u + i];
+    for (uint32_t i = threadIdx.x; i < n_head; i += blockDim.x) ws[i] = weights[(size_t)token * n_head + i];
+    __syncthreads();
+    const uint32_t visible = pos0 + token + 1u, lim = visible < n_rows ? visible : n_rows;
+    const uint32_t row0 = blockIdx.x * 256u;
+    for (uint32_t r = warp; r < 256u; r += 8u) {
+        const uint32_t row = row0 + r;
+        if (row >= n_rows) break;
+        if (row >= lim) { if (lane == 0u) scores[(size_t)token * n_rows + row] = -INFINITY; continue; }
+        const float *kr = key + (size_t)row * 128u;
+        const float k0 = kr[lane], k1 = kr[lane + 32u], k2 = kr[lane + 64u], k3 = kr[lane + 96u];
+        float total = 0.0f;
+        for (uint32_t h = 0; h < n_head; h++) {
+            const float *qh = k3_dsa_qs + h * 128u;
+            const float a = __fmul_rn(qh[lane], k0) + __fmul_rn(qh[lane + 64u], k2);         /* tree level 64 */
+            const float b = __fmul_rn(qh[lane + 32u], k1) + __fmul_rn(qh[lane + 96u], k3);
+            float v = a + b;                                                                   /* level 32 */
+            v += __shfl_down_sync(0xffffffffu, v, 16);                                         /* levels 16 .. 1 */
+            v += __shfl_down_sync(0xffffffffu, v, 8);
+            v += __shfl_down_sync(0xffffffffu, v, 4);
+            v += __shfl_down_sync(0xffffffffu, v, 2);
+            v += __shfl_down_sync(0xffffffffu, v, 1);
+            if (lane == 0u) total += fmaxf(v, 0.0f) * ws[h];
+        }
+        if (lane == 0u) scores[(size_t)token * n_rows + row] = total * scale;
+    }
+}
+__global__ static void k3_bits_diff_kernel(const float *a, const float *b, uint64_t n, unsigned long long *count) {
+    unsigned long long c = 0;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (uint64_t)gridDim.x * blockDim.x)
+        c += __float_as_uint(a[i]) != __float_as_uint(b[i]);
+    if (c) atomicAdd(count, c);
+}
+extern "C" int ds4_gpu_k3_dsa_scores_tensor(ds4_gpu_tensor *scores, const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,
+                                            const ds4_gpu_tensor *key_cache, uint32_t n_rows, uint32_t n_tokens, uint32_t pos0,
+                                            uint32_t n_head, float scale) {
+    if (!scores || !q || !weights || !key_cache || n_rows == 0u || n_tokens == 0u || n_head == 0u || !isfinite(scale) || scale <= 0.0f ||
+        q->bytes < (uint64_t)n_tokens * n_head * 128u * sizeof(float) || weights->bytes < (uint64_t)n_tokens * n_head * sizeof(float) ||
+        key_cache->bytes < (uint64_t)n_rows * 128u * sizeof(float) || scores->bytes < (uint64_t)n_tokens * n_rows * sizeof(float)) return 0;
+    static int mode = -1;   /* step 101: 1 warp kernel (default), 0 GLM kernel, 2 both, compared bit for bit */
+    if (mode < 0) { const char *e = getenv("DS4_K3_DSA_SCORES"); mode = !e ? 1 : !strcmp(e, "check") ? 2 : (atoi(e) ? 1 : 0); }
+    cudaStream_t st = cuda_decode_stream();
+    if (mode == 0 || n_head > 64u) {
+        glm_indexer_scores_f32_kernel<float><<<dim3(n_rows, n_tokens, 1u), 128, 0, st>>>((float *)scores->ptr,
+            (const float *)q->ptr, (const float *)weights->ptr, (const float *)key_cache->ptr, n_rows, n_tokens, pos0, n_head, 128u, 1u,
+            scale, true);
+        return cuda_ok(cudaGetLastError(), "K3 DSA scores launch");
+    }
+    k3_dsa_scores_warp_kernel<<<dim3((n_rows + 255u) / 256u, n_tokens, 1u), 256, (size_t)n_head * 129u * sizeof(float), st>>>(
+        (float *)scores->ptr, (const float *)q->ptr, (const float *)weights->ptr, (const float *)key_cache->ptr, n_rows, n_tokens, pos0,
+        n_head, scale);
+    if (!cuda_ok(cudaGetLastError(), "K3 DSA scores (warp) launch")) return 0;
+    if (mode == 2) {
+        static float *ref = nullptr; static size_t ref_cap = 0; static unsigned long long *dcount = nullptr;
+        static uint64_t calls = 0, all = 0, bad = 0;
+        const size_t cnt = (size_t)n_tokens * n_rows;
+        if (ref_cap < cnt) {
+            if (cudaStreamSynchronize(st) != cudaSuccess) return 0;
+            if (ref) cudaFree(ref);
+            ref = nullptr; ref_cap = 0;
+            if (cudaMalloc(&ref, cnt * sizeof(float)) != cudaSuccess) return cuda_ok(cudaGetLastError(), "K3 DSA score self-test buffer");
+            ref_cap = cnt;
+        }
+        if (!dcount && cudaMalloc(&dcount, sizeof(*dcount)) != cudaSuccess) return cuda_ok(cudaGetLastError(), "K3 DSA score self-test counter");
+        glm_indexer_scores_f32_kernel<float><<<dim3(n_rows, n_tokens, 1u), 128, 0, st>>>(ref, (const float *)q->ptr,
+            (const float *)weights->ptr, (const float *)key_cache->ptr, n_rows, n_tokens, pos0, n_head, 128u, 1u, scale, true);
+        unsigned long long hcount = 0;
+        if (cudaMemsetAsync(dcount, 0, sizeof(*dcount), st) != cudaSuccess) return cuda_ok(cudaGetLastError(), "K3 DSA score self-test");
+        k3_bits_diff_kernel<<<1024, 256, 0, st>>>((const float *)scores->ptr, ref, (uint64_t)cnt, dcount);
+        if (cudaMemcpyAsync(&hcount, dcount, sizeof(hcount), cudaMemcpyDeviceToHost, st) != cudaSuccess || cudaStreamSynchronize(st) != cudaSuccess)
+            return cuda_ok(cudaGetLastError(), "K3 DSA score self-test readback");
+        calls++; all += cnt; bad += hcount;
+        if (hcount || calls % 24u == 0u)
+            fprintf(stderr, "ds4: K3 DSA score self-test: %llu calls, %llu scores compared, %llu differ%s\n", (unsigned long long)calls,
+                    (unsigned long long)all, (unsigned long long)bad, hcount ? " (this call differs)" : "");
+        if (hcount) { fprintf(stderr, "ds4: K3 DSA score SELF-TEST FAILED\n"); return 0; }   /* step 104 */
+    }
+    return 1;
+}
+
+__global__ static void k3_dsa_mask_kernel(uint8_t *mask, const uint32_t *selected, uint32_t stride, uint32_t pos0, uint32_t top_k) {
+    const uint32_t t = blockIdx.x, visible = pos0 + t + 1u;
+    uint8_t *m = mask + (size_t)t * stride;
+    if (visible <= top_k) {   /* every visible position is selected */
+        for (uint32_t p = threadIdx.x; p < stride; p += blockDim.x) m[p] = p < visible ? 1u : 0u;
+        return;
+    }
+    for (uint32_t p = threadIdx.x; p < stride; p += blockDim.x) m[p] = 0u;
+    __syncthreads();
+    const uint32_t *sel = selected + (size_t)t * top_k;
+    for (uint32_t i = threadIdx.x; i < top_k; i += blockDim.x) { const uint32_t p = sel[i]; if (p < visible) m[p] = 1u; }
+}
+
+extern "C" int ds4_gpu_k3_dsa_mask_tensor(ds4_gpu_tensor *mask, const ds4_gpu_tensor *selected, uint32_t stride, uint32_t n_tokens,
+                                          uint32_t pos0, uint32_t top_k) {
+    if (!mask || !selected || n_tokens == 0u || top_k == 0u || pos0 + n_tokens > stride ||
+        mask->bytes < (uint64_t)n_tokens * stride || selected->bytes < (uint64_t)n_tokens * top_k * sizeof(uint32_t)) return 0;
+    k3_dsa_mask_kernel<<<n_tokens, 256, 0, cuda_decode_stream()>>>((uint8_t *)mask->ptr, (const uint32_t *)selected->ptr, stride, pos0, top_k);
+    return cuda_ok(cudaGetLastError(), "K3 DSA mask launch");
+}
+
+/* k3_mla_attend_kernel with a selection: an unselected position scores -inf, so it is left out of the max, its weight is
+   exactly 0 and it adds nothing; the loops, their order and every other operation are the same */
+__global__ static void k3_mla_attend_masked_kernel(float *heads_out, const float *q, const float *key_cache,
+                                                   const float *value_cache, const uint8_t *mask, uint32_t n_pos, uint32_t heads,
+                                                   uint32_t qk, uint32_t vdim, float scale) {
+    extern __shared__ float sc[];
+    __shared__ float red[32];
+    __shared__ float stats[2];
+    const uint32_t h = blockIdx.x;
+    const float *qh = q + (size_t)h * qk;
+    float local_max = -1e30f;
+    for (uint32_t t = threadIdx.x; t < n_pos; t += blockDim.x) {
+        float s = -INFINITY;
+        if (mask[t]) {
+            const float *kt = key_cache + ((size_t)t * heads + h) * qk;
+            s = 0.0f;
+            for (uint32_t d = 0; d < qk; d++) s += qh[d] * kt[d];
+            s *= scale;
+        }
+        sc[t] = s;
+        local_max = fmaxf(local_max, s);
+    }
+    for (int o = 16; o > 0; o >>= 1) local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, o));
+    if ((threadIdx.x & 31u) == 0u) red[threadIdx.x >> 5u] = local_max;
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        float m = -1e30f;
+        for (uint32_t w = 0; w < (blockDim.x >> 5u); w++) m = fmaxf(m, red[w]);
+        stats[0] = m;
+    }
+    __syncthreads();
+    const float m = stats[0];
+    float local_sum = 0.0f;
+    for (uint32_t t = threadIdx.x; t < n_pos; t += blockDim.x) { const float e = __expf(sc[t] - m); sc[t] = e; local_sum += e; }
+    local_sum = k3_warp_sum(local_sum);
+    if ((threadIdx.x & 31u) == 0u) red[threadIdx.x >> 5u] = local_sum;
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        float s = 0.0f;
+        for (uint32_t w = 0; w < (blockDim.x >> 5u); w++) s += red[w];
+        stats[1] = s;
+    }
+    __syncthreads();
+    const float inv = 1.0f / stats[1];
+    float *o = heads_out + (size_t)h * vdim;
+    for (uint32_t v = threadIdx.x; v < vdim; v += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t t = 0; t < n_pos; t++) { const float w = sc[t]; if (w != 0.0f || acc == 0.0f) acc += w * value_cache[((size_t)t * heads + h) * vdim + v]; }   /* steps 100, 105: a zero weight is skipped once the sum is nonzero */
+        o[v] = acc * inv;
+    }
+}
+
+__global__ static void k3_mla_attend_batch_masked_kernel(float *heads_out, const float *q, const float *key_cache,
+                                                         const float *value_cache, const uint8_t *mask, uint32_t mask_stride,
+                                                         uint32_t pos0, uint32_t heads, uint32_t qk, uint32_t vdim, float scale) {
+    extern __shared__ float sc[];
+    __shared__ float red[32];
+    __shared__ float stats[2];
+    const uint32_t t_q = blockIdx.x, h = blockIdx.y;
+    const uint32_t n_pos = pos0 + t_q + 1u;
+    const uint8_t *mrow = mask + (size_t)t_q * mask_stride;
+    const float *qh = q + ((size_t)t_q * heads + h) * qk;
+    float local_max = -1e30f;
+    for (uint32_t t = threadIdx.x; t < n_pos; t += blockDim.x) {
+        float s = -INFINITY;
+        if (mrow[t]) {
+            const float *kt = key_cache + ((size_t)t * heads + h) * qk;
+            s = 0.0f;
+            for (uint32_t d = 0; d < qk; d++) s += qh[d] * kt[d];
+            s *= scale;
+        }
+        sc[t] = s;
+        local_max = fmaxf(local_max, s);
+    }
+    for (int o = 16; o > 0; o >>= 1) local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, o));
+    if ((threadIdx.x & 31u) == 0u) red[threadIdx.x >> 5u] = local_max;
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        float m = -1e30f;
+        for (uint32_t w = 0; w < (blockDim.x >> 5u); w++) m = fmaxf(m, red[w]);
+        stats[0] = m;
+    }
+    __syncthreads();
+    const float m = stats[0];
+    float local_sum = 0.0f;
+    for (uint32_t t = threadIdx.x; t < n_pos; t += blockDim.x) { const float e = __expf(sc[t] - m); sc[t] = e; local_sum += e; }
+    local_sum = k3_warp_sum(local_sum);
+    if ((threadIdx.x & 31u) == 0u) red[threadIdx.x >> 5u] = local_sum;
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        float s = 0.0f;
+        for (uint32_t w = 0; w < (blockDim.x >> 5u); w++) s += red[w];
+        stats[1] = s;
+    }
+    __syncthreads();
+    const float inv = 1.0f / stats[1];
+    float *o = heads_out + ((size_t)t_q * heads + h) * vdim;
+    for (uint32_t v = threadIdx.x; v < vdim; v += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t t = 0; t < n_pos; t++) { const float w = sc[t]; if (w != 0.0f || acc == 0.0f) acc += w * value_cache[((size_t)t * heads + h) * vdim + v]; }   /* steps 100, 105: a zero weight is skipped once the sum is nonzero */
+        o[v] = acc * inv;
+    }
+}
+
+/* step 102: the masked batch attention over the selected positions only, with k3_mla_attend_batch_masked_kernel's arithmetic:
+   the row's mask is compacted into its selected positions in increasing order (a ballot scan over 256-position windows: the ballots
+   and each (window, warp)'s rank offset stay in shared memory); every selected position gets the same 192-term FMA chain and scale;
+   the max is the same; thread j sums the exps of its own positions (t mod 256 == j) in increasing t (the unselected positions only
+   added exact zeros there), then the same warp butterfly and the same sequential sum over warps; the values accumulate over the
+   selected positions in increasing t. Shared memory: 2 x cap_sel floats and 2 words per (window, warp), instead of one float per
+   visible position, so several blocks share an SM. blockDim.x must be 256. */
+__global__ static void k3_mla_attend_batch_compact_kernel(float *heads_out, const float *q, const float *key_cache, const float *value_cache,
+                                                          const uint8_t *mask, uint32_t mask_stride, uint32_t pos0, uint32_t heads,
+                                                          uint32_t qk, uint32_t vdim, float scale, uint32_t cap_sel) {
+    extern __shared__ float k3_cmp_smem[];
+    __shared__ float red[32];
+    __shared__ float stats[2];
+    const uint32_t t_q = blockIdx.x, h = blockIdx.y, lane = threadIdx.x & 31u, warp = threadIdx.x >> 5u;
+    const uint32_t n_pos = pos0 + t_q + 1u, nb = (n_pos + 255u) / 256u;
+    uint32_t *list = (uint32_t *)k3_cmp_smem;
+    float *sc = k3_cmp_smem + cap_sel;
+    uint32_t *bals = (uint32_t *)(sc + cap_sel);      /* nb x 8 ballots */
+    uint32_t *woff = bals + (size_t)nb * 8u;           /* nb x 8 exclusive rank offsets, then the count */
+    const uint8_t *mrow = mask + (size_t)t_q * mask_stride;
+    const float *qh = q + ((size_t)t_q * heads + h) * qk;
+    for (uint32_t b = 0; b < nb; b++) {
+        const uint32_t t = b * 256u + threadIdx.x;
+        const uint32_t bal = __ballot_sync(0xffffffffu, t < n_pos && mrow[t]);
+        if (lane == 0u) bals[b * 8u + warp] = bal;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        uint32_t acc = 0;
+        for (uint32_t i = 0; i < nb * 8u; i++) { woff[i] = acc; acc += __popc(bals[i]); }
+        woff[nb * 8u] = acc;
+    }
+    __syncthreads();
+    const uint32_t n_sel = woff[nb * 8u] < cap_sel ? woff[nb * 8u] : cap_sel;
+    const uint32_t lt = (1u << lane) - 1u;
+    for (uint32_t b = 0; b < nb; b++) {
+        const uint32_t bal = bals[b * 8u + warp];
+        if (bal & (1u << lane)) { const uint32_t r = woff[b * 8u + warp] + __popc(bal & lt); if (r < cap_sel) list[r] = b * 256u + threadIdx.x; }
+    }
+    __syncthreads();
+    float local_max = -1e30f;
+    for (uint32_t i = threadIdx.x; i < n_sel; i += blockDim.x) {
+        const float *kt = key_cache + ((size_t)list[i] * heads + h) * qk;
+        float s = 0.0f;
+        for (uint32_t d = 0; d < qk; d++) s += qh[d] * kt[d];
+        s *= scale;
+        sc[i] = s;
+        local_max = fmaxf(local_max, s);
+    }
+    for (int o = 16; o > 0; o >>= 1) local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, o));
+    if ((threadIdx.x & 31u) == 0u) red[threadIdx.x >> 5u] = local_max;
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        float m = -1e30f;
+        for (uint32_t w = 0; w < (blockDim.x >> 5u); w++) m = fmaxf(m, red[w]);
+        stats[0] = m;
+    }
+    __syncthreads();
+    const float m = stats[0];
+    float local_sum = 0.0f;
+    for (uint32_t b = 0; b < nb; b++) {
+        const uint32_t bal = bals[b * 8u + warp];
+        if (bal & (1u << lane)) {
+            const uint32_t r = woff[b * 8u + warp] + __popc(bal & lt);
+            if (r < cap_sel) { const float e = __expf(sc[r] - m); sc[r] = e; local_sum += e; }
+        }
+    }
+    local_sum = k3_warp_sum(local_sum);
+    if ((threadIdx.x & 31u) == 0u) red[threadIdx.x >> 5u] = local_sum;
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        float s = 0.0f;
+        for (uint32_t w = 0; w < (blockDim.x >> 5u); w++) s += red[w];
+        stats[1] = s;
+    }
+    __syncthreads();
+    const float inv = 1.0f / stats[1];
+    float *o = heads_out + ((size_t)t_q * heads + h) * vdim;
+    for (uint32_t v = threadIdx.x; v < vdim; v += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t i = 0; i < n_sel; i++) { const float w = sc[i]; if (w != 0.0f) acc += w * value_cache[((size_t)list[i] * heads + h) * vdim + v]; }
+        o[v] = acc * inv;
+    }
+}
+static size_t k3_compact_smem(uint32_t cap_sel, uint32_t n_pos_max) {
+    const size_t nb = (n_pos_max + 255u) / 256u;
+    return (size_t)2u * cap_sel * sizeof(float) + (nb * 8u * 2u + 1u) * sizeof(uint32_t);
+}
+/* step 103b: the exact-order SGEMM, register-tiled: 128 x 128 outputs per block of 256 threads, 8 x 8 per thread (rows ty*4+i and
+   64+ty*4+i, columns tx*4+j and 64+tx*4+j), k tiles of 8 staged through shared memory with the next tile prefetched into registers.
+   Every output still accumulates k = 0, 1, 2, ... one FMA after another from 0, so it equals the naive chain bit for bit; there is no
+   split-k. blockIdx.z selects a head: each operand advances by its own per-head stride. */
+#define K3H_BM 128
+#define K3H_BN 128
+#define K3H_BK 8
+template <bool NT>
+__global__ __launch_bounds__(256) static void k3_sgemm128_exact_kernel(float *c, uint32_t ldc, size_t c_hs,
+        const float *a, uint32_t lda, size_t a_hs, const float *b, uint32_t ldb, size_t b_hs,
+        uint32_t M, uint32_t N, uint32_t K, float scale, const float *row_scale, size_t rs_hs, uint32_t causal_pos0) {
+    __shared__ __align__(16) float As[K3H_BK][K3H_BM];
+    __shared__ __align__(16) float Bs[K3H_BK][K3H_BN];
+    const uint32_t z = blockIdx.z;
+    a += z * a_hs; b += z * b_hs; c += z * c_hs;
+    if (row_scale) row_scale += z * rs_hs;
+    const uint32_t m0 = blockIdx.y * K3H_BM, n0 = blockIdx.x * K3H_BN;
+    if (NT && causal_pos0 != 0xffffffffu && n0 >= causal_pos0 + m0 + K3H_BM) return;   /* no row of this tile sees these positions */
+    uint32_t K_eff = K;
+    if (!NT && causal_pos0 != 0xffffffffu && causal_pos0 + m0 + K3H_BM < K_eff) K_eff = causal_pos0 + m0 + K3H_BM;   /* zeros past */
+    const uint32_t tid = threadIdx.x, tx = tid & 15u, ty = tid >> 4u;
+    /* global -> shared assignment: A (and B for NT): row r = tid / 2, k half kh = (tid & 1) * 4: 4 consecutive k of one row.
+       B for NN: k row kr = tid / 32, columns (tid & 31) * 4: 4 consecutive n of one k row. */
+    const uint32_t ar = tid >> 1u, ak = (tid & 1u) * 4u, bkr = tid >> 5u, bn = (tid & 31u) * 4u;
+    float ra[4], rb[4];
+    auto load_tile = [&](uint32_t k0) {
+        const uint32_t m = m0 + ar;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) { const uint32_t k = k0 + ak + i; ra[i] = (m < M && k < K_eff) ? a[(size_t)m * lda + k] : 0.0f; }
+        if (NT) {
+            const uint32_t n = n0 + ar;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) { const uint32_t k = k0 + ak + i; rb[i] = (n < N && k < K_eff) ? b[(size_t)n * ldb + k] : 0.0f; }
+        } else {
+            const uint32_t k = k0 + bkr;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) { const uint32_t n = n0 + bn + i; rb[i] = (n < N && k < K_eff) ? b[(size_t)k * ldb + n] : 0.0f; }
+        }
+    };
+    auto store_tile = [&]() {
+        #pragma unroll
+        for (int i = 0; i < 4; i++) As[ak + i][ar] = ra[i];
+        if (NT) {
+            #pragma unroll
+            for (int i = 0; i < 4; i++) Bs[ak + i][ar] = rb[i];
+        } else {
+            *(float4 *)&Bs[bkr][bn] = make_float4(rb[0], rb[1], rb[2], rb[3]);
+        }
+    };
+    float acc[8][8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+        #pragma unroll
+        for (int j = 0; j < 8; j++) acc[i][j] = 0.0f;
+    if (K_eff > 0u) load_tile(0);
+    for (uint32_t k0 = 0; k0 < K_eff; k0 += K3H_BK) {
+        store_tile();
+        __syncthreads();
+        if (k0 + K3H_BK < K_eff) load_tile(k0 + K3H_BK);   /* the next tile's loads overlap this tile's FMAs */
+        /* step 105: in the value pass, a tile past the first row's last visible position adds each row's visible positions only */
+        const bool edge = !NT && causal_pos0 != 0xffffffffu && k0 + K3H_BK > causal_pos0 + m0 + 1u;
+        #pragma unroll
+        for (uint32_t kk = 0; kk < K3H_BK; kk++) {
+            const float4 a0 = *(const float4 *)&As[kk][ty * 4u], a1 = *(const float4 *)&As[kk][64u + ty * 4u];
+            const float4 b0 = *(const float4 *)&Bs[kk][tx * 4u], b1 = *(const float4 *)&Bs[kk][64u + tx * 4u];
+            const float av[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+            const float bv[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+            if (!edge) {
+                #pragma unroll
+                for (int i = 0; i < 8; i++)
+                    #pragma unroll
+                    for (int j = 0; j < 8; j++) acc[i][j] += av[i] * bv[j];
+            } else {
+                const uint32_t k = k0 + kk;
+                #pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    const uint32_t m = m0 + (i < 4 ? ty * 4u + i : 64u + ty * 4u + (i - 4));
+                    if (k < causal_pos0 + m + 1u) {
+                        #pragma unroll
+                        for (int j = 0; j < 8; j++) acc[i][j] += av[i] * bv[j];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        const uint32_t m = m0 + (i < 4 ? ty * 4u + i : 64u + ty * 4u + (i - 4));
+        if (m >= M) continue;
+        const float sm = row_scale ? row_scale[m] : scale;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const uint32_t n = n0 + (j < 4 ? tx * 4u + j : 64u + tx * 4u + (j - 4));
+            if (n < N) { float v = acc[i][j]; v *= sm; c[(size_t)m * ldc + n] = v; }
+        }
+    }
+}
+/* (2) for a group of heads: grid (rows, heads in the group) */
+__global__ static void k3_attn_softmax_exact_g_kernel(float *s, uint32_t lds, size_t s_hs, const uint8_t *mask, uint32_t mask_stride,
+                                                      uint32_t pos0, uint32_t n_cols, float *inv_out, size_t inv_hs) {
+    __shared__ float red[32];
+    __shared__ float stats[2];
+    const uint32_t row = blockIdx.x, z = blockIdx.y, n_pos = pos0 + row + 1u;
+    float *sr = s + z * s_hs + (size_t)row * lds;
+    const uint8_t *mrow = mask ? mask + (size_t)row * mask_stride : nullptr;
+    float local_max = -1e30f;
+    for (uint32_t t = threadIdx.x; t < n_pos; t += blockDim.x) {
+        const float v = (!mask || mrow[t]) ? sr[t] : -INFINITY;
+        sr[t] = v;
+        local_max = fmaxf(local_max, v);
+    }
+    for (int o = 16; o > 0; o >>= 1) local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, o));
+    if ((threadIdx.x & 31u) == 0u) red[threadIdx.x >> 5u] = local_max;
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        float m = -1e30f;
+        for (uint32_t w = 0; w < (blockDim.x >> 5u); w++) m = fmaxf(m, red[w]);
+        stats[0] = m;
+    }
+    __syncthreads();
+    const float m = stats[0];
+    float local_sum = 0.0f;
+    for (uint32_t t = threadIdx.x; t < n_pos; t += blockDim.x) { const float e = __expf(sr[t] - m); sr[t] = e; local_sum += e; }
+    for (uint32_t t = n_pos + threadIdx.x; t < n_cols; t += blockDim.x) sr[t] = 0.0f;
+    local_sum = k3_warp_sum(local_sum);
+    if ((threadIdx.x & 31u) == 0u) red[threadIdx.x >> 5u] = local_sum;
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        float sum = 0.0f;
+        for (uint32_t w = 0; w < (blockDim.x >> 5u); w++) sum += red[w];
+        stats[1] = sum;
+        inv_out[z * inv_hs + row] = 1.0f / sum;
+    }
+}
+
+/* step 103: the batch attention as GEMM passes per group of heads, scores in a scratch of at most DS4_K3_ATTN_GEMM_MB (256) or one
+   head; false (nothing launched) when the scratch cannot be had, and the caller runs its kernel */
+static float *g_k3_attn_s = nullptr; static size_t g_k3_attn_s_bytes = 0;
+static size_t k3_attn_gemm_bytes(uint32_t n_tok, uint32_t n_cols, uint32_t heads, uint32_t *G_out) {
+    static size_t budget = 0;
+    if (!budget) budget = (size_t)k3_env_u32("DS4_K3_ATTN_GEMM_MB", 256u) << 20;
+    const uint32_t ldc = (n_cols + 127u) & ~127u;
+    const size_t per_head = (size_t)n_tok * ldc * sizeof(float) + (size_t)n_tok * sizeof(float);
+    uint32_t G = (uint32_t)(budget / per_head);
+    if (G < 1u) G = 1u;
+    if (G > heads) G = heads;
+    if (G_out) *G_out = G;
+    return (size_t)G * per_head;
+}
+extern "C" uint64_t ds4_gpu_k3_attn_scratch_need(uint32_t n_tok, uint32_t n_cols, uint32_t heads) {   /* growth a pass would cause */
+    const size_t need = k3_attn_gemm_bytes(n_tok, n_cols, heads, nullptr);
+    return need > g_k3_attn_s_bytes ? (uint64_t)(need - g_k3_attn_s_bytes) : 0u;
+}
+static bool k3_attn_gemm(float *heads_out, const float *q, const float *key, const float *val, const uint8_t *mask, uint32_t mask_stride,
+                         uint32_t pos0, uint32_t n_tok, uint32_t heads, uint32_t qk, uint32_t vdim, float scale, cudaStream_t st) {
+    const uint32_t n_cols = pos0 + n_tok, ldc = (n_cols + 127u) & ~127u;
+    uint32_t G = 1;
+    const size_t need = k3_attn_gemm_bytes(n_tok, n_cols, heads, &G);
+    if (g_k3_attn_s_bytes < need) {
+        if (cudaStreamSynchronize(st) != cudaSuccess) return false;
+        if (g_k3_attn_s) cudaFree(g_k3_attn_s);
+        g_k3_attn_s = nullptr; g_k3_attn_s_bytes = 0;
+        if (cudaMalloc(&g_k3_attn_s, need) != cudaSuccess) { cudaGetLastError(); return false; }
+        g_k3_attn_s_bytes = need;
+    }
+    float *S = g_k3_attn_s, *inv = g_k3_attn_s + (size_t)G * n_tok * ldc;
+    for (uint32_t h0 = 0; h0 < heads; h0 += G) {
+        const uint32_t g = heads - h0 < G ? heads - h0 : G;
+        k3_sgemm128_exact_kernel<true><<<dim3((n_cols + 127u) / 128u, (n_tok + 127u) / 128u, g), 256, 0, st>>>(S, ldc, (size_t)n_tok * ldc,
+            q + (size_t)h0 * qk, heads * qk, qk, key + (size_t)h0 * qk, heads * qk, qk, n_tok, n_cols, qk, scale, nullptr, 0, pos0);
+        k3_attn_softmax_exact_g_kernel<<<dim3(n_tok, g), 256, 0, st>>>(S, ldc, (size_t)n_tok * ldc, mask, mask_stride, pos0, n_cols, inv, n_tok);
+        k3_sgemm128_exact_kernel<false><<<dim3((vdim + 127u) / 128u, (n_tok + 127u) / 128u, g), 256, 0, st>>>(heads_out + (size_t)h0 * vdim,
+            heads * vdim, vdim, S, ldc, (size_t)n_tok * ldc, val + (size_t)h0 * vdim, heads * vdim, vdim, n_tok, vdim, n_cols, 1.0f, inv, n_tok, pos0);
+    }
+    return cuda_ok(cudaGetLastError(), "K3 GEMM attention launch") != 0;
+}
+static int k3_attn_gemm_mode(void) {   /* 1 GEMM attention (default), 0 the kernels, 2 GEMM checked against the full-scan kernel */
+    static int mode = -1;
+    if (mode < 0) { const char *e = getenv("DS4_K3_ATTN_GEMM"); mode = !e ? 1 : !strcmp(e, "check") ? 2 : (atoi(e) ? 1 : 0); }
+    return mode;
+}
+static bool k3_attn_check(const float *out, const float *ref, size_t cnt, const char *what, cudaStream_t st) {
+    static unsigned long long *dcount = nullptr; static uint64_t calls = 0, all = 0, bad = 0;
+    if (!dcount && cudaMalloc(&dcount, sizeof(*dcount)) != cudaSuccess) return cuda_ok(cudaGetLastError(), "K3 GEMM attention self-test counter") != 0;
+    unsigned long long hcount = 0;
+    if (cudaMemsetAsync(dcount, 0, sizeof(*dcount), st) != cudaSuccess) return false;
+    k3_bits_diff_kernel<<<1024, 256, 0, st>>>(out, ref, (uint64_t)cnt, dcount);
+    if (cudaMemcpyAsync(&hcount, dcount, sizeof(hcount), cudaMemcpyDeviceToHost, st) != cudaSuccess || cudaStreamSynchronize(st) != cudaSuccess) return false;
+    calls++; all += cnt; bad += hcount;
+    if (hcount || calls % 24u == 0u)
+        fprintf(stderr, "ds4: K3 GEMM attention self-test: %llu calls, %llu outputs compared, %llu differ%s%s\n", (unsigned long long)calls,
+                (unsigned long long)all, (unsigned long long)bad, hcount ? " (this call differs: " : "", hcount ? what : "");
+    if (hcount) { fprintf(stderr, "ds4: K3 GEMM attention SELF-TEST FAILED\n"); return false; }   /* step 104 */
+    return true;
+}
+static float *k3_attn_ref(size_t cnt, cudaStream_t st) {
+    static float *ref = nullptr; static size_t cap = 0;
+    if (cap < cnt) {
+        if (cudaStreamSynchronize(st) != cudaSuccess) return nullptr;
+        if (ref) cudaFree(ref);
+        ref = nullptr; cap = 0;
+        if (cudaMalloc(&ref, cnt * sizeof(float)) != cudaSuccess) { cudaGetLastError(); return nullptr; }
+        cap = cnt;
+    }
+    return ref;
+}
+extern "C" int ds4_gpu_k3_mla_attend_masked_tensor(ds4_gpu_tensor *heads_out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *key_cache,
+                                                   const ds4_gpu_tensor *value_cache, const ds4_gpu_tensor *mask, uint32_t n_pos,
+                                                   uint32_t heads, uint32_t qk, uint32_t vdim) {
+    if (!heads_out || !q || !key_cache || !value_cache || !mask || n_pos == 0u || n_pos > ds4_gpu_k3_attn_max_pos() || mask->bytes < n_pos) return 0;
+    if (k3_mla_cache_mode() != 0) { fprintf(stderr, "ds4: K3 DSA needs the full-precision attention cache\n"); return 0; }
+    const float scale = 1.0f / sqrtf((float)qk);
+    { static uint8_t r = 0; if (!k3_attn_smem((const void *)k3_mla_attend_masked_kernel, &r, (size_t)n_pos * sizeof(float))) return 0; }   /* step 99 */
+    k3_mla_attend_masked_kernel<<<heads, 256, n_pos * sizeof(float), cuda_decode_stream()>>>((float *)heads_out->ptr,
+        (const float *)q->ptr, (const float *)key_cache->ptr, (const float *)value_cache->ptr, (const uint8_t *)mask->ptr, n_pos, heads,
+        qk, vdim, scale);
+    return cuda_ok(cudaGetLastError(), "K3 MLA masked attention launch");
+}
+
+extern "C" int ds4_gpu_k3_mla_attend_batch_masked_tensor(ds4_gpu_tensor *heads_out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *key_cache,
+                                                         const ds4_gpu_tensor *value_cache, const ds4_gpu_tensor *mask, uint32_t pos0,
+                                                         uint32_t n_tok, uint32_t mask_stride, uint32_t top_k, uint32_t heads, uint32_t qk,
+                                                         uint32_t vdim) {
+    if (!heads_out || !q || !key_cache || !value_cache || !mask || n_tok == 0u || pos0 + n_tok > ds4_gpu_k3_attn_max_pos() || pos0 + n_tok > mask_stride ||
+        mask->bytes < (uint64_t)n_tok * mask_stride) return 0;
+    if (k3_mla_cache_mode() != 0) { fprintf(stderr, "ds4: K3 DSA needs the full-precision attention cache\n"); return 0; }
+    if (k3_raw_get().verify) {   /* verification rows: the plain path's launch, row by row (step 80); rows that see every position take
+                                    the unmasked kernel, exactly as a plain step at that position does */
+        for (uint32_t r = 0; r < n_tok; r++) {
+            ds4_gpu_tensor ho = *heads_out, qo = *q, mo = *mask;
+            ho.ptr = (char *)heads_out->ptr + (size_t)r * heads * vdim * sizeof(float); ho.bytes = (uint64_t)heads * vdim * sizeof(float);
+            qo.ptr = (char *)q->ptr + (size_t)r * heads * qk * sizeof(float); qo.bytes = (uint64_t)heads * qk * sizeof(float);
+            mo.ptr = (char *)mask->ptr + (size_t)r * mask_stride; mo.bytes = mask_stride;
+            const uint32_t np = pos0 + r + 1u;
+            const int ok = np <= top_k ? ds4_gpu_k3_mla_attend_tensor(&ho, &qo, key_cache, value_cache, np, heads, qk, vdim)
+                                       : ds4_gpu_k3_mla_attend_masked_tensor(&ho, &qo, key_cache, value_cache, &mo, np, heads, qk, vdim);
+            if (!ok) return 0;
+        }
+        return 1;
+    }
+    const float scale = 1.0f / sqrtf((float)qk);
+    static int mode = -1;   /* step 102: 1 compact kernel (default), 0 the full-scan kernel, 2 both, compared bit for bit */
+    if (mode < 0) { const char *e = getenv("DS4_K3_ATTN_COMPACT"); mode = !e ? 0 : !strcmp(e, "check") ? 2 : (atoi(e) ? 1 : 0); }   /* step 105: opt-in */
+    cudaStream_t st = cuda_decode_stream();
+    const size_t sm_full = (size_t)(pos0 + n_tok) * sizeof(float);
+    if (k3_attn_gemm_mode() != 0 && k3_attn_gemm((float *)heads_out->ptr, (const float *)q->ptr, (const float *)key_cache->ptr,
+                                                 (const float *)value_cache->ptr, (const uint8_t *)mask->ptr, mask_stride, pos0, n_tok,
+                                                 heads, qk, vdim, scale, st)) {   /* step 103 */
+        if (k3_attn_gemm_mode() == 2) {
+            const size_t cnt = (size_t)n_tok * heads * vdim;
+            float *ref = k3_attn_ref(cnt, st);
+            if (!ref) return 0;
+            { static uint8_t r = 0; if (!k3_attn_smem((const void *)k3_mla_attend_batch_masked_kernel, &r, sm_full)) return 0; }
+            k3_mla_attend_batch_masked_kernel<<<dim3(n_tok, heads, 1u), 256, sm_full, st>>>(ref, (const float *)q->ptr,
+                (const float *)key_cache->ptr, (const float *)value_cache->ptr, (const uint8_t *)mask->ptr, mask_stride, pos0, heads, qk, vdim, scale);
+            if (!k3_attn_check((const float *)heads_out->ptr, ref, cnt, "masked)", st)) return 0;
+        }
+        return 1;
+    }
+    if (mode == 0) {
+        { static uint8_t r = 0; if (!k3_attn_smem((const void *)k3_mla_attend_batch_masked_kernel, &r, sm_full)) return 0; }   /* step 99 */
+        k3_mla_attend_batch_masked_kernel<<<dim3(n_tok, heads, 1u), 256, sm_full, st>>>(
+            (float *)heads_out->ptr, (const float *)q->ptr, (const float *)key_cache->ptr, (const float *)value_cache->ptr,
+            (const uint8_t *)mask->ptr, mask_stride, pos0, heads, qk, vdim, scale);
+        return cuda_ok(cudaGetLastError(), "K3 MLA masked attention batch launch");
+    }
+    const size_t sm_c = k3_compact_smem(top_k, pos0 + n_tok);
+    { static uint8_t r = 0; if (!k3_attn_smem((const void *)k3_mla_attend_batch_compact_kernel, &r, sm_c)) return 0; }
+    k3_mla_attend_batch_compact_kernel<<<dim3(n_tok, heads, 1u), 256, sm_c, st>>>(
+        (float *)heads_out->ptr, (const float *)q->ptr, (const float *)key_cache->ptr, (const float *)value_cache->ptr,
+        (const uint8_t *)mask->ptr, mask_stride, pos0, heads, qk, vdim, scale, top_k);
+    if (!cuda_ok(cudaGetLastError(), "K3 MLA compact attention batch launch")) return 0;
+    if (mode == 2) {
+        static float *ref = nullptr; static size_t ref_cap = 0; static unsigned long long *dcount = nullptr;
+        static uint64_t calls = 0, all = 0, bad = 0;
+        const size_t cnt = (size_t)n_tok * heads * vdim;
+        if (ref_cap < cnt) {
+            if (cudaStreamSynchronize(st) != cudaSuccess) return 0;
+            if (ref) cudaFree(ref);
+            ref = nullptr; ref_cap = 0;
+            if (cudaMalloc(&ref, cnt * sizeof(float)) != cudaSuccess) return cuda_ok(cudaGetLastError(), "K3 attention self-test buffer");
+            ref_cap = cnt;
+        }
+        if (!dcount && cudaMalloc(&dcount, sizeof(*dcount)) != cudaSuccess) return cuda_ok(cudaGetLastError(), "K3 attention self-test counter");
+        { static uint8_t r = 0; if (!k3_attn_smem((const void *)k3_mla_attend_batch_masked_kernel, &r, sm_full)) return 0; }
+        k3_mla_attend_batch_masked_kernel<<<dim3(n_tok, heads, 1u), 256, sm_full, st>>>(ref, (const float *)q->ptr,
+            (const float *)key_cache->ptr, (const float *)value_cache->ptr, (const uint8_t *)mask->ptr, mask_stride, pos0, heads, qk, vdim, scale);
+        unsigned long long hcount = 0;
+        if (cudaMemsetAsync(dcount, 0, sizeof(*dcount), st) != cudaSuccess) return cuda_ok(cudaGetLastError(), "K3 attention self-test");
+        k3_bits_diff_kernel<<<1024, 256, 0, st>>>((const float *)heads_out->ptr, ref, (uint64_t)cnt, dcount);
+        if (cudaMemcpyAsync(&hcount, dcount, sizeof(hcount), cudaMemcpyDeviceToHost, st) != cudaSuccess || cudaStreamSynchronize(st) != cudaSuccess)
+            return cuda_ok(cudaGetLastError(), "K3 attention self-test readback");
+        calls++; all += cnt; bad += hcount;
+        if (hcount || calls % 24u == 0u)
+            fprintf(stderr, "ds4: K3 compact attention self-test: %llu calls, %llu outputs compared, %llu differ%s\n", (unsigned long long)calls,
+                    (unsigned long long)all, (unsigned long long)bad, hcount ? " (this call differs)" : "");
+        if (hcount) { fprintf(stderr, "ds4: K3 compact attention SELF-TEST FAILED\n"); return 0; }   /* step 104 */
+    }
+    return 1;
+}
+
+/* step 96c: kv_b rows straight into the dense K/V, what k3_split_kvb_batch_kernel then k3_mla_store_batch_kernel write, in one
+   pass; with a mask, only the selected positions */
+__global__ static void k3_lat_store_kvb_kernel(float *key_cache, float *value_cache, const float *kvb, const float *kv_raw, const uint8_t *mask,
+                                               uint32_t pos0, uint32_t heads, uint32_t nope, uint32_t rot, uint32_t kv_lora, uint32_t vdim) {
+    const size_t t = blockIdx.y;
+    const uint32_t pos = pos0 + (uint32_t)t;
+    if (mask && !mask[pos]) return;
+    const uint32_t per = nope + vdim, qk = nope + rot;
+    const float *row = kvb + t * heads * per;
+    const float *raw = kv_raw + t * (kv_lora + rot);
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t key_elems = heads * qk;
+    if (i < key_elems) {
+        const uint32_t h = i / qk, d = i % qk;
+        key_cache[((size_t)pos * heads + h) * qk + d] = d < nope ? row[h * per + d] : raw[kv_lora + (d - nope)];
+    } else if (i < key_elems + heads * vdim) {
+        const uint32_t j = i - key_elems, h = j / vdim, d = j % vdim;
+        value_cache[(size_t)pos * heads * vdim + j] = row[h * per + nope + d];
+    }
+}
+
+extern "C" int ds4_gpu_k3_lat_store_kvb_tensor(ds4_gpu_tensor *key_cache, ds4_gpu_tensor *value_cache, const ds4_gpu_tensor *kvb,
+                                               const ds4_gpu_tensor *kv_raw, const ds4_gpu_tensor *mask, uint32_t pos0, uint32_t n_tok,
+                                               uint32_t cache_cap, uint32_t heads, uint32_t nope, uint32_t rot, uint32_t kv_lora, uint32_t vdim) {
+    if (!key_cache || !value_cache || !kvb || !kv_raw || n_tok == 0u || pos0 + n_tok > cache_cap || k3_mla_cache_mode() != 0) return 0;
+    if (mask && mask->bytes < (uint64_t)pos0 + n_tok) return 0;
+    if (kvb->bytes < (uint64_t)n_tok * heads * (nope + vdim) * sizeof(float) || kv_raw->bytes < (uint64_t)n_tok * (kv_lora + rot) * sizeof(float)) return 0;
+    const uint32_t n = heads * (nope + rot) + heads * vdim;
+    k3_lat_store_kvb_kernel<<<dim3((n + 255u) / 256u, n_tok, 1u), 256, 0, cuda_decode_stream()>>>((float *)key_cache->ptr, (float *)value_cache->ptr,
+        (const float *)kvb->ptr, (const float *)kv_raw->ptr, mask ? (const uint8_t *)mask->ptr : (const uint8_t *)NULL, pos0, heads, nope, rot, kv_lora, vdim);
+    return cuda_ok(cudaGetLastError(), "K3 latent K/V store launch");
 }
 
 extern "C" int ds4_gpu_k3_kda_decode_batch(

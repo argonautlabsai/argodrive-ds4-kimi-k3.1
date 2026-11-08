@@ -3712,7 +3712,11 @@ int ds4_gpu_k3_moe_raw_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, cons
                               const float *weights, uint32_t n_used, uint32_t layer, uint32_t ff, uint32_t latent,
                               float beta, float beta_linear);
 void ds4_gpu_k3_moe_raw_stats(double *wait_s, uint64_t *bytes);
-int ds4_gpu_k3_cache_grow(void);   /* sizes the device expert cache from free VRAM; call after the first full forward */
+int ds4_gpu_k3_cache_grow(void);
+uint64_t ds4_gpu_k3_cache_lend(void);
+uint32_t ds4_gpu_k3_attn_max_pos(void);
+uint64_t ds4_gpu_k3_attn_scratch_need(uint32_t n_tok, uint32_t n_cols, uint32_t heads);   /* step 103: GEMM attention scratch growth */   /* step 99: positions the K3 attention kernels take (shared memory opt-in limit) */   /* step 97: frees the grown region for a prompt pass; returns the bytes freed */
+uint64_t ds4_gpu_k3_pass_scratch_need(uint32_t n_tok, uint32_t n_used, uint32_t ff, uint32_t latent);   /* step 97 */   /* sizes the device expert cache from free VRAM; call after the first full forward */
 int ds4_gpu_k3_skip_mode(void);   /* step 57: DS4_K3_EXPERT_SKIP (0 off, 1 on, 2 observe only) */
 void ds4_gpu_k3_skip_stats(uint64_t *skipped, double *mass, uint64_t *obs_n, uint64_t obs[6]);
 void ds4_gpu_k3_cache_stats(uint64_t *hits_dev, uint64_t *hits_host, uint64_t *misses);   /* expert cache counters */
@@ -3758,6 +3762,27 @@ int ds4_gpu_k3_mla_store_batch_tensor(ds4_gpu_tensor *key_cache, ds4_gpu_tensor 
 int ds4_gpu_k3_mla_attend_batch_tensor(ds4_gpu_tensor *heads_out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *key_cache,
                                        const ds4_gpu_tensor *value_cache, uint32_t pos0, uint32_t n_tok, uint32_t heads,
                                        uint32_t qk, uint32_t vdim);
+/* step 95: K3.1 sparse attention (DSA). The indexer's weights are their own device range (f32, host copy as the key). */
+int ds4_gpu_k3_lat_store_kvb_tensor(ds4_gpu_tensor *key_cache, ds4_gpu_tensor *value_cache, const ds4_gpu_tensor *kvb,
+                                    const ds4_gpu_tensor *kv_raw, const ds4_gpu_tensor *mask, uint32_t pos0, uint32_t n_tok,
+                                    uint32_t cache_cap, uint32_t heads, uint32_t nope, uint32_t rot, uint32_t kv_lora, uint32_t vdim);   /* step 96c */
+int ds4_gpu_k3_register_aux_weights(const void *host, uint64_t bytes);
+int ds4_gpu_k3_dsa_matmul_tensor(ds4_gpu_tensor *out, const void *aux, uint64_t aux_size, uint64_t offset, uint32_t in_dim,
+                                 uint32_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok);
+int ds4_gpu_k3_dsa_ln_store_tensor(ds4_gpu_tensor *key_cache, const ds4_gpu_tensor *raw, const void *aux, uint64_t aux_size,
+                                   uint64_t w_off, uint64_t b_off, uint32_t pos0, uint32_t n_tok, uint32_t cap, float eps);
+int ds4_gpu_k3_dsa_scores_tensor(ds4_gpu_tensor *scores, const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,
+                                 const ds4_gpu_tensor *key_cache, uint32_t n_rows, uint32_t n_tokens, uint32_t pos0,
+                                 uint32_t n_head, float scale);
+int ds4_gpu_k3_dsa_mask_tensor(ds4_gpu_tensor *mask, const ds4_gpu_tensor *selected, uint32_t stride, uint32_t n_tokens,
+                               uint32_t pos0, uint32_t top_k);
+int ds4_gpu_k3_mla_attend_masked_tensor(ds4_gpu_tensor *heads_out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *key_cache,
+                                        const ds4_gpu_tensor *value_cache, const ds4_gpu_tensor *mask, uint32_t n_pos,
+                                        uint32_t heads, uint32_t qk, uint32_t vdim);
+int ds4_gpu_k3_mla_attend_batch_masked_tensor(ds4_gpu_tensor *heads_out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *key_cache,
+                                              const ds4_gpu_tensor *value_cache, const ds4_gpu_tensor *mask, uint32_t pos0,
+                                              uint32_t n_tok, uint32_t mask_stride, uint32_t top_k, uint32_t heads, uint32_t qk,
+                                              uint32_t vdim);
 int ds4_gpu_k3_kda_decode_batch(ds4_gpu_tensor *out, ds4_gpu_tensor *conv_state, ds4_gpu_tensor *recurrent_state,
                                 const ds4_gpu_tensor *q, const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
                                 const ds4_gpu_tensor *raw_gate, const ds4_gpu_tensor *raw_beta,

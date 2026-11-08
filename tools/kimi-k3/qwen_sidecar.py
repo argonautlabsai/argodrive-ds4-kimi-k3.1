@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Qwen proposal sidecar for ds4's Kimi K3 decode (steps 79, 82, 86 and 89, experimental). ds4 sends the committed K3 token ids; this answers with up to `requested` K3 ids or none.
+"""Qwen proposal sidecar for ds4's Kimi K3 decode (steps 79, 82, 86, 89 and 94b, experimental). ds4 sends the committed K3 token ids; this answers with up to `requested` K3 ids or none.
 Rules from deltafin's qwen_draft.rs and provider_qwen.cpp: greedy; generated rows stop at, and include, end-of-text; a proposal is cut at the first row below the
 confidence gate; translation goes through the decoded K3 text and must keep the history as an exact prefix; a failed round trip gives no proposal (soft skip);
 budget requested + 2 clamped to [3, 20], with one retry at 20 when the budget ran out short of `requested`. Generation stops early at the first row below the gate,
@@ -7,7 +7,7 @@ because nothing after it can be used, and the KV cache and predicted rows are re
 dropped, and ds4 runs a block of 1 + n rows for any other. While ds4 works on a block or a plain step, the sidecar can carry its greedy sequence on past the history
 (DS4_K3_QWEN_SPEC) and stops as soon as the next request arrives. Binary protocol on stdin/stdout, little endian:
   H                                          -> h  f32 load_seconds, u32 vram_mb
-  B                                          -> b  (a new request: empty history)
+  B  u32 n_prompt                            -> b  (a new request: empty history; the prompt's length, which the test fixtures need)
   Q  u32 n_new, n_new * u32 ids, u32 requested -> q  u32 nd, nd * u32 ids, f32 min_conf, f32 seconds, u32 steps, u32 flags (1 soft skip, 2 confidence stop, 4 retried)
   X                                          -> exits
 Environment: DS4_K3_QWEN_DIR (the Qwen3-0.6B-Base checkpoint), DS4_K3_QWEN_META (the folder with K3's tiktoken.model and tokenizer_config.json), DS4_K3_QWEN_CONF (gate, default 0.6),
@@ -143,7 +143,8 @@ def main():
         if c == b"H":
             proto_out.write(b"h" + struct.pack("<fI", time.time() - t_load0, int(torch.cuda.memory_reserved() >> 20) if dev == "cuda" else 0))
         elif c == b"B":
-            h = []; n_q = 0; n_prompt = None; gate = GATE; last = []; QW_STATE.kv = None; QW_STATE.ids = []; QW_STATE.pred = {}; proto_out.write(b"b")
+            n_prompt = struct.unpack("<I", rd(4))[0]   # ds4 may take plain steps before its first proposal
+            h = []; n_q = 0; gate = GATE; last = []; QW_STATE.kv = None; QW_STATE.ids = []; QW_STATE.pred = {}; proto_out.write(b"b")
         elif c == b"Q":
             t0 = time.time()
             n = struct.unpack("<I", rd(4))[0]
