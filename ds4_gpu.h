@@ -3721,6 +3721,14 @@ int ds4_gpu_k3_skip_mode(void);   /* step 57: DS4_K3_EXPERT_SKIP (0 off, 1 on, 2
 void ds4_gpu_k3_skip_stats(uint64_t *skipped, double *mass, uint64_t *obs_n, uint64_t obs[6]);
 void ds4_gpu_k3_cache_stats(uint64_t *hits_dev, uint64_t *hits_host, uint64_t *misses);   /* expert cache counters */
 uint64_t ds4_gpu_k3_cache_copydowns(void);   /* victim copy-downs so far */
+void ds4_gpu_k3_set_f32_act(int on);   /* step 106: K3 spine and prompt-pass expert matmuls with fp32 activations */
+int ds4_gpu_k3_kvb_chain_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset,
+                                uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok);   /* step 107 */
+int ds4_gpu_k3_lat_replay_sel_tensor(ds4_gpu_tensor *key_cache, ds4_gpu_tensor *value_cache, ds4_gpu_tensor *kvb,
+        const ds4_gpu_tensor *norm_rows, const ds4_gpu_tensor *raw_rows, const ds4_gpu_tensor *cls, const ds4_gpu_tensor *mask,
+        uint32_t q0, uint32_t q1, uint32_t max_rows, uint32_t cache_cap, const void *model_map, uint64_t model_size,
+        uint64_t kvb_offset, uint32_t heads, uint32_t nope, uint32_t rot, uint32_t kv_lora, uint32_t vdim);   /* step 107 */
+int ds4_gpu_k3_memset_tensor(ds4_gpu_tensor *t, uint64_t offset, int value, uint64_t bytes);   /* step 107 */
 void ds4_gpu_k3_prefetch_hint(uint32_t layer, const int32_t *experts, uint32_t n);   /* ranked candidates for a layer */
 void ds4_gpu_k3_prefetch_stats(uint64_t *issued, uint64_t *adopted);
 void ds4_gpu_k3_set_verify(int on);

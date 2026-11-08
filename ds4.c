@@ -10157,7 +10157,11 @@ static void matvec_q8_0_rows(
 }
 
 /* Single-token Q8_0 matvec, used heavily in decode. */
+static void matvec_q8_0_f32_ref(float *out, const ds4_model *m, const ds4_tensor *w, const float *x);
 static void matvec_q8_0(float *out, const ds4_model *m, const ds4_tensor *w, const float *x) {
+    static int f32 = -1;   /* step 106: DS4_K3_CPU_F32=1 gives the CPU reference fp32 activations (no int8 prequantization) */
+    if (f32 < 0) f32 = getenv("DS4_K3_CPU_F32") != NULL;
+    if (f32) { matvec_q8_0_f32_ref(out, m, w, x); return; }
     matvec_q8_0_rows(out, m, w, x, 0, w->dim[1]);
 }
 
@@ -61800,6 +61804,7 @@ static struct {
     k3_lat_chunk *ch; uint32_t n_ch;
     ds4_gpu_tensor *key, *val;           /* the shared dense K/V, rebuilt one layer at a time */
     ds4_gpu_tensor *kvb, *kn, *vv; uint32_t scr_rows;
+    ds4_gpu_tensor *cls;                 /* step 107: per position 1 = made by the chain (a prompt batch), 0 = by the single-row arithmetic */
 } g_k3_lat = { -1, 0, 0, NULL, NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL, 0 };
 static uint32_t g_k3_lat_cap = 0;   /* step 96b: the cache's positions, known once the buffers are made */
 static bool k3_lat_on(void) {
@@ -61811,6 +61816,17 @@ static bool k3_lat_on(void) {
         g_k3_lat.loop_max = lm ? (uint32_t)(atoi(lm) < 0 ? 0 : atoi(lm)) : 64u;
     }
     return g_k3_lat.on == 1 || (g_k3_lat.on == 2 && g_k3_lat_cap > 2048u);
+}
+static bool k3_lat_sel_on(void) {   /* step 107, see patch_step107.py */
+    static int on = -1;
+    if (on < 0) {
+        (void)k3_lat_on();   /* loop_max */
+        const char *e = getenv("DS4_K3_LAT_SEL"), *fa = getenv("DS4_K3_F32_ACT");
+        const int f32 = fa ? (fa[0] && strcmp(fa, "0") != 0) : 1;
+        on = (e ? (e[0] && strcmp(e, "0") != 0) : 1) && f32;
+        if (on) fprintf(stderr, "ds4: kimi-k3 latent replay (step 107): kv_b of prompt batches as one in-order FMA chain per row; rebuilds compute only the positions the attention reads\n");
+    }
+    return on != 0;
 }
 static void k3_lat_chunk_free(k3_lat_chunk *c) {
     if (c->in) { for (uint32_t il = 0; il < DS4_N_LAYER; il++) if (c->in[il]) ds4_gpu_tensor_free(c->in[il]); free(c->in); }
@@ -61832,11 +61848,12 @@ static void k3_lat_claim(uint32_t p0, uint32_t n, int32_t owner) {
         if (p0 < c->start + c->alive) { c->alive = p0 > c->start ? p0 - c->start : 0u; if (!c->alive) k3_lat_chunk_free(c); }
     }
     for (uint32_t q = p0; q < p0 + n; q++) g_k3_lat.owner[q] = owner;
+    if (k3_lat_sel_on() && g_k3_lat.cls && !ds4_gpu_k3_memset_tensor(g_k3_lat.cls, p0, owner >= 0 ? 1 : 0, n)) ds4_die("K3 latent class update failed");
 }
 static bool k3_lat_record(uint32_t il, uint32_t pos0, uint32_t n, const ds4_gpu_tensor *norm_rows, const ds4_gpu_tensor *raw_rows, int32_t chunk) {
     const uint64_t rw = (uint64_t)(DS4_N_KV_LORA + DS4_N_ROT) * 4u, nw = (uint64_t)DS4_N_KV_LORA * 4u;
     if (ds4_gpu_tensor_copy(g_k3_lat.raw[il], (uint64_t)pos0 * rw, raw_rows, 0, (uint64_t)n * rw) == 0) return false;
-    if (chunk < 0) return ds4_gpu_tensor_copy(g_k3_lat.norm[il], (uint64_t)pos0 * nw, norm_rows, 0, (uint64_t)n * nw) != 0;
+    if (chunk < 0 || k3_lat_sel_on()) return ds4_gpu_tensor_copy(g_k3_lat.norm[il], (uint64_t)pos0 * nw, norm_rows, 0, (uint64_t)n * nw) != 0;   /* step 107: every row by position */
     k3_lat_chunk *c = &g_k3_lat.ch[chunk];
     if (!c->in[il] && !(c->in[il] = ds4_gpu_tensor_alloc((uint64_t)c->len * nw))) return false;
     return ds4_gpu_tensor_copy(c->in[il], 0, norm_rows, 0, (uint64_t)n * nw) != 0;
@@ -61861,8 +61878,24 @@ static bool k3_lat_replay(const ds4_model *model, const ds4_layer_weights *l, ui
     if (raw) ds4_gpu_tensor_free(raw);
     return ok;
 }
+/* step 107: the positions before `lim` that `mask` selects (all without one), each made again by the arithmetic that first made it */
+static bool k3_lat_rebuild_sel(const ds4_model *model, const ds4_layer_weights *l, uint32_t il, uint32_t lim, uint32_t cap, const ds4_gpu_tensor *mask) {
+    if (lim == 0u) return true;
+    const uint32_t piece = 2048u;
+    const uint32_t max_rows = mask && g_k3_dsa.top_k > piece ? g_k3_dsa.top_k : piece;
+    if (!k3_lat_scratch(max_rows) || !g_k3_lat.cls) return false;
+    const uint32_t step = mask ? lim : piece;   /* a selection holds at most top_k positions: one call */
+    for (uint32_t q0 = 0; q0 < lim; q0 += step) {
+        const uint32_t q1 = lim - q0 < step ? lim : q0 + step;
+        if (!ds4_gpu_k3_lat_replay_sel_tensor(g_k3_lat.key, g_k3_lat.val, g_k3_lat.kvb, g_k3_lat.norm[il], g_k3_lat.raw[il], g_k3_lat.cls,
+                                              mask, q0, q1, max_rows, cap, model->map, model->size, l->attn_kv_b->abs_offset,
+                                              DS4_N_HEAD, DS4_N_KEY_MLA, DS4_N_ROT, DS4_N_KV_LORA, DS4_N_VALUE_MLA)) return false;
+    }
+    return true;
+}
 /* the shared K/V for this layer at every position before `lim` (the caller stores its own rows from lim on) */
 static bool k3_lat_rebuild(const ds4_model *model, const ds4_layer_weights *l, uint32_t il, uint32_t lim, uint32_t cap, const ds4_gpu_tensor *mask) {
+    if (k3_lat_sel_on()) return k3_lat_rebuild_sel(model, l, il, lim, cap, mask);
     for (uint32_t i = 0; i < g_k3_lat.n_ch; i++) {
         const k3_lat_chunk *c = &g_k3_lat.ch[i];
         if (!c->in || !c->alive || c->start >= lim) continue;
@@ -62165,9 +62198,9 @@ static void k3_prefill_hint_next(k3_gpu_batch *bb, const ds4_model *model, const
     if (n == 0) return;
     g_k3_pp_counts = counts;
     qsort(idx, n, sizeof(uint32_t), k3_pp_cmp);
-    int32_t list[256];
+    int32_t list[1024];   /* step 108: every predicted expert, most-predicted first */
     uint32_t m = 0;
-    for (uint32_t i = 0; i < n && m < 256u; i++) list[m++] = (int32_t)idx[i];
+    for (uint32_t i = 0; i < n && m < 1024u; i++) list[m++] = (int32_t)idx[i];
     ds4_gpu_k3_prefetch_hint(nl, list, m);
     g_k3_pp_hints++; g_k3_pp_experts += m;
 }
@@ -62256,12 +62289,19 @@ static bool k3_gpu_layer_batch(k3_gpu_buffers *b, k3_gpu_batch *bb, const ds4_mo
         K3_GPU_CHECK(ds4_gpu_k3_copy_rows_tensor(bb->kv_latent, DS4_N_KV_LORA, bb->kv, DS4_N_KV_LORA + rot, DS4_N_KV_LORA, T) != 0,
                      "mla kv latent pack");
         K3_GPU_CHECK(k3_gpu_rms_norm_rows(bb->latent_norm, bb->kv_latent, model, l->attn_kv_a_norm, DS4_N_KV_LORA, T), "mla kv_a norm");
-        K3_GPU_CHECK(k3_gpu_matmul_n(bb->kvb, model, l->attn_kv_b, bb->latent_norm, T), "mla kv_b");
+        if (k3_lat_sel_on() && T > g_k3_lat.loop_max) {   /* step 107: one in-order FMA chain per row, whatever the batch */
+            const double tm0 = g_k3_trace_on ? k3_trace_mark(bb->latent_norm) : 0.0;
+            K3_GPU_CHECK(ds4_gpu_k3_kvb_chain_tensor(bb->kvb, model->map, model->size, l->attn_kv_b->abs_offset, DS4_N_KV_LORA,
+                         heads * (nope + vdim), bb->latent_norm, T) != 0, "mla kv_b (chain)");
+            if (g_k3_trace_on) k3_trace_acc("kv_b chain (step 107)", k3_trace_mark(bb->kvb) - tm0);
+        } else {
+            K3_GPU_CHECK(k3_gpu_matmul_n(bb->kvb, model, l->attn_kv_b, bb->latent_norm, T), "mla kv_b");
+        }
         K3_GPU_CHECK(ds4_gpu_k3_split_kvb_batch_tensor(bb->k_nope, bb->value, bb->kvb, T, heads, nope, vdim) != 0, "mla split");
         if (k3_lat_on()) {   /* step 96: a batch of more than loop_max rows is one matmul, kept whole for replay; smaller ones are rows */
             static int32_t chunk = -1;
             if (il == g_k3_lat.first_mla) {
-                chunk = T > g_k3_lat.loop_max ? k3_lat_new_chunk(pos0, T) : -1;
+                chunk = T > g_k3_lat.loop_max ? (k3_lat_sel_on() ? 0 : k3_lat_new_chunk(pos0, T)) : -1;   /* step 107: no batch copies */
                 k3_lat_claim(pos0, T, chunk);
             }
             K3_GPU_CHECK(k3_lat_record(il, pos0, T, bb->latent_norm, bb->kv, chunk), "latent record");
@@ -62591,7 +62631,7 @@ static uint64_t k3_gpu_batch_bytes_per_row(void) {
    growth of the pool's scratch (compact partials, expert GEMM scratch, mid rows, token lists), the latent replay scratch for
    the longest live batch and 512 MB of transients */
 static uint64_t k3_gpu_pass_extra_per_row(void) {
-    uint64_t b = k3_lat_on() ? (uint64_t)(DS4_N_LAYER - DS4_N_LAYER * 3 / 4) * DS4_N_KV_LORA * 4u : 0u;
+    uint64_t b = k3_lat_on() && !k3_lat_sel_on() ? (uint64_t)(DS4_N_LAYER - DS4_N_LAYER * 3 / 4) * DS4_N_KV_LORA * 4u : 0u;   /* step 107: none kept */
     if (k3_dsa_on() && g_k3_dsa.cap > 4096u) {   /* step 99: the DSA top-k's tree scratch per row above 4,096 positions */
         uint64_t sets = (g_k3_dsa.cap + 4095u) / 4096u, u32 = sets * g_k3_dsa.top_k;
         while (sets > 2u) { sets = (sets + 1u) / 2u; u32 += sets * g_k3_dsa.top_k; }
@@ -62605,6 +62645,7 @@ static uint64_t k3_gpu_pass_extra_fixed(uint32_t T) {
     if (k3_lat_on() && g_k3_lat.key) {
         uint32_t rows = 0;
         for (uint32_t i = 0; i < g_k3_lat.n_ch; i++) if (g_k3_lat.ch[i].in && g_k3_lat.ch[i].len > rows) rows = g_k3_lat.ch[i].len;
+        if (k3_lat_sel_on()) rows = g_k3_dsa.top_k > 2048u ? g_k3_dsa.top_k : 2048u;   /* step 107: pieces of 2,048 */
         if (rows > g_k3_lat.scr_rows) b += (uint64_t)(rows - g_k3_lat.scr_rows) * DS4_N_HEAD * (DS4_N_KEY_MLA + DS4_N_VALUE_MLA) * 4u;
     }
     return b;
@@ -63127,8 +63168,15 @@ static bool k3_ckpt_restore(k3_gpu_buffers *b, const k3_ckpt *cc) {
                     ds4_gpu_tensor_write(g_k3_lat.ch[id].in[il], 0, sc->in[il], (uint64_t)sc->len * 512u * 4u) == 0) { free(remap); return false; }
             }
         }
-        for (int q = 0; q < c->n; q++) g_k3_lat.owner[q] = c->owner[q] < 0 ? -1 : remap[c->owner[q]];
+        for (int q = 0; q < c->n; q++) g_k3_lat.owner[q] = c->owner[q] < 0 ? -1 : (k3_lat_sel_on() ? c->owner[q] : remap[c->owner[q]]);
         free(remap);
+        if (k3_lat_sel_on()) {   /* step 107: the saved classes */
+            uint8_t *cb = xmalloc((size_t)c->n);
+            for (int q = 0; q < c->n; q++) cb[q] = c->owner[q] >= 0 ? 1u : 0u;
+            const bool okc = g_k3_lat.cls && ds4_gpu_tensor_write(g_k3_lat.cls, 0, cb, (uint64_t)c->n) != 0;
+            free(cb);
+            if (!okc) return false;
+        }
     }
     for (uint32_t il = 0; il < c->n_layer; il++) {
         if (ds4_k3_layer_is_kda(il)) {
@@ -63169,6 +63217,7 @@ static void k3_gpu_buffers_free(k3_gpu_buffers *b) {
         for (uint32_t i = 0; i < g_k3_lat.n_ch; i++) if (g_k3_lat.ch[i].in) k3_lat_chunk_free(&g_k3_lat.ch[i]);
         free(g_k3_lat.owner); g_k3_lat.owner = NULL;
         ds4_gpu_tensor_free(g_k3_lat.key); ds4_gpu_tensor_free(g_k3_lat.val); g_k3_lat.key = g_k3_lat.val = NULL;
+        if (g_k3_lat.cls) { ds4_gpu_tensor_free(g_k3_lat.cls); g_k3_lat.cls = NULL; }   /* step 107 */
         if (g_k3_lat.kvb) { ds4_gpu_tensor_free(g_k3_lat.kvb); g_k3_lat.kvb = NULL; g_k3_lat.scr_rows = 0; }
     }
     { ds4_gpu_tensor *d[6] = {b->dsa_q, b->dsa_k, b->dsa_w, b->dsa_scores, b->dsa_sel, b->dsa_mask}; for (int i = 0; i < 6; i++) if (d[i]) ds4_gpu_tensor_free(d[i]); }
@@ -63866,6 +63915,12 @@ static int generate_k3_cuda_argmax(
         ds4_generation_done_fn done,
         void              * emit_ud) {
     fprintf(stderr, "ds4: using Kimi K3 CUDA decode path (batched prompt pass, dense MLA cache)\n");
+    {   /* step 106: fp32 activations in the spine and prompt-pass expert matmuls (DS4_K3_F32_ACT=0: the int8 / bf16 paths) */
+        const char *fa = getenv("DS4_K3_F32_ACT");
+        const int on = fa ? (fa[0] && strcmp(fa, "0") != 0) : 1;
+        ds4_gpu_k3_set_f32_act(on);
+        fprintf(stderr, "ds4: kimi-k3 spine matmuls: %s\n", on ? "fp32 activations (step 106)" : "int8 prequantized activations (DS4_K3_F32_ACT=0)");
+    }
     /* Under SSD streaming nothing but a seed span is resident after load: install every decode-static
      * weight (the whole K3 spine) into the device cache before the first token. */
     if (!metal_graph_stream_map_decode_static_all(model, weights)) {
@@ -64037,6 +64092,8 @@ static int generate_k3_cuda_argmax(
                     g_k3_lat.raw = xcalloc(L, sizeof(*g_k3_lat.raw)); g_k3_lat.norm = xcalloc(L, sizeof(*g_k3_lat.norm));
                     g_k3_lat.owner = xmalloc(sizeof(int32_t) * cache_cap);
                     for (uint32_t q = 0; q < cache_cap; q++) g_k3_lat.owner[q] = -1;
+                    if (k3_lat_sel_on() && (!(g_k3_lat.cls = ds4_gpu_tensor_alloc(cache_cap)) || !k3_gpu_zero(g_k3_lat.cls, cache_cap)))
+                        ds4_die("K3 latent class allocation failed");   /* step 107 */
                     if (!g_k3_lat.key || !g_k3_lat.val || !k3_gpu_zero(g_k3_lat.key, (uint64_t)cache_cap * heads * (nope + rot) * 4u) ||
                         !k3_gpu_zero(g_k3_lat.val, (uint64_t)cache_cap * heads * vdim * 4u)) ds4_die("K3 latent cache allocation failed");
                     fprintf(stderr, "ds4: K3 latent cache: %.2f GB of latent rows and %.2f GB of shared K/V for %u positions (dense: %.1f GB)\n",
