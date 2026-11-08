@@ -1,4 +1,8 @@
-# Kimi K3 and K3.1 Pro on ds4 with CUDA
+# Argodrive DS4 Kimi K3.1 — setup and configuration
+
+**This repository is the complete Kimi inference engine for the documented scope.** The ds4-based runtime, Kimi CUDA port, expert caches, NVMe streaming and weight-preparation tools are included. Build this repository; do not install a separate upstream ds4 copy or the Argodrive Mac app.
+
+The release provides source code. Supply the Kimi checkpoint separately, a compatible NVIDIA driver and CUDA toolchain, C/C++ build tools and the Python dependencies used by the conversion tools. Prepared model weights are not bundled. The optional Qwen drafter has its own setup below.
 
 This branch (`kimi-k3`) adds Moonshot's Kimi K3 and Kimi K3.1 Pro to Salvatore Sanfilippo's
 [ds4](https://github.com/antirez/ds4) (upstream commit c97964b). The model is a 2.8T-parameter MoE with 92 MoE layers, 896
