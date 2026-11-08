@@ -1,10 +1,12 @@
 <p align="center"><a href="https://argonautlabs.ai/"><img src="tools/kimi-k3/images/argodrive-mark.svg" width="112" alt="Argonaut Labs"></a></p>
 
-# Kimi K3.1 Pro on one 96 GB GPU
+# Run Kimi 3.1 locally on one GPU — Kimi K3.1 Pro
 
 **argodrive-ds4-kimi-k3.1** runs Kimi K3.1 Pro (2.8T parameters, 1.45 TB of experts) on one 96 GB GPU, with the experts streamed off NVMe as the router asks
 for them: 3.1 tok/s decode on raw completions with its Qwen drafter, which gives the same tokens as plain decoding, and prefill
 at up to 44 tok/s.
+
+**Start here:** [Run Kimi 3.1 locally on one GPU — hardware, build guide and benchmarks](https://argonautlabs.ai/research/kimi-k31-single-gpu.html). The tested setup uses one RTX PRO 6000 Blackwell (96 GB), 70 GiB of VM RAM and five physical NVMe devices. The 3.11 tok/s result is raw-text decode with the drafter; 44 tok/s is prefill. The published benchmark profile is limited to 2,048 tokens total, and equivalence to Moonshot’s reference implementation has not been validated.
 
 [Argonaut Labs](https://argonautlabs.ai) built this Kimi K3 / K3.1 Pro port on top of Salvatore Sanfilippo's [ds4](https://github.com/antirez/ds4) at commit c97964b.
 The spine sits in VRAM as Q8_0. The 82,432 MXFP4 expert files stay on disk and move through a VRAM cache and a pinned RAM
