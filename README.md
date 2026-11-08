@@ -21,29 +21,29 @@ This is a **source release**. Model weights, NVIDIA drivers, CUDA build tools an
 ### Measured performance and scope
 
 **argodrive-ds4-kimi-k3.1** runs Kimi K3.1 Pro (2.8T parameters, 1.45 TB of experts) on one 96 GB GPU, with the experts streamed off NVMe as the router asks
-for them: 3.1 tok/s decode on raw completions with its Qwen drafter, which gives the same tokens as plain decoding, and prefill
-at up to 44 tok/s.
+for them: 3.05 tok/s decode on raw completions with its Qwen drafter, which gives the same tokens as plain decoding, prefill
+at up to 43 tok/s, and contexts up to 16,384 tokens with K3.1's sparse attention.
 
-**Start here:** [Run Kimi 3.1 locally on one GPU — hardware, build guide and benchmarks](https://argonautlabs.ai/research/kimi-k31-single-gpu.html). The tested setup uses one RTX PRO 6000 Blackwell (96 GB), 70 GiB of VM RAM and five physical NVMe devices. The 3.11 tok/s result is raw-text decode with the drafter; 44 tok/s is prefill. The published benchmark profile is limited to 2,048 tokens total, and equivalence to Moonshot’s reference implementation has not been validated.
+**Start here:** [Run Kimi 3.1 locally on one GPU — hardware, build guide and benchmarks](https://argonautlabs.ai/research/kimi-k31-single-gpu.html). The tested setup uses one RTX PRO 6000 Blackwell (96 GB), 70 GiB of VM RAM and five physical NVMe devices. The 3.05 tok/s result is raw-text decode with the drafter; 43 tok/s is prefill. Contexts up to 16,384 tokens use K3.1's sparse attention (measured at 4k, 8k and 16k), and equivalence to Moonshot’s reference implementation has not been validated.
 
 [Argonaut Labs](https://argonautlabs.ai) built this Kimi K3 / K3.1 Pro port on top of Salvatore Sanfilippo's [ds4](https://github.com/antirez/ds4) at commit c97964b.
-The spine sits in VRAM as Q8_0. The 82,432 MXFP4 expert files stay on disk and move through a VRAM cache and a pinned RAM
+The spine sits in VRAM as Q8_0, and its matmuls take fp32 activations. The 82,432 MXFP4 expert files stay on disk and move through a VRAM cache and a pinned RAM
 pool. There's no expert skipping. The drafter is off by default; `DS4_K3_QWEN=1` turns it on
 ([setup](tools/kimi-k3/README.md#the-optional-qwen-drafter)).
 
 <p align="center"><img src="tools/kimi-k3/images/workstation.jpg" width="760" alt="Inside the workstation: two NVIDIA RTX PRO 6000 Blackwell cards above a Hyper M.2 x16 Gen5 card"></p>
 <p align="center"><em>The workstation. The port runs on one of its two RTX PRO 6000 Blackwell cards (96 GB).</em></p>
 
-Measured on 7 November at commit 6808130, one fresh process per run, greedy, raw prompts, with the Qwen drafter:
+Measured on 8 November at commit b959c89, one fresh process per run, greedy, raw prompts, with the Qwen drafter:
 
 | test | prefill | decode |
 |---|---|---|
-| "The three main financial statements are" (6 tokens), 128 generated (tg128) | — | 2.91 tok/s |
-| 512-token prompt, 128 generated (pp512 / tg128) | 18.6 tok/s | 2.68 tok/s |
-| 1,512-token prompt, 128 generated (pp1512 / tg128) | 44 tok/s | 2.43 tok/s |
-| the same 6-token prompt, 512 generated | — | 3.11 tok/s |
+| "The three main financial statements are" (6 tokens), 128 generated (tg128) | — | 2.88 tok/s |
+| 512-token prompt, 128 generated (pp512 / tg128) | 18.0 tok/s | 2.66 tok/s |
+| 1,512-token prompt, 128 generated (pp1512 / tg128) | 43 tok/s | 2.45 tok/s |
+| the same 6-token prompt, 512 generated | — | 3.05 tok/s |
 
-The drafter gives the same tokens as plain decoding: a block's rows run the same arithmetic as plain steps, and the logits of 3,416
+The drafter gives the same tokens as plain decoding: a block's rows run the same arithmetic as plain steps, and the logits of 3,800
 positions showed no differing bit. Decode depends on how predictable the text is, and chat runs at about 2 tok/s. The 512-token
 prompt is `prompt-512-tokens.txt` from the deltafin Kimi K3 benchmark.
 
@@ -55,8 +55,17 @@ The prompt pass is the interesting part. Once a prompt is a few hundred tokens l
 layer, so the pass reads most of the model once and the time barely changes with length. For this model, prefill is a
 bandwidth problem.
 
-K3.1's DSA indexer isn't implemented yet. We use dense attention instead, which should compute the same thing as long as you
-stay within 2,048 tokens, so run it with `-c 2048`.
+K3.1's sparse attention works: each of the 24 attention layers attends to the 2,048 positions its indexer scores highest, and
+the selections match a float64 reference. The attention cache keeps what it needs to rebuild keys and values exactly, 105 KB
+per position instead of 2.95 MB. A 6,769-token prompt takes 60 s at an 8k cache and then decodes at 1.51 tok/s; a
+13,167-token prompt takes 124 s and decodes at 1.48 tok/s. Up to 2,048 tokens nothing changes. To use it, cut the indexer
+weights out of the checkpoint with `tools/kimi-k3/k31_indexer_extract.py` and run with
+`DS4_K3_DSA=k31-indexer.bin DS4_K3_CACHE_CAP=16384` and `-c 16384`.
+
+The spine's activations are fp32 since 8 November. Earlier releases rounded each activation vector to int8 (one scale per 32
+values) before every Q8_0 matmul, as ds4's dp4a path does: about 1e-3 per matmul against float64, enough to flip near-ties.
+Of the published test prompts two answers changed: "The capital of France is" at its sixth token, and the record prompt at
+512 tokens from token 356. `DS4_K3_F32_ACT=0` restores the int8 path.
 
 Weight layout, knobs, how we measured and what is and isn't bit-identical are all in
 [tools/kimi-k3/README.md](tools/kimi-k3/README.md).

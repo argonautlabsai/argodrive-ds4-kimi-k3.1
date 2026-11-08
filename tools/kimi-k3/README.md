@@ -36,12 +36,18 @@ A file missing from one directory is read from the next.
 ### Kimi K3.1 Pro
 
 K3.1 Pro has the same tensor set as K3 plus 120 `self_attn.indexer.*` tensors on its 24 full-attention layers (the
-Gated DSA lightning indexer, top-2,048 tokens). The converter and the engine ignore them, so the pipeline runs K3.1
-unchanged (`k3_spine_to_gguf.py --name "Kimi K3.1 Pro"`; `k31_extract.py --replace-in` overwrites a K3 expert layout
-in place, atomically and resumably). We don't implement the indexer yet, so dense attention stands in for DSA. That
-only holds while prompt plus generation stay within 2,048 tokens: below the indexer's window every token gets selected, so by
-the model's definition the two compute the same attention. We haven't checked this against Moonshot's own implementation. Run
-K3.1 with `-c 2048`. `k31_diff.py` compares two checkpoints tensor by tensor.
+Gated DSA lightning indexer, top-2,048 tokens). The converter leaves them out of the spine, so the spine and expert pipeline
+run K3.1 unchanged (`k3_spine_to_gguf.py --name "Kimi K3.1 Pro"`; `k31_extract.py --replace-in` overwrites a K3 expert
+layout in place, atomically and resumably). `k31_diff.py` compares two checkpoints tensor by tensor.
+
+The indexer's tensors (`wq_b` [4096, 1536], `wk` [128, 7168], `k_norm` weight and bias [128], `weights_proj` [32, 7168] per
+attention layer, bf16) are cut from the checkpoint by `k31_indexer_extract.py <checkpoint dir> <out>`, which reads only their
+byte ranges and writes `<out>.bin` (357 MB) and a manifest with sha256 hashes. `DS4_K3_DSA=<out>.bin` turns sparse attention
+on. The indexer follows DeepSeek V3.2's: q = wq_b(q_a_norm), k = LayerNorm(wk(x)), w = weights_proj(x),
+score = Σ_h ReLU(q_h·k)·w_h, the top 2,048 per query, recomputed on every attention layer. Against a float64 reference
+(`k31_dsa_ref.py` on a `DS4_K3_DSA_DUMP` dump) at 3,546 positions on layers 3, 47 and 92 the selection was identical (2,048 of
+2,048) and the scores agreed within 1e-7. Up to 2,048 positions every position is selected and the dense kernels run. We
+haven't compared any of this with Moonshot's own implementation.
 
 ## Build and run
 
@@ -56,7 +62,9 @@ K3.1 with `-c 2048`. `k31_diff.py` compares two checkpoints tensor by tensor.
     ./ds4 -m k3-spine.gguf --cuda --ssd-streaming --ssd-streaming-cold --ssd-streaming-cache-experts 16 \
           --temp 0 -c 2048 -n 512 --k3-serve HOST:PORT
 
-The examples use `-c 2048` for K3.1 Pro; Kimi K3 (not Pro) can run with `-c 4096`. Set `DS4_K3_EXPERT_DIR_C` to a third
+The examples use `-c 2048`. For a longer context with K3.1 Pro set `DS4_K3_DSA=k31-indexer.bin DS4_K3_CACHE_CAP=16384` and
+use `-c 16384`; the attention kernels take up to the device's shared-memory opt-in limit, 25,088 positions on an RTX PRO 6000.
+Kimi K3 (not Pro) has no indexer and can run with `-c 4096`. Set `DS4_K3_EXPERT_DIR_C` to a third
 expert directory if you have one. `DS4_K3_MLA_CACHE=bf16` keeps the dense attention cache in half precision. It frees 3 GB
 of VRAM at `-c 2048` and changed decode by a few percent at most on our machine, but it can flip near-tie tokens, so the
 numbers below don't use it.
@@ -70,7 +78,18 @@ numbers below don't use it.
 3. Each expert's GEMVs launch as soon as its slab lands; the layer completes when the last one does. A shallow
    next-layer prefetch fills the gap while the GPU runs attention.
 4. Prompt passes run as batched GEMMs with a prefetch of the next layer's experts and a prefix checkpoint for the
-   shared system prompt; long prompts are sized to free VRAM and chunked only when they do not fit.
+   shared system prompt. Their attention is three exact tiled SGEMM passes (scores, softmax in the per-row kernel's
+   reduction order, values), so every output keeps the per-row kernel's arithmetic. When a pass doesn't fit the free VRAM,
+   the device expert cache lends it the region it grew into and grows back when generation starts. Above 8,192 tokens a
+   pass runs in chunks of exactly 8,192.
+5. Above 2,048 positions the attention cache keeps each position's latent row (105 KB instead of 2.95 MB). Before every
+   attention step it rebuilds the keys and values of only the positions sparse attention selects (at most 2,048), each with
+   the arithmetic that first produced it: a prompt batch's rows as one in-order FMA chain per row, whatever the batch size,
+   and generated rows with the single-row kernel.
+6. The spine's Q8_0 matmuls take fp32 activations: a warp per row for one row, the same arithmetic per row for 2 to 64 rows,
+   exact fp32 dequantization and a pedantic fp32 cuBLAS GEMM above that. Prompt-pass experts that serve several tokens run
+   on the tensor cores with bf16 weights (exact for MXFP4) and each activation split into three bf16 terms. Decode experts
+   take fp32 activations as before.
 
 ## Main environment knobs (the defaults are what we measured with)
 
@@ -90,10 +109,21 @@ numbers below don't use it.
 | `DS4_K3_POOL_KEEP`, `DS4_K3_POOL_EVICT_BIAS` | 0, 0 | a host hit keeps its host copy; prefer evicting a slab the pool still holds (neutral to negative on this rig; kept for other cache geometries) |
 | `DS4_K3_POOL_LAZY` | unset | create the expert pool at the first token instead of at load |
 | `DS4_K3_PREFILL_SEQUENTIAL` | unset | process the prompt through the decode path one token at a time, about 0.7 s per token: 29 s vs 36 s fresh-process wall on the 5-token prompt, 192 s vs 39 s for a 286-token prompt pass. A different float path from the batched pass |
-| `DS4_K3_PREFILL_PREFETCH`, `_DIV`, `_MIN`, `_N`, `_INFLIGHT` | 2, 5, 0, 96, 96 | prompt pass: read ahead the next layer's predicted experts from any tier (1: the cold tier only, 0: off), n_tok / `_DIV` per layer but at least `_MIN` and at most `_N` |
+| `DS4_K3_PREFILL_PREFETCH`, `_DIV`, `_MIN`, `_N`, `_INFLIGHT` | 2, 5, 0, 256, 256 | prompt pass: read ahead the next layer's predicted experts from any tier (1: the cold tier only, 0: off), n_tok / `_DIV` per layer but at least `_MIN` and at most `_N` (up to 1,024) |
 | `DS4_K3_BULK_MIN` | 64 | a prompt of at most this many tokens reads like decode (split reads, least expected completion) |
 | `DS4_K3_SPINE_LAZY`, `DS4_K3_SPINE_THREADS`, `DS4_K3_POOL_REGION_SLABS` | unset, 8, 16 | a fresh process reads the spine with 8 threads before the first forward, beside the host pool's pinned memory, which comes in regions of 16 slabs so other CUDA calls run between them; `_LAZY=1` stages the spine during the first forward instead |
-| `DS4_K3_PROMPT_COMPACT`, `DS4_K3_CPART_MB` | 1, 512 | fixed-order accumulation for long prompt passes, so they repeat exactly; the compact buffer's cap in MB (512 covers the 2,048-token context) |
+| `DS4_K3_PROMPT_COMPACT`, `DS4_K3_CPART_MB` | 1, 0 | fixed-order accumulation for long prompt passes, so they repeat exactly; the compact buffer is sized by the pass's VRAM plan, `_MB` caps it (0: no cap) |
+| `DS4_K3_F32_ACT` | 1 | fp32 activations in the spine matmuls and the prompt pass's multi-token experts; 0 restores the int8 / bf16 paths of the releases before 8 November |
+| `DS4_K3_CPU_F32` | unset | the CPU reference's Q8_0 matvec takes fp32 activations too (for checks) |
+| `DS4_K3_DSA` | unset | the indexer file from `k31_indexer_extract.py`: K3.1 sparse attention, needed past 2,048 positions |
+| `DS4_K3_CACHE_CAP` | 4096 | the most positions the attention cache holds (also capped by `-c` and by the kernels' limit) |
+| `DS4_K3_LATENT` | auto | the exact latent attention cache, on above 2,048 positions; 1 forces it on, 0 off |
+| `DS4_K3_LAT_SEL` | 1 | the latent cache rebuilds only the positions attention reads, with batch-independent key/value projections (needs fp32 activations); 0 rebuilds every position |
+| `DS4_K3_PREFILL_MAX`, `DS4_K3_PREFILL_CHUNK`, `DS4_K3_PREFILL_FIT` | 8192, unset, unset | passes longer than `_MAX` run in chunks of exactly that many tokens; `_CHUNK` forces a chunk size (diagnostic); a pass that does not fit is refused unless `_FIT=1` |
+| `DS4_K3_ATTN_GEMM`, `DS4_K3_ATTN_GEMM_MB` | 1, 256 | prompt-pass attention as exact GEMM passes with a score scratch of this size; 0 runs the per-row kernels; `check` runs both and stops on a mismatch |
+| `DS4_K3_ATTN_COMPACT` | 0 | attention over the selected positions only (exact, opt-in; it wins only past about 10,000 positions); `check` compares |
+| `DS4_K3_DSA_SCORES` | 1 | indexer scores with one warp per position and token, the reference kernel's arithmetic; 0 runs the reference kernel; `check` compares |
+| `DS4_K3_QWEN_GRACE_MS` | 300 | the first drafter proposal waits at most this long for the sidecar; plain steps run until it is ready |
 | `DS4_K3_QWEN`, `DS4_K3_QWEN_PY`, `DS4_K3_QWEN_SCRIPT`, `DS4_K3_QWEN_DIR`, `DS4_K3_QWEN_META`, `DS4_K3_QWEN_CONF` | off, -, -, -, -, 0.6 | the optional Qwen drafter ([below](#the-optional-qwen-drafter)) |
 | `DS4_K3_QWEN_CHAT` | unset | allow the drafter on chat prompts; use it with the chat settings [below](#the-optional-qwen-drafter) |
 | `DS4_K3_QWEN_ROWS`, `DS4_K3_QWEN_KMIN` | 16, 2 | the most rows a verification block may take (2 to 16), and the fewest drafts worth a block |
@@ -180,6 +210,35 @@ With the drafter on, the sidecar loads during the spine read and both slow down.
 instead of 3.6 to 3.7, the sidecar was ready after 19 to 24 s instead of 2.5 to 2.7 s in the previous release, and the record prompt's first token
 came after 22.8 to 27.4 s instead of 20.0 to 20.3 s with the drafter off (the release's own counter, which agrees with the stamped clock to 0.04 s).
 
+### Long context and fp32 activations (8 November 2026)
+
+At commit b959c89, one fresh process per run, greedy, the third drive on. In brackets the same tests with int8 activations,
+measured the same day on the long-context code before the fp32 change:
+
+| test | prompt pass | first token | decode |
+|---|---|---|---|
+| 6,769-token chat prompt, 8k cache | 60.0 s (46.7) | 77.6 s (64.1) | 1.51 tok/s (1.53) |
+| 13,167-token chat prompt, 16k cache, two chunks | 124.4 s (98.2) | 141.9 s (115.7) | 1.48 tok/s (1.40) |
+| 3,545-token raw prompt, 4k cache | 45.1 s (38.8) | — | 1.69 tok/s (1.77) |
+
+The 6,769-token pass waits about 34 s on 1.4 TB of expert reads; the rest is compute, and fp32 adds about 13 s to it. Those are
+the spine's GEMMs on cuBLAS's fp32 path, at about 42 TFLOPS where the int8 matmuls ran at about 220 TOPS; the experts' extra work
+hides behind the reads. Decode at long context rebuilds only the positions sparse attention selects, which more than pays for
+fp32 at 16k.
+
+Through the server at an 8k cache, the 6,753-token request took 77.7 s. The same question again took 27.5 s from the saved
+prefix, and 27.6 s after another request in between, with identical logits.
+
+With short prompts the difference is a few percent:
+
+| test | int8 activations | fp32 activations |
+|---|---|---|
+| record prompt, 128 generated, plain / Qwen | 2.03 / 2.93 tok/s | 1.98 / 2.88 tok/s |
+| record prompt, 512 generated, plain / Qwen | 1.90 / 3.14 | 1.87 / 3.05 |
+| "The capital of France is", 17 generated, plain / Qwen | 1.96 / 2.24 | 1.99 / 2.13 |
+| 512-token prompt, 128 generated, Qwen: prefill / decode | 18.7 / 2.69 | 18.0 / 2.66 |
+| 1,512-token prompt, 128 generated, Qwen: prefill / decode | 46 / 2.44 | 43 / 2.45 |
+
 ## The optional Qwen drafter
 
 Off by default. Greedy decoding only, and raw completions only unless you set `DS4_K3_QWEN_CHAT=1`.
@@ -236,16 +295,29 @@ drafts, within 0.6 to 0.95.
 
 A verification block matches plain decoding bit for bit. Its rows run the plain path's arithmetic: attention and KDA launch per row, an expert used by more than four rows runs in chunks on the same GEMV
 kernels, and the multi-row spine GEMV computes each row with the single-row kernel's arithmetic, in the same order. A rejection restores the KDA snapshot and replays the kept rows through the same kernel.
-We checked the spine kernel on the GPU against the per-row loop (16,183 calls, all identical) and the whole path with `DS4_K3_TRACE_HASH`: in this release's runs with the drafter, the logits of 3,416
+We checked the spine kernel on the GPU against the per-row loop (16,183 calls, all identical) and the whole path with `DS4_K3_TRACE_HASH`: in the 8 November release's runs with the drafter, the logits of 3,800
 positions show no differing bit against plain decoding, including forced rejections of the first, a middle and the last draft, short proposals, a sidecar that dies or answers garbage, and end-of-text
 inside a block. The first drafter release's checks covered every layer of 40 positions (10,842 hashes) and the logits of 5,325 positions. That's evidence from these runs on this GPU and driver, not a
 proof for every input.
 
 The expert path doesn't touch the arithmetic. Caches, read scheduling, chunked reads, prefetch and enqueue order only change
 when an expert's bytes arrive. Per-layer traces on a 5-token prompt plus 2 generated tokens match a reference run line for line,
-and the 128- and 512-token id files are the same with and without pool-first. This release's start-up and prompt-pass changes are of the same
-kind: on prompts of 6, 286 and 1,549 tokens the first token's logits hash the same as with the previous release, and plain decoding gives the
-same token ids as the previous release on the record and public prompts.
+and the 128- and 512-token id files are the same with and without pool-first. The 7 November start-up and prompt-pass changes were of the same
+kind: on prompts of 6, 286 and 1,549 tokens the first token's logits hashed the same as with the release before, and plain decoding gave the
+same token ids on the record and public prompts.
+
+The 8 November release changes the arithmetic on purpose: the spine's activations are fp32 instead of int8. Against the int8 release, plain
+decoding gives the same ids on the record prompt at 128 and 200 tokens and on the public 512-token prompt; "The capital of France is" changes
+at its sixth token, where two candidates were 0.08 apart, and the record prompt at 512 tokens from token 356. Within the fp32 path:
+
+- the latent attention cache gave the same logits as the dense cache, bit for bit (record prompt, 3,545 tokens at 4k, 6,769 at 8k,
+  drafter blocks; tested with int8 activations), and rebuilding only the selected positions gives the same logits as rebuilding
+  all of them (1,188 logit hashes at 4k, 8k and 16k, on short prompts and through the server's checkpoints, 0 differing);
+- GEMM attention and the warp score kernel give the per-row kernels' outputs: in-model checks compared 2.44 billion attention outputs
+  and 1.1 billion scores, 0 differing;
+- a prompt pass's spine GEMMs run on cuBLAS, whose fp32 result for a row depends on how many rows share the call, so a prompt's logits
+  depend on how its pass is batched: chunks of 8,192 differ from one pass, and a reused prefix in the server is a different batching.
+  The key/value projection is computed as one in-order FMA chain per row, so it does not.
 
 A given setup repeats exactly. Every repeat in the tables above gave the same token ids, or the same text on the chat endpoint.
 Long prompt passes keep one weighted row per (token, slot) in a compact buffer and sum the slots in the router's order.
@@ -256,8 +328,8 @@ the expert GEMM all use different float operations. Top logits differ between th
 percentile of 0.3 to 0.7, with rare jumps up to 2.5 that we haven't explained yet. A token with a narrow margin can flip, and
 the answers differ from there on.
 
-Here's where each path first differs from the sequential prompt pass with the full-precision cache, counting generated tokens
-from 0:
+Here's where each path first differed from the sequential prompt pass with the full-precision cache, counting generated tokens
+from 0 (measured on 6 November, with int8 activations):
 
 | path | France, 17 tokens | record prompt, 128 tokens | chat prompt of 286 tokens, 200 tokens |
 |---|---|---|---|
@@ -274,13 +346,14 @@ Two comparisons with the published Kimi K3 text from deltafin on Apple silicon. 
 with the half-precision cache gives the same 17 ids (" Paris. The Eiffel Tower is located in Paris. The Louvre Museum is also").
 On the record prompt all our runs differ at character 91 ("an overview" against "a snapshot"), and we don't know why yet.
 
-So to be clear about what we're claiming: no expert skipping, and no quantisation beyond the Q8_0 spine (itself a quantisation of the BF16 spine) and the MXFP4 experts the checkpoint ships with. The
+So to be clear about what we're claiming: no expert skipping, and no quantisation beyond the Q8_0 spine (itself a quantisation of the BF16 spine) and the MXFP4 experts the checkpoint ships with; since 8 November the activations stay fp32 as well. The
 optional drafter doesn't change the output. The output isn't bit-identical across the other arithmetic paths above, and we haven't compared any of this with Moonshot's own implementation.
 
 ## Tools
 
 `k3_spine_to_gguf.py` (checkpoint to spine), `k31_extract.py` (checkpoint to expert files, in place or fresh),
-`k31_diff.py` (two checkpoints compared), `gguf_header.py` (spine header dump), `k3_tokenize.py` /
+`k31_diff.py` (two checkpoints compared), `k31_indexer_extract.py` (K3.1's indexer tensors to one file), `k31_dsa_ref.py`
+(one position's indexer and sparse attention against float64), `gguf_header.py` (spine header dump), `k3_tokenize.py` /
 `k3_cpu_forward.c` / `k3src_test.c` (reference checks), `readbench*.c` (per-file read latency and throughput),
 `cache_sim*.py`, `sim*.py`, `lru_test.cpp` (cache policy simulators on recorded routes), `serve_summary.py` /
 `tier_summary.py` (log summaries), `qwen_sidecar.py` (the drafter), `hash_compare.py` (bit-level comparison of two runs).
