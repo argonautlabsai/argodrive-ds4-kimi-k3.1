@@ -10,6 +10,8 @@ This is a **source release**. Model weights, NVIDIA drivers, CUDA build tools an
 
 ### Get started
 
+**First installation?** Follow the [step-by-step guide: get the engine, download and prepare the weights, then run Kimi](https://argonautlabs.ai/guides/install-kimi-k31.html). It includes copyable Linux commands and troubleshooting.
+
 1. **Get and build this engine** using the commands below.
 2. **Download and prepare the Kimi K3.1 weights** with the included [weight-preparation tools](tools/kimi-k3/README.md#weight-layout).
 3. **Run Kimi locally** using the [CLI or OpenAI-compatible chat endpoint](tools/kimi-k3/README.md#build-and-run). The [Qwen drafter](tools/kimi-k3/README.md#the-optional-qwen-drafter) is optional and needs its own checkpoint and dependencies.

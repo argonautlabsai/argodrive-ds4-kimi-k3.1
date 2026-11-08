@@ -1,5 +1,7 @@
 # Argodrive DS4 Kimi K3.1 — setup and configuration
 
+For a first setup, use the [illustrated installation guide](https://argonautlabs.ai/guides/install-kimi-k31.html): engine build, official model download, expert extraction, spine conversion and a local run. This document covers the detailed configuration and measurements.
+
 **This repository is the complete Kimi inference engine for the documented scope.** The ds4-based runtime, Kimi CUDA port, expert caches, NVMe streaming and weight-preparation tools are included. Build this repository; do not install a separate upstream ds4 copy or the Argodrive Mac app.
 
 The release provides source code. Supply the Kimi checkpoint separately, a compatible NVIDIA driver and CUDA toolchain, C/C++ build tools and the Python dependencies used by the conversion tools. Prepared model weights are not bundled. The optional Qwen drafter has its own setup below.
