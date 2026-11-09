@@ -69,6 +69,75 @@ expert directory if you have one. `DS4_K3_MLA_CACHE=bf16` keeps the dense attent
 of VRAM at `-c 2048` and changed decode by a few percent at most on our machine, but it can flip near-tie tokens, so the
 numbers below don't use it.
 
+## Apple silicon (Metal)
+
+The same engine runs Kimi K3.1 Pro on a Mac with Apple silicon through Metal (`--metal`). The Metal path computes with fp32
+activations throughout. At position 0 each stage of the first four layers, recomputed by an all-fp32 CPU reference from the
+GPU's own input, agreed within a relative error of 1.7e-5 (`DS4_K3_STAGE_CHECK=4 DS4_K3_CPU_F32=1 DS4_K3_PREFILL_SEQUENTIAL=1`;
+the check hooks the one-token path, so the prompt must not be batched). The drafter is exact here too: with it on, every
+logit we hashed matched plain decoding.
+
+Tested on a MacBook Pro with an M5 Max and 128 GB of unified memory, measured on 9 November 2026 at commit 5560b5e, median of
+three fresh processes per row, greedy, raw prompts, with the Qwen drafter:
+
+| test | prefill | decode |
+|---|---|---|
+| "The three main financial statements are" (6 tokens), 128 generated (tg128) | — | 1.93 tok/s |
+| 512-token prompt, 128 generated (pp512 / tg128) | 8.4 tok/s | 1.47 tok/s |
+| the same 6-token prompt, 512 generated | — | 2.04 tok/s |
+
+Plain decode (no drafter) on the 6-token prompt runs at 1.40 tok/s over 128 tokens and 1.29 over 512. The first token
+of a short prompt comes after about 6 to 9 s. `prompt-512-tokens.txt` is the prompt from the deltafin Kimi K3 benchmark, as above.
+
+Where the model lives:
+
+- the spine (62 GB of Q8_0 weights) in unified memory, read from the internal SSD at start;
+- an expert cache of 40 GB in unified memory (`DS4_K3_CACHE_RAM_GB`; past about 40 GB the process exceeds Metal's
+  recommended working set and decode got slower);
+- the expert files on three drives: the internal SSD (13.7 GB/s on expert files) with 71,866 of them, and two NVMe drives
+  in Thunderbolt 5 enclosures, each on its own port (7.1 GB/s each). One holds the other 10,566 experts plus copies of
+  the 33,600 most used ones, the other a full copy of all 82,432. Every expert has at least two homes and the 33,600 most
+  used have three.
+
+Each missed expert is read from the drives that hold it at once: its bytes are poured into its homes as contiguous
+16 KB-aligned ranges so that every drive's projected finish time rises evenly at its rate, experts with fewer homes first.
+Only which drive serves which bytes changes, not the data or the arithmetic. Set the rates to what your drives read.
+
+Build on macOS with the Xcode command-line tools (`make ds4`), then run the configuration we measured:
+
+    DS4_K3_EXPERT_DIR=/path/to/internal/experts DS4_K3_EXPERT_DIR_B=/path/to/drive1/experts \
+    DS4_K3_EXPERT_DIR_C=/path/to/drive2/experts DS4_K3_RATE_A_GBS=13.7 DS4_K3_RATE_B_GBS=7.1 DS4_K3_RATE_C_GBS=7.05 \
+    DS4_K3_HEAT=heat.bin DS4_K3_PREFETCH=0 \
+    ./ds4 -m k31-spine.gguf --metal --raw --ssd-streaming --ssd-streaming-cold --ssd-streaming-cache-experts 16 \
+          --temp 0 -c 2048 -n 200 -p "..."
+
+`DS4_K3_PREFETCH=0` switches off the CUDA engine's decode-prefetch predictor, which on Metal would only add a router pass per
+layer; the Metal path reads ahead with its own lookahead (below).
+
+For the drafter add the variables from [the drafter section](#the-optional-qwen-drafter) and `DS4_K3_QWEN_DEVICE=mps`
+(the sidecar runs Qwen on the Mac's GPU through PyTorch's MPS backend; it needs torch with MPS support). Sparse attention
+(`DS4_K3_DSA`) runs on Metal too, but contexts above 2,048 tokens were not part of these measurements.
+
+`DS4_K3_HEAT` is a histogram of expert use. With it the cache evicts the expert with the lowest use probability for its
+age, and a verification block keeps only the experts enough of its rows use; without it the cache is LRU. Build one from
+prompts like yours: run them with `DS4_K3_TRACE_ROUTES=1` (route lines go to stdout), then
+`tools/kimi-k3/heat_from_routes.py heat.bin trace1.txt trace2.txt ...`. The same counts rank the experts for the layout:
+the most used belong on the fastest drive and are the first to get more homes. Our numbers used a histogram from our own
+earlier runs, which is not part of this repository.
+
+| variable (Metal) | default | meaning |
+|---|---|---|
+| `DS4_K3_RATE_A_GBS`, `_B_GBS`, `_C_GBS` | 13.7, 7.1, 6.0 | read rates the balancer assumes for the primary directory, `dir_b` and `dir_c` |
+| `DS4_K3_BALANCE` | 1 | 0 reads every expert from its first home only |
+| `DS4_K3_CACHE_RAM_GB` | 40 | the expert cache in unified memory |
+| `DS4_K3_HEAT` | unset | the expert-use histogram (above); `DS4_K3_METAL_EVICT=lru` ignores it |
+| `DS4_K3_METAL_ADMIT` | auto | as `DS4_K3_VERIFY_ADMIT` on CUDA: a block's fill used by fewer rows than the threshold is recycled first |
+| `DS4_K3_LOOKAHEAD`, `DS4_K3_METAL_PREFETCH`, `DS4_K3_METAL_PREFETCH_ROW1` | 1, 8, 2 | the next layer's router runs on this layer's input; up to K predicted experts per layer are read ahead in verification blocks, up to ROW1 in plain steps |
+| `DS4_K3_OVERLAP` | 1 | the shared expert and the cached routed experts run while the missed experts are read |
+| `DS4_K3_WAVES`, `DS4_K3_WAVE_MODE` | 3, 1 | the missed experts of a block are computed in about this many chunks as their reads complete |
+| `DS4_K3_METAL_F32_GEMM` | 1 | batched Q8_0 spine matmuls of more than 64 rows dequantize exactly and multiply in fp32 (the generic batched kernels round to half) |
+| `DS4_K3_METAL_ROWS` | 1 | the rows kernel for 2 to 64-row spine matmuls: each Q8_0 block is read once per 8 rows, each row's arithmetic unchanged |
+
 ## What the engine does per token
 
 1. Attention, KDA and the router run on the GPU; routing (sigmoid + bias top-16, renormalised) is mirrored on the host.
@@ -356,4 +425,5 @@ optional drafter doesn't change the output. The output isn't bit-identical acros
 (one position's indexer and sparse attention against float64), `gguf_header.py` (spine header dump), `k3_tokenize.py` /
 `k3_cpu_forward.c` / `k3src_test.c` (reference checks), `readbench*.c` (per-file read latency and throughput),
 `cache_sim*.py`, `sim*.py`, `lru_test.cpp` (cache policy simulators on recorded routes), `serve_summary.py` /
-`tier_summary.py` (log summaries), `qwen_sidecar.py` (the drafter), `hash_compare.py` (bit-level comparison of two runs).
+`tier_summary.py` (log summaries), `qwen_sidecar.py` (the drafter), `hash_compare.py` (bit-level comparison of two runs),
+`heat_from_routes.py` (an expert-use histogram for `DS4_K3_HEAT` from route traces).

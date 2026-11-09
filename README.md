@@ -4,9 +4,9 @@
 
 ## Run Kimi K3.1 Pro locally on one GPU
 
-**This repository is the inference engine.** It already includes the ds4-based runtime, the Kimi K3/K3.1 CUDA port, NVMe expert streaming, expert caches and weight-preparation tools. Clone and build this repository; **no separate upstream ds4 installation or Argodrive Mac app is needed**.
+**This repository is the inference engine.** It already includes the ds4-based runtime, the Kimi K3/K3.1 CUDA port and its Metal port for Apple silicon, NVMe expert streaming, expert caches and weight-preparation tools. Clone and build this repository; **no separate upstream ds4 installation or Argodrive Mac app is needed**.
 
-This is a **source release**. Model weights, NVIDIA drivers, CUDA build tools and Python dependencies are separate; there is currently no prebuilt installer.
+This is a **source release**. Model weights, NVIDIA drivers, CUDA build tools (on a Mac, the Xcode command-line tools) and Python dependencies are separate; there is currently no prebuilt installer.
 
 ### Measured results at a glance
 
@@ -16,10 +16,12 @@ This is a **source release**. Model weights, NVIDIA drivers, CUDA build tools an
 | Raw financial text: 6 prompt / 512 output tokens | **3.05 tok/s decode** | 8 November, Qwen drafter, fp32 activations |
 | Prompt processing: 1,512-token prompt | **43 tok/s prefill** | 8 November; not output generation speed |
 | Long chat prompts: 6,769 / 13,167 tokens | **1.51 / 1.48 tok/s decode** | 8 November, 8k / 16k context caches |
+| MacBook Pro M5 Max, raw financial text: 6 prompt / 512 output tokens | **2.04 tok/s decode** | 9 November, Metal, Qwen drafter |
 
 **Tested hardware, not minimum requirements:**
 - One RTX PRO 6000 Blackwell GPU with **96 GB VRAM**; **70 GiB RAM** assigned to the Ubuntu VM.
 - **Five physical NVMe devices** in three storage tiers; **1.45 TB of unique MXFP4 experts**, plus spine, checkpoint and replicas.
+- On a Mac: a MacBook Pro with an **M5 Max and 128 GB** of unified memory, its internal SSD and **two Thunderbolt 5 NVMe drives**.
 - Context caches measured up to **16,384 tokens** using sparse attention. **Equivalence to Moonshot’s reference implementation remains unvalidated.**
 
 Different prompts and engine versions are separate experiments, not a single controlled speed comparison. [All measurements, definitions and limits](https://argonautlabs.ai/research/kimi-k31-single-gpu.html).
@@ -48,6 +50,22 @@ Measured on 8 November at commit b959c89, one fresh process per run, greedy, raw
 The drafter gives the same tokens as plain decoding: a block's rows run the same arithmetic as plain steps, and the logits of 3,800
 positions showed no differing bit. Decode depends on how predictable the text is, and chat runs at about 2 tok/s. The 512-token
 prompt is `prompt-512-tokens.txt` from the deltafin Kimi K3 benchmark.
+
+### On a MacBook Pro (Apple silicon, Metal)
+
+Since 9 November the same engine runs Kimi K3.1 Pro on a MacBook Pro with an M5 Max and 128 GB of unified memory, through
+Metal, with the experts streamed from the internal SSD and two Thunderbolt 5 NVMe drives: 2.04 tok/s decode on raw
+completions with the Qwen drafter (512 generated), 1.93 tok/s over 128. Measured on 9 November at commit 5560b5e, median
+of three fresh processes per row, greedy, raw prompts, with the Qwen drafter:
+
+| test | prefill | decode |
+|---|---|---|
+| "The three main financial statements are" (6 tokens), 128 generated (tg128) | — | 1.93 tok/s |
+| 512-token prompt, 128 generated (pp512 / tg128) | 8.4 tok/s | 1.47 tok/s |
+| the same 6-token prompt, 512 generated | — | 2.04 tok/s |
+
+The Metal path computes with fp32 activations throughout, and the drafter's runs gave the same logits as plain decoding
+(2,955 positions compared). Setup, drive layout and knobs: [Apple silicon](tools/kimi-k3/README.md#apple-silicon-metal).
 
 ### Architecture and validation
 
@@ -89,7 +107,7 @@ Weight layout, knobs, how we measured and what is and isn't bit-identical are al
 
 ## Where to find the Kimi code
 
-**Kimi starts in [`ds4_kimi_k3.c`](ds4_kimi_k3.c) and [`ds4_kimi_k3.h`](ds4_kimi_k3.h); the `ds4_k3_*` files implement the [server](ds4_k3_serve.c) and [draft verification](ds4_k3_draft.cuh). Weight preparation and configuration live in [`tools/kimi-k3/`](tools/kimi-k3/README.md).** Shared ds4 runtime and CUDA code also support the port; other-model directories remain for the upstream engine.
+**Kimi starts in [`ds4_kimi_k3.c`](ds4_kimi_k3.c) and [`ds4_kimi_k3.h`](ds4_kimi_k3.h); the `ds4_k3_*` files implement the [server](ds4_k3_serve.c) and [draft verification](ds4_k3_draft.cuh), and the Metal port is [`ds4_metal_k3.inc`](ds4_metal_k3.inc) with [`metal/k3.metal`](metal/k3.metal). Weight preparation and configuration live in [`tools/kimi-k3/`](tools/kimi-k3/README.md).** Shared ds4 runtime and CUDA code also support the port; other-model directories remain for the upstream engine.
 
 The default branch is **`main`**. It contains the Kimi K3.1 Pro port and earlier K3 support. [Updating an existing `kimi-k3` clone](tools/kimi-k3/BRANCH-MIGRATION.md). For a fixed reproduction target, use the [8 November source tag](https://github.com/argonautlabsai/argodrive-ds4-kimi-k3.1/tree/k31-cuda-20261108).
 
