@@ -51,8 +51,8 @@ haven't compared any of this with Moonshot's own implementation.
 
 ## Build and run
 
-    git clone https://github.com/argonautlabsai/argodrive-ds4-kimi-k3.1.git
-    cd argodrive-ds4-kimi-k3.1 && git checkout kimi-k3
+    git clone --branch main https://github.com/argonautlabsai/argodrive-ds4-kimi-k3.1.git
+    cd argodrive-ds4-kimi-k3.1
     make ds4 CUDA_ARCH=sm_120          # Blackwell; use your GPU's arch
 
     # one-shot

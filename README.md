@@ -34,21 +34,7 @@ Different prompts and engine versions are separate experiments, not a single con
 
 [Full setup and tested hardware](https://argonautlabs.ai/research/kimi-k31-single-gpu.html#reproduce) · [Configuration guide](tools/kimi-k3/README.md)
 
-### Engine architecture and full measurements
-
-**argodrive-ds4-kimi-k3.1** runs Kimi K3.1 Pro (2.8T parameters, 1.45 TB of experts) on one 96 GB GPU, with the experts streamed off NVMe as the router asks
-for them: 3.05 tok/s decode on raw completions with its Qwen drafter, which gives the same tokens as plain decoding, prefill
-at up to 43 tok/s, and contexts up to 16,384 tokens with K3.1's sparse attention.
-
-**Start here:** [Run Kimi K3.1 Pro locally on one GPU — hardware, build guide and benchmarks](https://argonautlabs.ai/research/kimi-k31-single-gpu.html). The tested setup uses one RTX PRO 6000 Blackwell (96 GB), 70 GiB of VM RAM and five physical NVMe devices. The 3.05 tok/s result is raw-text decode with the drafter; 43 tok/s is prefill. Contexts up to 16,384 tokens use K3.1's sparse attention (measured at 4k, 8k and 16k), and equivalence to Moonshot’s reference implementation has not been validated.
-
-[Argonaut Labs](https://argonautlabs.ai) built this Kimi K3 / K3.1 Pro port on top of Salvatore Sanfilippo's [ds4](https://github.com/antirez/ds4) at commit c97964b.
-The spine sits in VRAM as Q8_0, and its matmuls take fp32 activations. The 82,432 MXFP4 expert files stay on disk and move through a VRAM cache and a pinned RAM
-pool. There's no expert skipping. The drafter is off by default; `DS4_K3_QWEN=1` turns it on
-([setup](tools/kimi-k3/README.md#the-optional-qwen-drafter)).
-
-<p align="center"><img src="tools/kimi-k3/images/workstation.jpg" width="760" alt="Inside the workstation: two NVIDIA RTX PRO 6000 Blackwell cards above a Hyper M.2 x16 Gen5 card"></p>
-<p align="center"><em>The workstation. The port runs on one of its two RTX PRO 6000 Blackwell cards (96 GB).</em></p>
+### Standard benchmark measurements
 
 Measured on 8 November at commit b959c89, one fresh process per run, greedy, raw prompts, with the Qwen drafter:
 
@@ -62,6 +48,16 @@ Measured on 8 November at commit b959c89, one fresh process per run, greedy, raw
 The drafter gives the same tokens as plain decoding: a block's rows run the same arithmetic as plain steps, and the logits of 3,800
 positions showed no differing bit. Decode depends on how predictable the text is, and chat runs at about 2 tok/s. The 512-token
 prompt is `prompt-512-tokens.txt` from the deltafin Kimi K3 benchmark.
+
+### Architecture and validation
+
+[Argonaut Labs](https://argonautlabs.ai) built this Kimi K3 / K3.1 Pro port on top of Salvatore Sanfilippo's [ds4](https://github.com/antirez/ds4) at commit c97964b.
+The spine sits in VRAM as Q8_0, and its matmuls take fp32 activations. The 82,432 MXFP4 expert files stay on disk and move through a VRAM cache and a pinned RAM
+pool. There's no expert skipping. The drafter is off by default; `DS4_K3_QWEN=1` turns it on
+([setup](tools/kimi-k3/README.md#the-optional-qwen-drafter)).
+
+<p align="center"><img src="tools/kimi-k3/images/workstation.jpg" width="760" alt="Inside the workstation: two NVIDIA RTX PRO 6000 Blackwell cards above a Hyper M.2 x16 Gen5 card"></p>
+<p align="center"><em>The workstation. The port runs on one of its two RTX PRO 6000 Blackwell cards (96 GB).</em></p>
 
 The machine is one RTX PRO 6000 Blackwell (96 GB) in a 70 GiB VM. A RAID0 of three NVMe drives (19 GB/s) has the 79,365
 hottest experts, a second NVMe (6.2 GB/s) has the rest plus some copies, and a Thunderbolt NVMe (3.7 GB/s) has another 74,000
@@ -86,14 +82,16 @@ Of the published test prompts two answers changed: "The capital of France is" at
 Weight layout, knobs, how we measured and what is and isn't bit-identical are all in
 [tools/kimi-k3/README.md](tools/kimi-k3/README.md).
 
-    git clone https://github.com/argonautlabsai/argodrive-ds4-kimi-k3.1.git
-    cd argodrive-ds4-kimi-k3.1 && git checkout kimi-k3
+    git clone --branch main https://github.com/argonautlabsai/argodrive-ds4-kimi-k3.1.git
+    cd argodrive-ds4-kimi-k3.1
     make ds4 CUDA_ARCH=sm_120
 
 
 ## Where to find the Kimi code
 
-The default branch, `kimi-k3`, contains the **Kimi K3.1 Pro** port as well as K3 support. Its name is not a model-version limit. For a fixed reproduction target, use the [8 November source tag](https://github.com/argonautlabsai/argodrive-ds4-kimi-k3.1/tree/k31-cuda-20261108).
+**Kimi starts in [`ds4_kimi_k3.c`](ds4_kimi_k3.c) and [`ds4_kimi_k3.h`](ds4_kimi_k3.h); the `ds4_k3_*` files implement the [server](ds4_k3_serve.c) and [draft verification](ds4_k3_draft.cuh). Weight preparation and configuration live in [`tools/kimi-k3/`](tools/kimi-k3/README.md).** Shared ds4 runtime and CUDA code also support the port; other-model directories remain for the upstream engine.
+
+The default branch is **`main`**. It contains the Kimi K3.1 Pro port and earlier K3 support. [Updating an existing `kimi-k3` clone](tools/kimi-k3/BRANCH-MIGRATION.md). For a fixed reproduction target, use the [8 November source tag](https://github.com/argonautlabsai/argodrive-ds4-kimi-k3.1/tree/k31-cuda-20261108).
 
 | Start here | What it contains |
 |---|---|
