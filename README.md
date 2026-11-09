@@ -10,21 +10,21 @@ This is a **source release**. Model weights, NVIDIA drivers, CUDA build tools (o
 
 ### Measured results at a glance
 
-| Workload | Measured speed | Version and scope |
-|---|---:|---|
-| Short-prompt chat: 286 prompt / 200 output tokens | **2.01–2.02 tok/s decode** | 7 November, chat drafter settings |
-| Raw financial text: 6 prompt / 512 output tokens | **3.05 tok/s decode** | 8 November, Qwen drafter, fp32 activations |
-| Prompt processing: 1,512-token prompt | **43 tok/s prefill** | 8 November; not output generation speed |
-| Long chat prompts: 6,769 / 13,167 tokens | **1.51 / 1.48 tok/s decode** | 8 November, 8k / 16k context caches |
-| MacBook Pro M5 Max, raw financial text: 6 prompt / 512 output tokens | **2.04 tok/s decode** | 9 November, Metal, Qwen drafter |
+| Hardware | Workload | Measured speed | Version and scope |
+|---|---|---:|---|
+| **RTX PRO 6000** (96 GB, Linux, CUDA) | Short-prompt chat: 286 prompt / 200 output tokens | **2.01–2.02 tok/s decode** | 7 November, chat drafter settings |
+| **RTX PRO 6000** (96 GB, Linux, CUDA) | Raw financial text: 6 prompt / 512 output tokens | **3.05 tok/s decode** | 8 November, Qwen drafter, fp32 activations |
+| **RTX PRO 6000** (96 GB, Linux, CUDA) | Prompt processing: 1,512-token prompt | **43 tok/s prefill** | 8 November; not output generation speed |
+| **RTX PRO 6000** (96 GB, Linux, CUDA) | Long chat prompts: 6,769 / 13,167 tokens | **1.51 / 1.48 tok/s decode** | 8 November, 8k / 16k context caches |
+| **MacBook Pro M5 Max** (128 GB, macOS, Metal) | Raw financial text: 6 prompt / 512 output tokens | **2.04 tok/s decode** | 9 November, Qwen drafter, fp32 activations |
+| **MacBook Pro M5 Max** (128 GB, macOS, Metal) | Prompt processing: 512-token prompt | **8.4 tok/s prefill** | 9 November; not output generation speed |
 
 **Tested hardware, not minimum requirements:**
-- One RTX PRO 6000 Blackwell GPU with **96 GB VRAM**; **70 GiB RAM** assigned to the Ubuntu VM.
-- **Five physical NVMe devices** in three storage tiers; **1.45 TB of unique MXFP4 experts**, plus spine, checkpoint and replicas.
-- On a Mac: a MacBook Pro with an **M5 Max and 128 GB** of unified memory, its internal SSD and **two Thunderbolt 5 NVMe drives**.
-- Context caches measured up to **16,384 tokens** using sparse attention. **Equivalence to Moonshot’s reference implementation remains unvalidated.**
+- **RTX PRO 6000 (Linux, CUDA):** one RTX PRO 6000 Blackwell GPU with **96 GB VRAM**, **70 GiB RAM** assigned to the Ubuntu VM and **five physical NVMe devices** in three storage tiers. Context caches measured up to **16,384 tokens** using sparse attention.
+- **MacBook Pro (macOS, Metal):** a MacBook Pro with an **M5 Max and 128 GB** of unified memory, its internal SSD and **two Thunderbolt 5 NVMe drives**. Contexts measured up to **2,048 tokens**.
+- Both run the same engine on the same **1.45 TB of unique MXFP4 experts**, plus spine, checkpoint and replicas. **Equivalence to Moonshot’s reference implementation remains unvalidated.**
 
-Different prompts and engine versions are separate experiments, not a single controlled speed comparison. [All measurements, definitions and limits](https://argonautlabs.ai/research/kimi-k31-single-gpu.html).
+Different machines, prompts and engine versions are separate experiments, not a single controlled speed comparison. [All measurements, definitions and limits](https://argonautlabs.ai/research/kimi-k31-single-gpu.html).
 
 ### Get started
 
@@ -36,9 +36,10 @@ Different prompts and engine versions are separate experiments, not a single con
 
 [Full setup and tested hardware](https://argonautlabs.ai/research/kimi-k31-single-gpu.html#reproduce) · [Configuration guide](tools/kimi-k3/README.md)
 
-### Standard benchmark measurements
+### Standard benchmarks on the RTX PRO 6000 (Linux, CUDA)
 
-Measured on 8 November at commit b959c89, one fresh process per run, greedy, raw prompts, with the Qwen drafter:
+Measured on 8 November at commit b959c89 on one RTX PRO 6000 Blackwell (96 GB), one fresh process per run, greedy, raw prompts,
+with the Qwen drafter:
 
 | test | prefill | decode |
 |---|---|---|
@@ -51,7 +52,7 @@ The drafter gives the same tokens as plain decoding: a block's rows run the same
 positions showed no differing bit. Decode depends on how predictable the text is, and chat runs at about 2 tok/s. The 512-token
 prompt is `prompt-512-tokens.txt` from the deltafin Kimi K3 benchmark.
 
-### On a MacBook Pro (Apple silicon, Metal)
+### Standard benchmarks on a MacBook Pro M5 Max (macOS, Metal)
 
 Since 9 November the same engine runs Kimi K3.1 Pro on a MacBook Pro with an M5 Max and 128 GB of unified memory, through
 Metal, with the experts streamed from the internal SSD and two Thunderbolt 5 NVMe drives: 2.04 tok/s decode on raw
@@ -70,14 +71,14 @@ The Metal path computes with fp32 activations throughout, and the drafter's runs
 ### Architecture and validation
 
 [Argonaut Labs](https://argonautlabs.ai) built this Kimi K3 / K3.1 Pro port on top of Salvatore Sanfilippo's [ds4](https://github.com/antirez/ds4) at commit c97964b.
-The spine sits in VRAM as Q8_0, and its matmuls take fp32 activations. The 82,432 MXFP4 expert files stay on disk and move through a VRAM cache and a pinned RAM
-pool. There's no expert skipping. The drafter is off by default; `DS4_K3_QWEN=1` turns it on
+The spine is Q8_0, and its matmuls take fp32 activations. The 82,432 MXFP4 expert files stay on disk. On the GPU the spine sits in VRAM and the experts move
+through a VRAM cache and a pinned RAM pool; on a Mac the spine and one expert cache share the unified memory. There's no expert skipping. The drafter is off by default; `DS4_K3_QWEN=1` turns it on
 ([setup](tools/kimi-k3/README.md#the-optional-qwen-drafter)).
 
 <p align="center"><img src="tools/kimi-k3/images/workstation.jpg" width="760" alt="Inside the workstation: two NVIDIA RTX PRO 6000 Blackwell cards above a Hyper M.2 x16 Gen5 card"></p>
 <p align="center"><em>The workstation. The port runs on one of its two RTX PRO 6000 Blackwell cards (96 GB).</em></p>
 
-The machine is one RTX PRO 6000 Blackwell (96 GB) in a 70 GiB VM. A RAID0 of three NVMe drives (19 GB/s) has the 79,365
+The CUDA results come from one RTX PRO 6000 Blackwell (96 GB) in a 70 GiB VM. A RAID0 of three NVMe drives (19 GB/s) has the 79,365
 hottest experts, a second NVMe (6.2 GB/s) has the rest plus some copies, and a Thunderbolt NVMe (3.7 GB/s) has another 74,000
 copies.
 
@@ -87,7 +88,7 @@ bandwidth problem.
 
 K3.1's sparse attention works: each of the 24 attention layers attends to the 2,048 positions its indexer scores highest, and
 the selections match a float64 reference. The attention cache keeps what it needs to rebuild keys and values exactly, 105 KB
-per position instead of 2.95 MB. A 6,769-token prompt takes 60 s at an 8k cache and then decodes at 1.51 tok/s; a
+per position instead of 2.95 MB. On the RTX PRO 6000, a 6,769-token prompt takes 60 s at an 8k cache and then decodes at 1.51 tok/s; a
 13,167-token prompt takes 124 s and decodes at 1.48 tok/s. Up to 2,048 tokens nothing changes. To use it, cut the indexer
 weights out of the checkpoint with `tools/kimi-k3/k31_indexer_extract.py` and run with
 `DS4_K3_DSA=k31-indexer.bin DS4_K3_CACHE_CAP=16384` and `-c 16384`.

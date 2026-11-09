@@ -206,7 +206,7 @@ earlier runs, which is not part of this repository.
 | `DS4_K3_TRACE_FILLS` | unset | per-fill timeline of n decode layers (diagnostic) |
 | `DS4_K3_EXPERT_SKIP` | 0 | experimental, lossy: drop low-weight experts that are disk misses. Off; never used for the reported numbers |
 
-## What we measured (6 November 2026, Kimi K3.1 Pro)
+## What we measured on the RTX PRO 6000 (6 November 2026, Kimi K3.1 Pro)
 
 We built this from a fresh clone with the commands above and ran it on the defaults, plus `DS4_K3_EXPERT_DIR_C` for the third
 drive. That means a full-precision attention cache, the drafter off and no expert skipping. Monitoring was off.
@@ -334,7 +334,7 @@ The recipe comes from the deltafin Kimi K3 work. Three things changed for this e
   Qwen's drafts on the record prompt, 200 tokens, up to 8 rows gave 2.98 tok/s, up to 12 rows 2.97 and up to 16 rows 3.10, so a block may now take up to
   16 rows (`DS4_K3_QWEN_ROWS`). A full 16-row block takes about 3.8 s, against about 8 s for sixteen plain steps.
 
-Measured 7 November 2026 on the machine above, at commit 6808130, fresh process per run, gate 0.6, third drive on, monitoring off:
+Measured 7 November 2026 on the RTX PRO 6000 machine above, at commit 6808130, fresh process per run, gate 0.6, third drive on, monitoring off:
 
 | prompt | generated | plain tok/s | with Qwen tok/s | blocks | drafts accepted | tokens from blocks | wall per run, plain | wall per run, Qwen |
 |---|---|---|---|---|---|---|---|---|
