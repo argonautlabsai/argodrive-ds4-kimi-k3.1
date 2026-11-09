@@ -9,6 +9,19 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __APPLE__
+/* macOS has no O_DIRECT and no posix_fadvise: a private flag asks for F_NOCACHE after open (uncached reads, no alignment rules) */
+#define K3_O_DIRECT_MAC 0x40000000
+static int k3_open_mac(const char *path, int flags) {
+    const int fd = open(path, flags & ~K3_O_DIRECT_MAC);
+    if (fd >= 0 && (flags & K3_O_DIRECT_MAC)) (void)fcntl(fd, F_NOCACHE, 1);
+    return fd;
+}
+#define O_DIRECT K3_O_DIRECT_MAC
+#define open(p, f) k3_open_mac((p), (f))
+#define posix_fadvise(fd, off, len, adv) 0
+#define POSIX_FADV_DONTNEED 0
+#endif
 
 #define K3_MAX_COMPONENTS (93u * 3u)
 #define K3_BLOCK 32u
@@ -46,11 +59,66 @@ static bool g_active;
 static atomic_uint_fast64_t g_stat_reads, g_stat_bytes, g_stat_opens;
 static atomic_uint_fast64_t g_stat_reads_tier[4], g_stat_ns_tier[4];   /* per tier: primary (0) / dir_b (1) / dir_c (2) / dir_d (3) */
 
+/* step M1: experts read straight from the downloaded checkpoint (DS4_K3_EXPERT_CKPT_INDEX), for those missing from the directories */
+static int g_ckpt_n = 0, *g_ckpt_fd = NULL;
+static int16_t *g_ckpt_shard = NULL;   /* (layer << 10 | expert) -> shard or -1 */
+static uint64_t *g_ckpt_off = NULL;
+static int k3_ckpt_load(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "ds4: kimi-k3 checkpoint index %s: %s\n", path, strerror(errno)); return 0; }
+    int n = 0;
+    if (fscanf(f, "shards %d\n", &n) != 1 || n <= 0 || n > 4096) { fclose(f); return 0; }
+    g_ckpt_fd = malloc(sizeof(int) * (size_t)n);
+    g_ckpt_shard = malloc(sizeof(int16_t) * 128u * 1024u);
+    g_ckpt_off = calloc(128u * 1024u, sizeof(uint64_t));
+    if (!g_ckpt_fd || !g_ckpt_shard || !g_ckpt_off) { fclose(f); return 0; }
+    for (uint32_t i = 0; i < 128u * 1024u; i++) g_ckpt_shard[i] = -1;
+    char line[4600];
+    for (int i = 0; i < n; i++) {
+        if (!fgets(line, sizeof(line), f)) { fclose(f); return 0; }
+        line[strcspn(line, "\n")] = '\0';
+        g_ckpt_fd[i] = open(line, O_RDONLY | O_CLOEXEC | O_DIRECT);
+        if (g_ckpt_fd[i] < 0) g_ckpt_fd[i] = open(line, O_RDONLY | O_CLOEXEC);
+        if (g_ckpt_fd[i] < 0) { fprintf(stderr, "ds4: kimi-k3 checkpoint shard %s: %s\n", line, strerror(errno)); fclose(f); return 0; }
+    }
+    unsigned l, e; int sh; unsigned long long off; uint32_t count = 0;
+    while (fscanf(f, "%u %u %d %llu\n", &l, &e, &sh, &off) == 4) {
+        if (l >= 128u || e >= 1024u || sh < 0 || sh >= n) continue;
+        g_ckpt_shard[(l << 10) | e] = (int16_t)sh; g_ckpt_off[(l << 10) | e] = off; count++;
+    }
+    fclose(f);
+    g_ckpt_n = n;
+    fprintf(stderr, "ds4: kimi-k3 experts missing from the directories are read from the checkpoint: %u experts in %d shards\n", count, n);
+    return 1;
+}
+static int k3_ckpt_read(uint32_t layer, uint32_t expert, void *out, uint64_t off, uint64_t len) {
+    if (!g_ckpt_n || layer >= 128u || expert >= 1024u) return 0;
+    const int sh = g_ckpt_shard[(layer << 10) | expert];
+    if (sh < 0) return 0;
+    uint64_t got = 0;
+    while (got < len) {
+        uint64_t want = len - got;
+        if (want > ((uint64_t)1 << 30)) want = (uint64_t)1 << 30;   /* Darwin's pread refuses more than INT_MAX */
+        const ssize_t r = pread(g_ckpt_fd[sh], (uint8_t *)out + got, (size_t)want, (off_t)(g_ckpt_off[(layer << 10) | expert] + off + got));
+        if (r <= 0) { if (r < 0 && errno == EINTR) continue; return 0; }
+        got += (uint64_t)r;
+    }
+    return 1;
+}
 void ds4_k3_expert_source_configure(const char *primary_dir, const char *dir_b, uint64_t file_bytes) {
+    {   /* step M1: the machine's own expert directories */
+        const char *ep = getenv("DS4_K3_EXPERT_DIR"), *eb = getenv("DS4_K3_EXPERT_DIR_B");
+        if (ep) primary_dir = ep;
+        if (eb) dir_b = eb[0] ? eb : NULL;
+    }
     snprintf(g_primary, sizeof(g_primary), "%s", primary_dir ? primary_dir : "");
     snprintf(g_dir_b, sizeof(g_dir_b), "%s", dir_b ? dir_b : "");
     g_file_bytes = file_bytes;
     g_active = g_primary[0] != '\0';
+    {   /* step M1 */
+        const char *ci = getenv("DS4_K3_EXPERT_CKPT_INDEX");
+        if (ci && ci[0] && k3_ckpt_load(ci)) g_active = true;
+    }
     g_dir_c[0] = '\0';
     const char *dc = getenv("DS4_K3_EXPERT_DIR_C");
     if (dc && dc[0]) {
@@ -445,6 +513,12 @@ int ds4_k3_expert_source_read_range_tier(uint32_t layer, uint32_t expert, void *
         const int fd = k3_open_expert_tier(layer, expert, attempt == 0 ? O_DIRECT : 0, want_tier, &tier);
         if (fd < 0) {
             if (attempt == 0 && errno == EINVAL) continue;
+            if (errno == ENOENT && g_ckpt_n) {   /* step M1: straight from the checkpoint */
+                if (!k3_ckpt_read(layer, expert, out, off, len)) return 0;
+                if (tier_used) *tier_used = 3;
+                atomic_fetch_add(&g_stat_reads, 1); atomic_fetch_add(&g_stat_bytes, len); atomic_fetch_add(&g_stat_reads_tier[3], 1);
+                return 1;
+            }
             return 0;
         }
         struct timespec t0, t1;
@@ -480,6 +554,15 @@ int ds4_k3_expert_source_read_file_tier(uint32_t layer, uint32_t expert, void *o
         const int fd = k3_open_expert_flags2(layer, expert, attempt == 0 ? O_DIRECT : 0, prefer_c, &tier);
         if (fd < 0) {
             if (attempt == 0 && errno == EINVAL) continue;   /* filesystem refuses O_DIRECT: buffered */
+            if (errno == ENOENT && g_ckpt_n) {   /* step M1: straight from the checkpoint */
+                struct timespec c0, c1;
+                clock_gettime(CLOCK_MONOTONIC, &c0);
+                if (!k3_ckpt_read(layer, expert, out, 0, g_file_bytes)) return 0;
+                clock_gettime(CLOCK_MONOTONIC, &c1);
+                atomic_fetch_add(&g_stat_reads, 1); atomic_fetch_add(&g_stat_bytes, g_file_bytes); atomic_fetch_add(&g_stat_reads_tier[3], 1);
+                atomic_fetch_add(&g_stat_ns_tier[3], (uint64_t)(c1.tv_sec - c0.tv_sec) * 1000000000ull + (uint64_t)(c1.tv_nsec - c0.tv_nsec));
+                return 1;
+            }
             return 0;
         }
         struct stat st;

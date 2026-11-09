@@ -203,8 +203,18 @@ int ds4_gpu_device_cache_support_tensors(int device_id,
     (void)device_id; (void)exec_device_id; (void)ranges;
     (void)n_ranges; (void)main_model; return 0;
 }
+#if defined(__APPLE__)
+int ds4_gpu_k3_matmul_q8_0_f32gemm_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset,
+                                          uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok);
+uint64_t ds4_gpu_metal_free_bytes(void);   /* step M5: unified memory left under the GPU working-set limit */
+#endif
 uint64_t ds4_gpu_tier_free_vram(int logical_tier) {
-    (void)logical_tier; return 0;
+    (void)logical_tier;
+#if defined(__APPLE__)
+    return ds4_gpu_metal_free_bytes();
+#else
+    return 0;
+#endif
 }
 int ds4_gpu_device_cache_tensors(int device_id,
                                   const ds4_tensor_range *ranges,
@@ -61574,6 +61584,24 @@ static bool k3_gpu_zero(ds4_gpu_tensor *t, uint64_t bytes) {
     return ok;
 }
 
+static bool k3_overlap_on(void) {   /* step M20 */
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DS4_K3_OVERLAP"); on = e ? atoi(e) != 0 : 1;
+#if !defined(__APPLE__)
+        on = 0;
+#endif
+        if (on) fprintf(stderr, "ds4: K3 on Metal: the shared expert and the cached routed experts run while the missed experts are read (step M20)\n"); }
+    return on != 0;
+}
+static bool k3_lookahead_on(void) {   /* step M24 */
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DS4_K3_LOOKAHEAD"); on = e ? atoi(e) != 0 : 1;
+#if !defined(__APPLE__)
+        on = 0;   /* the Metal slab cache's prefetch; the CUDA engine has its own */
+#endif
+        if (on) fprintf(stderr, "ds4: K3: router lookahead hints for the next layer's prefetch (step M24)\n"); }
+    return on != 0;
+}
 static bool k3_gpu_matmul(ds4_gpu_tensor *out, const ds4_model *model, const ds4_tensor *w, const ds4_gpu_tensor *x) {
     if (w->type == DS4_TENSOR_F32) {
         return ds4_gpu_matmul_f32_tensor(out, model->map, model->size, w->abs_offset, w->dim[0], w->dim[1], x, 1) != 0;
@@ -61597,7 +61625,10 @@ static double k3_trace_mark(const ds4_gpu_tensor *t) {
     if (t) ds4_gpu_tensor_read(t, 0, &dummy, sizeof(dummy));
     return now_sec();
 }
-static void k3_trace_acc(const char *key, double secs) {
+static uint32_t g_k3_trace_rows = 0;   /* dev5: verify-block rows appended to keys without n= */
+static void k3_trace_acc(const char *key0, double secs) {
+    char keyb[96]; const char *key = key0;
+    if (g_k3_trace_rows && !strstr(key0, "n=")) { snprintf(keyb, sizeof(keyb), "%s n=%u", key0, g_k3_trace_rows); key = keyb; }
     for (int i = 0; i < g_k3_trace_n; i++) {
         if (!strcmp(g_k3_trace[i].key, key)) { g_k3_trace[i].calls++; g_k3_trace[i].secs += secs; return; }
     }
@@ -61647,7 +61678,7 @@ static bool k3_gpu_matmul_n_impl(ds4_gpu_tensor *out, const ds4_model *model, co
                                  uint32_t n_tok) {
     if (w->type == DS4_TENSOR_F32 && g_k3_verify_on && n_tok > 1u) {   /* step 80: the single-row call, as a plain step makes it */
         const uint64_t in_bytes = (uint64_t)w->dim[0] * sizeof(float), out_bytes = (uint64_t)w->dim[1] * sizeof(float);
-        if (x->bytes < in_bytes * n_tok || out->bytes < out_bytes * n_tok) return false;
+        if (ds4_gpu_tensor_bytes(x) < in_bytes * n_tok || ds4_gpu_tensor_bytes(out) < out_bytes * n_tok) return false;
         if (k3_rows_gemv_on()) {   /* step 91: the single-row kernel for all rows in one launch */
             const int rc = ds4_gpu_k3_matmul_f32_rows_tensor(out, model->map, model->size, w->abs_offset, w->dim[0], w->dim[1], x, n_tok);
             if (rc >= 0) return rc > 0;
@@ -61676,7 +61707,7 @@ static bool k3_gpu_matmul_n_impl(ds4_gpu_tensor *out, const ds4_model *model, co
     }
     if (n_tok > 1u && n_tok <= (uint32_t)loop_max) {
         const uint64_t in_bytes = (uint64_t)w->dim[0] * sizeof(float), out_bytes = (uint64_t)w->dim[1] * sizeof(float);
-        if (x->bytes < in_bytes * n_tok || out->bytes < out_bytes * n_tok) return false;
+        if (ds4_gpu_tensor_bytes(x) < in_bytes * n_tok || ds4_gpu_tensor_bytes(out) < out_bytes * n_tok) return false;
         if (w->type == DS4_TENSOR_Q8_0 && k3_rows_gemv_on()) {   /* step 91: the single-row GEMV's arithmetic, each weight read once per 8 rows */
             const int rc = ds4_gpu_k3_matmul_q8_0_rows_tensor(out, model->map, model->size, w->abs_offset, w->dim[0], w->dim[1], x, n_tok);
             if (rc >= 0) return rc > 0;
@@ -61690,6 +61721,13 @@ static bool k3_gpu_matmul_n_impl(ds4_gpu_tensor *out, const ds4_model *model, co
         }
         return true;
     }
+#if defined(__APPLE__)
+    if (w->type == DS4_TENSOR_Q8_0) {   /* step M13: fp32 GEMM (the generic batched Metal kernels round to half) */
+        static int f32g = -1;
+        if (f32g < 0) { const char *e = getenv("DS4_K3_METAL_F32_GEMM"); f32g = e ? atoi(e) != 0 : 1; }
+        if (f32g) return ds4_gpu_k3_matmul_q8_0_f32gemm_tensor(out, model->map, model->size, w->abs_offset, w->dim[0], w->dim[1], x, n_tok) != 0;
+    }
+#endif
     return ds4_gpu_matmul_quant_tensor(out, model->map, model->size, w->abs_offset, w->type, w->dim[0], w->dim[1], x,
                                        n_tok) != 0;
 }
@@ -61824,6 +61862,9 @@ static bool k3_lat_sel_on(void) {   /* step 107, see patch_step107.py */
         const char *e = getenv("DS4_K3_LAT_SEL"), *fa = getenv("DS4_K3_F32_ACT");
         const int f32 = fa ? (fa[0] && strcmp(fa, "0") != 0) : 1;
         on = (e ? (e[0] && strcmp(e, "0") != 0) : 1) && f32;
+#if defined(__APPLE__)
+        on = 0;   /* the Metal port replays the latent cache as step 96 did (step 107's chain and replay kernels are CUDA's) */
+#endif
         if (on) fprintf(stderr, "ds4: kimi-k3 latent replay (step 107): kv_b of prompt batches as one in-order FMA chain per row; rebuilds compute only the positions the attention reads\n");
     }
     return on != 0;
@@ -61916,6 +61957,16 @@ static bool k3_lat_rebuild(const ds4_model *model, const ds4_layer_weights *l, u
     return true;
 }
 
+/* DS4_K3_STAGE_CHECK=N (Metal port check, 8 Nov 2026): at position 0, layers < N, each stage's GPU input is read back and the
+   stage is recomputed by the CPU reference from it; prints the relative error of the GPU output per stage */
+static int k3_stage_check_layers(void) { static int n = -2; if (n == -2) { const char *e = getenv("DS4_K3_STAGE_CHECK"); n = e ? atoi(e) : 0; } return n; }
+static float *k3_sc_read(const ds4_gpu_tensor *t, uint64_t n) { float *h = xmalloc(n * sizeof(float)); if (ds4_gpu_tensor_read(t, 0, h, n * sizeof(float)) == 0) memset(h, 0, n * sizeof(float)); return h; }
+static void k3_sc_report(uint32_t il, const char *stage, const float *gpu, const float *cpu, uint64_t n) {
+    double num = 0.0, den = 0.0, mx = 0.0; uint64_t at = 0;
+    for (uint64_t i = 0; i < n; i++) { const double d = (double)gpu[i] - (double)cpu[i]; num += d * d; den += (double)cpu[i] * cpu[i]; if (fabs(d) > mx) { mx = fabs(d); at = i; } }
+    fprintf(stderr, "ds4: K3 stage check layer %u %-22s rel err %.3e, max abs %.3e at %llu (gpu %.7g cpu %.7g)\n", il, stage,
+            den > 0 ? sqrt(num / den) : sqrt(num), mx, (unsigned long long)at, gpu[at], cpu[at]);
+}
 static bool k3_gpu_layer(k3_gpu_buffers *b, const ds4_model *model, const ds4_layer_weights *l, uint32_t il,
                          uint32_t pos, uint32_t *n_anchor) {
     const uint32_t n = DS4_N_EMBD;
@@ -61940,6 +61991,14 @@ static bool k3_gpu_layer(k3_gpu_buffers *b, const ds4_model *model, const ds4_la
         have_prefix = false;
     }
     K3_GPU_CHECK(k3_gpu_rms_norm(b->normed, b->attn_in, model, l->attn_norm, n), "attn norm");
+    const bool sc = pos == 0 && (int)il < k3_stage_check_layers();
+    float *sc_normed = NULL;
+    if (sc) {
+        float *ai = k3_sc_read(b->attn_in, n), *g = k3_sc_read(b->normed, n), *c = xmalloc(n * sizeof(float));
+        rms_norm_weight(c, ai, tensor_data(model, l->attn_norm), n, DS4_RMS_EPS);
+        k3_sc_report(il, "attn rms norm", g, c, n);
+        sc_normed = g; free(ai); free(c);
+    }
     if (ds4_k3_layer_is_kda(il)) {
         K3_GPU_CHECK(k3_gpu_matmul(b->kda_q, model, l->kda_q, b->normed), "kda q");
         K3_GPU_CHECK(k3_gpu_matmul(b->kda_k, model, l->kda_k, b->normed), "kda k");
@@ -61956,6 +62015,17 @@ static bool k3_gpu_layer(k3_gpu_buffers *b, const ds4_model *model, const ds4_la
                      g_ds4_shape.kda_a_log_per_channel ? 1 : 0) != 0, "kda decode");
         K3_GPU_CHECK(k3_gpu_matmul(b->attn_out, model, l->kda_output, b->kda_out), "kda output");
         (void)proj;
+        if (sc) {   /* the KDA step from the GPU's normed input, fresh state (position 0) */
+            const uint32_t heads = DS4_N_KDA_HEAD, dim = DS4_N_KDA_HEAD_DIM, pj = heads * dim;
+            k3_cpu_kda_state st = { xcalloc((size_t)3 * 3 * pj, sizeof(float)), xcalloc((size_t)heads * dim * dim, sizeof(float)) };
+            float *c = xmalloc(n * sizeof(float)), *g = k3_sc_read(b->attn_out, n);
+            k3_cpu_kda_one(c, model, l, sc_normed, &st);
+            k3_sc_report(il, "KDA attention", g, c, n);
+            { float *q = k3_sc_read(b->kda_q, pj), *cq = xmalloc(pj * sizeof(float)); matvec_q8_0(cq, model, l->kda_q, sc_normed); k3_sc_report(il, "  kda q vs int8-act CPU", q, cq, pj);
+              matvec_q8_0_f32_ref(cq, model, l->kda_q, sc_normed); k3_sc_report(il, "  kda q vs fp32 CPU", q, cq, pj); free(q); free(cq); }
+            { float *ko = k3_sc_read(b->kda_out, pj), *co = xmalloc(n * sizeof(float)); matvec_q8_0_f32_ref(co, model, l->kda_output, ko); k3_sc_report(il, "  kda out vs fp32 CPU", g, co, n); free(ko); free(co); }
+            free(st.conv_hist); free(st.state); free(c); free(g);
+        }
     } else {
         K3_GPU_CHECK(k3_gpu_matmul(b->q_a, model, l->attn_q_a, b->normed), "mla q_a");
         K3_GPU_CHECK(k3_gpu_rms_norm(b->q_an, b->q_a, model, l->attn_q_a_norm, DS4_N_LORA_Q), "mla q_a norm");
@@ -62014,6 +62084,16 @@ static bool k3_gpu_layer(k3_gpu_buffers *b, const ds4_model *model, const ds4_la
     K3_GPU_CHECK(ds4_gpu_k3_residual_mix_tensor(b->mixed, b->prefix, b->anchors, *n_anchor, model->map, model->size,
                  l->res_ffn_norm->abs_offset, l->res_ffn_proj->abs_offset, n, DS4_RMS_EPS) != 0, "ffn residual mix");
     K3_GPU_CHECK(k3_gpu_rms_norm(b->normed, b->mixed, model, l->ffn_norm, n), "ffn norm");
+    float *sc_fnormed = NULL;
+    if (sc) {
+        float *pf = k3_sc_read(b->prefix, n), *an = k3_sc_read(b->anchors, (uint64_t)(*n_anchor) * n), *mx = k3_sc_read(b->mixed, n), *c = xmalloc(n * sizeof(float));
+        k3_cpu_residual_mix(c, pf, an, *n_anchor, tensor_data(model, l->res_ffn_norm), tensor_data(model, l->res_ffn_proj));
+        k3_sc_report(il, "ffn residual mix", mx, c, n);
+        float *g = k3_sc_read(b->normed, n);
+        rms_norm_weight(c, mx, tensor_data(model, l->ffn_norm), n, DS4_RMS_EPS);
+        k3_sc_report(il, "ffn rms norm", g, c, n);
+        sc_fnormed = g; free(pf); free(an); free(mx); free(c);
+    }
     if (il < DS4_N_LEADING_DENSE) {
         const uint32_t ffd = DS4_N_FF_DENSE;
         K3_GPU_CHECK(k3_gpu_matmul(b->dense_gate, model, l->ffn_gate, b->normed), "dense gate");
@@ -62022,6 +62102,11 @@ static bool k3_gpu_layer(k3_gpu_buffers *b, const ds4_model *model, const ds4_la
         K3_GPU_CHECK(k3_gpu_matmul(b->ffn_out, model, l->ffn_down, b->dense_mid), "dense down");
     } else {
         K3_GPU_CHECK(k3_gpu_matmul(b->router_logits, model, l->ffn_gate_inp, b->normed), "router logits");
+        const ds4_layer_weights *lnx = l + 1;
+        static int la_row1 = -1;   /* plain steps compute the hint only when they may prefetch (DS4_K3_METAL_PREFETCH_ROW1 > 0) */
+        if (la_row1 < 0) { const char *e = getenv("DS4_K3_METAL_PREFETCH_ROW1"); la_row1 = e ? atoi(e) > 0 : 1; }
+        const bool la = la_row1 && k3_lookahead_on() && il + 1u < g_ds4_shape.n_layer && il + 1u >= DS4_N_LEADING_DENSE && lnx->ffn_gate_inp && lnx->ffn_exp_probs_b;
+        if (la) K3_GPU_CHECK(k3_gpu_matmul(b->router_probs, model, lnx->ffn_gate_inp, b->normed), "lookahead router");   /* step M24 */
         /* Host-side routing: the GLM router kernel caps n_expert at 384 and K3 has 896. Mirrors the CPU
          * reference exactly: scores = sigmoid(logits), top-k by scores + e_score_correction_bias, weights =
          * the selected sigmoid scores renormalised to sum 1 (no extra scale). 3.5 KB readback per MoE layer. */
@@ -62035,6 +62120,14 @@ static bool k3_gpu_layer(k3_gpu_buffers *b, const ds4_model *model, const ds4_la
             K3_GPU_CHECK(bias != NULL, "router bias");
             k3_route_host(logits_h, bias, selected, weights);
         }
+        if (la) {   /* step M24: the batch above completed both GEMVs; this read waits for nothing */
+            float lg[1024]; int32_t pred[32];
+            const float *bn = tensor_data(model, lnx->ffn_exp_probs_b);
+            if (bn && ds4_gpu_tensor_read(b->router_probs, 0, lg, sizeof(float) * DS4_N_EXPERT) != 0) {
+                k3_spec_rank32(lg, bn, pred);
+                ds4_gpu_k3_prefetch_hint(il + 1u, pred, 32u);
+            }
+        }
         if (g_k3_spec_mode < 0) {   /* step 51b: the observer feeds the decode prefetch, which is on by default */
             const char *pf = getenv("DS4_K3_PREFETCH");
             g_k3_spec_mode = (getenv("DS4_K3_SPEC_TRACE") || !pf || (strcmp(pf, "0") != 0 && strcmp(pf, "off") != 0)) ? 1 : 0;
@@ -62047,6 +62140,14 @@ static bool k3_gpu_layer(k3_gpu_buffers *b, const ds4_model *model, const ds4_la
             fflush(stdout);
         }
         K3_GPU_CHECK(k3_gpu_matmul(b->moe_latent, model, l->moe_latent_down, b->normed), "latent down");
+        const bool ovl = k3_overlap_on();
+        const uint32_t sh = (uint32_t)l->ffn_gate_shexp->dim[1];
+        if (ovl) {   /* step M20: before the routed experts, so it runs while their reads are in flight */
+            K3_GPU_CHECK(k3_gpu_matmul(b->sh_gate, model, l->ffn_gate_shexp, b->normed), "shared gate");
+            K3_GPU_CHECK(k3_gpu_matmul(b->sh_up, model, l->ffn_up_shexp, b->normed), "shared up");
+            K3_GPU_CHECK(ds4_gpu_k3_situ_tensor(b->sh_mid, b->sh_gate, b->sh_up, sh, sb, sbl) != 0, "shared situ");
+            K3_GPU_CHECK(k3_gpu_matmul(b->sh_down, model, l->ffn_down_shexp, b->sh_mid), "shared down");
+        }
         if (getenv("DS4_K3_MOE_LEGACY")) {
             K3_GPU_CHECK(ds4_gpu_k3_moe_tensor(b->routed, b->moe_latent, selected, weights, DS4_N_EXPERT_USED,
                          l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset, l->ffn_down_exps->abs_offset,
@@ -62057,14 +62158,21 @@ static bool k3_gpu_layer(k3_gpu_buffers *b, const ds4_model *model, const ds4_la
         }
         K3_GPU_CHECK(k3_gpu_rms_norm(b->routed_norm, b->routed, model, l->moe_latent_norm, latent), "latent norm");
         K3_GPU_CHECK(k3_gpu_matmul(b->moe_up, model, l->moe_latent_up, b->routed_norm), "latent up");
-        const uint32_t sh = (uint32_t)l->ffn_gate_shexp->dim[1];
-        K3_GPU_CHECK(k3_gpu_matmul(b->sh_gate, model, l->ffn_gate_shexp, b->normed), "shared gate");
-        K3_GPU_CHECK(k3_gpu_matmul(b->sh_up, model, l->ffn_up_shexp, b->normed), "shared up");
-        K3_GPU_CHECK(ds4_gpu_k3_situ_tensor(b->sh_mid, b->sh_gate, b->sh_up, sh, sb, sbl) != 0, "shared situ");
-        K3_GPU_CHECK(k3_gpu_matmul(b->sh_down, model, l->ffn_down_shexp, b->sh_mid), "shared down");
+        if (!ovl) {
+            K3_GPU_CHECK(k3_gpu_matmul(b->sh_gate, model, l->ffn_gate_shexp, b->normed), "shared gate");
+            K3_GPU_CHECK(k3_gpu_matmul(b->sh_up, model, l->ffn_up_shexp, b->normed), "shared up");
+            K3_GPU_CHECK(ds4_gpu_k3_situ_tensor(b->sh_mid, b->sh_gate, b->sh_up, sh, sb, sbl) != 0, "shared situ");
+            K3_GPU_CHECK(k3_gpu_matmul(b->sh_down, model, l->ffn_down_shexp, b->sh_mid), "shared down");
+        }
         K3_GPU_CHECK(ds4_gpu_add_tensor(b->ffn_out, b->moe_up, b->sh_down, n) != 0, "moe + shared");
     }
     K3_GPU_CHECK(ds4_gpu_add_tensor(b->cur, b->prefix, b->ffn_out, n) != 0, "layer residual");
+    if (sc) {
+        float *g = k3_sc_read(b->ffn_out, n), *c = xmalloc(n * sizeof(float));
+        if (il < DS4_N_LEADING_DENSE) k3_cpu_dense_one(c, model, l, sc_fnormed); else k3_cpu_moe_one(c, model, l, sc_fnormed);
+        k3_sc_report(il, il < DS4_N_LEADING_DENSE ? "dense FFN" : "MoE (routed + shared)", g, c, n);
+        free(g); free(c); free(sc_fnormed); free(sc_normed);
+    }
     return true;
 }
 
@@ -62252,8 +62360,8 @@ static bool k3_gpu_layer_batch(k3_gpu_buffers *b, k3_gpu_batch *bb, const ds4_mo
                          l->kda_a_log->abs_offset, l->kda_dt_bias->abs_offset, l->kda_o_norm->abs_offset,
                          DS4_N_KDA_HEAD, DS4_KDA_GATE_LOWER_BOUND, DS4_RMS_EPS,
                          g_ds4_shape.kda_a_log_per_channel ? 1 : 0, ckpt_row) != 0, "kda decode (prefix)");
-            K3_GPU_CHECK(ds4_gpu_tensor_read(b->kda_conv[il], 0, ck_conv[il], b->kda_conv[il]->bytes) != 0 &&
-                         ds4_gpu_tensor_read(b->kda_state[il], 0, ck_state[il], b->kda_state[il]->bytes) != 0, "kda checkpoint read");
+            K3_GPU_CHECK(ds4_gpu_tensor_read(b->kda_conv[il], 0, ck_conv[il], ds4_gpu_tensor_bytes(b->kda_conv[il])) != 0 &&
+                         ds4_gpu_tensor_read(b->kda_state[il], 0, ck_state[il], ds4_gpu_tensor_bytes(b->kda_state[il])) != 0, "kda checkpoint read");
             ds4_gpu_tensor *vo = ds4_gpu_tensor_view(bb->kda_out, (uint64_t)ckpt_row * proj * 4u, (uint64_t)rest * proj * 4u);
             ds4_gpu_tensor *vq = ds4_gpu_tensor_view(bb->kda_q, (uint64_t)ckpt_row * proj * 4u, (uint64_t)rest * proj * 4u);
             ds4_gpu_tensor *vk = ds4_gpu_tensor_view(bb->kda_k, (uint64_t)ckpt_row * proj * 4u, (uint64_t)rest * proj * 4u);
@@ -62352,6 +62460,16 @@ static bool k3_gpu_layer_batch(k3_gpu_buffers *b, k3_gpu_batch *bb, const ds4_mo
         K3_GPU_CHECK(DS4_N_EXPERT <= 1024u && DS4_N_EXPERT_USED <= 64u, "router dims");
         if (timing) tl1 = k3_pf_mark(bb->normed);
         K3_GPU_CHECK(k3_gpu_matmul_n(bb->router_logits, model, l->ffn_gate_inp, bb->normed, T), "router logits");
+        /* step M24: the next layer's router on this layer's router input, in the same batch (blocks of up to 16 rows) */
+        static ds4_gpu_tensor *rnext = NULL; static uint32_t rnext_cap = 0;
+        const ds4_layer_weights *lnx = l + 1;
+        bool la = k3_lookahead_on() && T <= 16u && il + 1u < g_ds4_shape.n_layer && il + 1u >= DS4_N_LEADING_DENSE && lnx->ffn_gate_inp && lnx->ffn_exp_probs_b;
+        if (la && rnext_cap < T) {
+            if (rnext) { K3_GPU_CHECK(ds4_gpu_synchronize() != 0, "lookahead buffer"); ds4_gpu_tensor_free(rnext); }
+            rnext = ds4_gpu_tensor_alloc((uint64_t)16u * DS4_N_EXPERT * sizeof(float)); rnext_cap = rnext ? 16u : 0u;
+            la = rnext != NULL;
+        }
+        if (la) K3_GPU_CHECK(k3_gpu_matmul_n(rnext, model, lnx->ffn_gate_inp, bb->normed, T), "lookahead router");
         float *rl = xmalloc((size_t)T * DS4_N_EXPERT * sizeof(float));
         int32_t *sel = xmalloc((size_t)T * DS4_N_EXPERT_USED * sizeof(int32_t));
         float *wts = xmalloc((size_t)T * DS4_N_EXPERT_USED * sizeof(float));
@@ -62363,6 +62481,23 @@ static bool k3_gpu_layer_batch(k3_gpu_buffers *b, k3_gpu_batch *bb, const ds4_mo
             for (uint32_t t = 0; t < T; t++) {
                 k3_route_host(rl + (size_t)t * DS4_N_EXPERT, bias, sel + (size_t)t * DS4_N_EXPERT_USED,
                               wts + (size_t)t * DS4_N_EXPERT_USED);
+            }
+            if (la) {   /* step M24: experts of layer il+1 by how many rows predict them */
+                const float *bn = tensor_data(model, lnx->ffn_exp_probs_b);
+                float *pl = xmalloc((size_t)T * DS4_N_EXPERT * sizeof(float));
+                if (bn && ds4_gpu_tensor_read(rnext, 0, pl, (uint64_t)T * DS4_N_EXPERT * sizeof(float)) != 0) {
+                    uint32_t cnt[1024]; memset(cnt, 0, sizeof cnt);
+                    for (uint32_t t = 0; t < T; t++) {
+                        int32_t ps[64]; float pw[64];
+                        k3_route_host(pl + (size_t)t * DS4_N_EXPERT, bn, ps, pw);
+                        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) if (ps[i] >= 0 && ps[i] < 1024) cnt[ps[i]]++;
+                    }
+                    int32_t list[32]; uint32_t m = 0;
+                    for (uint32_t c = T; c >= 1u && m < 32u; c--)
+                        for (uint32_t e = 0; e < DS4_N_EXPERT && m < 32u; e++) if (cnt[e] == c) list[m++] = (int32_t)e;
+                    ds4_gpu_k3_prefetch_hint(il + 1u, list, m);
+                }
+                free(pl);
             }
             if (getenv("DS4_K3_TRACE_ROUTES")) {
                 for (uint32_t t = 0; t < T; t++) {
@@ -62379,6 +62514,14 @@ static bool k3_gpu_layer_batch(k3_gpu_buffers *b, k3_gpu_batch *bb, const ds4_mo
                 k3_prefill_hint_next(bb, model, l + 1, il + 1u, T);
         }
         if (timing) tl2 = k3_pf_mark(bb->moe_latent);
+        const bool ovl = k3_overlap_on();
+        const uint32_t sh = (uint32_t)l->ffn_gate_shexp->dim[1];
+        if (ok && ovl) {   /* step M20: before the routed experts, so it runs while their reads are in flight */
+            ok = k3_gpu_matmul_n(bb->sh_gate, model, l->ffn_gate_shexp, bb->normed, T) &&
+                 k3_gpu_matmul_n(bb->sh_up, model, l->ffn_up_shexp, bb->normed, T) &&
+                 ds4_gpu_k3_situ_tensor(bb->sh_mid, bb->sh_gate, bb->sh_up, T * sh, sb, sbl) != 0 &&
+                 k3_gpu_matmul_n(bb->sh_down, model, l->ffn_down_shexp, bb->sh_mid, T);
+        }
         if (ok) {
             const double tmoe = g_k3_trace_on ? k3_trace_mark(bb->moe_latent) : 0.0;
             ok = ds4_gpu_k3_moe_raw_batch_tensor(bb->routed, bb->moe_latent, sel, wts, T, DS4_N_EXPERT_USED, il,
@@ -62389,11 +62532,12 @@ static bool k3_gpu_layer_batch(k3_gpu_buffers *b, k3_gpu_batch *bb, const ds4_mo
         K3_GPU_CHECK(ok, "routed experts (batched raw pipeline)");
         K3_GPU_CHECK(k3_gpu_rms_norm_rows(bb->routed_norm, bb->routed, model, l->moe_latent_norm, latent, T), "latent norm");
         K3_GPU_CHECK(k3_gpu_matmul_n(bb->moe_up, model, l->moe_latent_up, bb->routed_norm, T), "latent up");
-        const uint32_t sh = (uint32_t)l->ffn_gate_shexp->dim[1];
-        K3_GPU_CHECK(k3_gpu_matmul_n(bb->sh_gate, model, l->ffn_gate_shexp, bb->normed, T), "shared gate");
-        K3_GPU_CHECK(k3_gpu_matmul_n(bb->sh_up, model, l->ffn_up_shexp, bb->normed, T), "shared up");
-        K3_GPU_CHECK(ds4_gpu_k3_situ_tensor(bb->sh_mid, bb->sh_gate, bb->sh_up, T * sh, sb, sbl) != 0, "shared situ");
-        K3_GPU_CHECK(k3_gpu_matmul_n(bb->sh_down, model, l->ffn_down_shexp, bb->sh_mid, T), "shared down");
+        if (!ovl) {
+            K3_GPU_CHECK(k3_gpu_matmul_n(bb->sh_gate, model, l->ffn_gate_shexp, bb->normed, T), "shared gate");
+            K3_GPU_CHECK(k3_gpu_matmul_n(bb->sh_up, model, l->ffn_up_shexp, bb->normed, T), "shared up");
+            K3_GPU_CHECK(ds4_gpu_k3_situ_tensor(bb->sh_mid, bb->sh_gate, bb->sh_up, T * sh, sb, sbl) != 0, "shared situ");
+            K3_GPU_CHECK(k3_gpu_matmul_n(bb->sh_down, model, l->ffn_down_shexp, bb->sh_mid, T), "shared down");
+        }
         K3_GPU_CHECK(ds4_gpu_add_tensor(bb->ffn_out, bb->moe_up, bb->sh_down, T * n) != 0, "moe + shared");
     }
     K3_GPU_CHECK(ds4_gpu_add_tensor(bb->cur, bb->prefix, bb->ffn_out, T * n) != 0, "layer residual");
@@ -62654,8 +62798,8 @@ static uint64_t k3_gpu_pass_extra_fixed(uint32_t T) {
 static bool k3_kda_states_read(const k3_gpu_buffers *b, float **ck_conv, float **ck_state) {
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (!ds4_k3_layer_is_kda(il) || !ck_conv[il] || !ck_state[il]) continue;
-        if (ds4_gpu_tensor_read(b->kda_conv[il], 0, ck_conv[il], b->kda_conv[il]->bytes) == 0 ||
-            ds4_gpu_tensor_read(b->kda_state[il], 0, ck_state[il], b->kda_state[il]->bytes) == 0) return false;
+        if (ds4_gpu_tensor_read(b->kda_conv[il], 0, ck_conv[il], ds4_gpu_tensor_bytes(b->kda_conv[il])) == 0 ||
+            ds4_gpu_tensor_read(b->kda_state[il], 0, ck_state[il], ds4_gpu_tensor_bytes(b->kda_state[il])) == 0) return false;
     }
     return true;
 }
@@ -63063,9 +63207,9 @@ static bool k3_ckpt_save(const k3_gpu_buffers *b, const int *ids, int n) {
     /* size it first */
     uint64_t bytes = 0;
     for (uint32_t il = 0; il < L; il++) {
-        if (ds4_k3_layer_is_kda(il)) { bytes += b->kda_conv[il]->bytes + b->kda_state[il]->bytes; }
+        if (ds4_k3_layer_is_kda(il)) { bytes += ds4_gpu_tensor_bytes(b->kda_conv[il]) + ds4_gpu_tensor_bytes(b->kda_state[il]); }
         else if (k3_lat_on()) { bytes += ((uint64_t)(576u + 512u) * 4u + (b->idx_cache ? 512u : 0u)) * (uint64_t)n; }   /* step 96b */
-        else { bytes += (b->key_cache[il]->bytes / b->cache_cap + b->value_cache[il]->bytes / b->cache_cap + (b->idx_cache ? 512u : 0u)) * (uint64_t)n; }
+        else { bytes += (ds4_gpu_tensor_bytes(b->key_cache[il]) / b->cache_cap + ds4_gpu_tensor_bytes(b->value_cache[il]) / b->cache_cap + (b->idx_cache ? 512u : 0u)) * (uint64_t)n; }
     }
     if (k3_lat_on()) {   /* step 96b: the prompt batches that positions before n came from */
         uint32_t n_mla = 0; for (uint32_t il = 0; il < L; il++) if (!ds4_k3_layer_is_kda(il)) n_mla++;
@@ -63108,7 +63252,7 @@ static bool k3_ckpt_save(const k3_gpu_buffers *b, const int *ids, int n) {
         bool ok = true;
         for (uint32_t il = 0; il < L && ok; il++) {
             if (ds4_k3_layer_is_kda(il)) {
-                c->conv_b[il] = b->kda_conv[il]->bytes; c->state_b[il] = b->kda_state[il]->bytes;
+                c->conv_b[il] = ds4_gpu_tensor_bytes(b->kda_conv[il]); c->state_b[il] = ds4_gpu_tensor_bytes(b->kda_state[il]);
                 if (g_k3_ckpt_host_conv && g_k3_ckpt_host_state && g_k3_ckpt_host_conv[il] && g_k3_ckpt_host_state[il]) {
                     c->conv[il] = g_k3_ckpt_host_conv[il]; c->state[il] = g_k3_ckpt_host_state[il];   /* ownership moves here */
                     g_k3_ckpt_host_conv[il] = NULL; g_k3_ckpt_host_state[il] = NULL;
@@ -63130,7 +63274,7 @@ static bool k3_ckpt_save(const k3_gpu_buffers *b, const int *ids, int n) {
                     ok = ds4_gpu_tensor_read(g_k3_lat.ch[i].in[il], 0, sc->in[il], (uint64_t)sc->len * 512u * 4u) != 0;
                 }
             } else {
-                c->key_row_b[il] = b->key_cache[il]->bytes / b->cache_cap; c->val_row_b[il] = b->value_cache[il]->bytes / b->cache_cap;
+                c->key_row_b[il] = ds4_gpu_tensor_bytes(b->key_cache[il]) / b->cache_cap; c->val_row_b[il] = ds4_gpu_tensor_bytes(b->value_cache[il]) / b->cache_cap;
                 c->key[il] = xmalloc(c->key_row_b[il] * (size_t)n); c->value[il] = xmalloc(c->val_row_b[il] * (size_t)n);
                 ok = ds4_gpu_tensor_read(b->key_cache[il], 0, c->key[il], c->key_row_b[il] * (uint64_t)n) != 0 &&
                      ds4_gpu_tensor_read(b->value_cache[il], 0, c->value[il], c->val_row_b[il] * (uint64_t)n) != 0;
@@ -63765,11 +63909,15 @@ static bool k3_qwen_block(k3_gpu_buffers *b, const ds4_model *model, const ds4_v
     const double t0 = now_sec();
     double wait0 = 0.0; uint64_t bytes0 = 0, cd0 = 0, ch0 = 0, cm0 = 0;
     ds4_gpu_k3_moe_raw_stats(&wait0, &bytes0); ds4_gpu_k3_cache_stats(&cd0, &ch0, &cm0);
+    const double pa0 = g_k3_pf_attn, pr0 = g_k3_pf_route, pm0 = g_k3_pf_moe;
     int blk[16], am[16]; int32_t tok32[16];
     blk[0] = *token_io; for (uint32_t i = 0; i < nd; i++) blk[1 + i] = drafts[i];
     for (uint32_t i = 0; i < nb; i++) tok32[i] = (int32_t)blk[i];
     bool ok = true;
     const double ts0 = now_sec();
+#if defined(__APPLE__)
+    (void)ds4_gpu_begin_commands();   /* step M26: the snapshot copies go into one command batch */
+#endif
     for (uint32_t il = 0; il < L && ok; il++) {
         if (!ds4_k3_layer_is_kda(il)) continue;
         ok = ds4_gpu_tensor_copy(g_k3_qwen.snap_state[il], 0, b->kda_state[il], 0, state_bytes) != 0 && ds4_gpu_tensor_copy(g_k3_qwen.snap_conv[il], 0, b->kda_conv[il], 0, conv_bytes) != 0;
@@ -63778,6 +63926,8 @@ static bool k3_qwen_block(k3_gpu_buffers *b, const ds4_model *model, const ds4_v
     if (!ok) { fprintf(stderr, "ds4: K3 Qwen: KDA snapshot failed\n"); return false; }
     ds4_gpu_k3_set_verify(1);
     g_k3_verify_on = 1;
+    static int btr = -1; if (btr < 0) btr = getenv("DS4_K3_BLOCK_TRACE") != NULL;
+    if (btr) { g_k3_trace_on = true; g_k3_trace_rows = nb; }
     vb->n_tok = nb;
     ok = ds4_gpu_tensor_write(vb->tokens, 0, tok32, sizeof(int32_t) * nb) != 0;
     if (ok) ok = ds4_gpu_embed_tokens_quant_tensor(vb->cur, vb->tokens, model->map, model->size, weights->token_embd->abs_offset, weights->token_embd->type, DS4_N_VOCAB, nb, n) != 0;
@@ -63804,6 +63954,7 @@ static bool k3_qwen_block(k3_gpu_buffers *b, const ds4_model *model, const ds4_v
     if (ok) ok = ds4_gpu_tensor_read(g_k3_qwen.vlg, 0, g_k3_qwen.vlog, (uint64_t)nb * DS4_N_VOCAB * sizeof(float)) != 0;
     if (!ok) { g_k3_verify_on = 0; ds4_gpu_k3_set_verify(0); fprintf(stderr, "ds4: K3 Qwen: block forward failed at pos %u\n", pos); return false; }
     const double dt = now_sec() - t0;
+    if (btr) { g_k3_trace_on = false; g_k3_trace_rows = 0; }
     g_k3_qwen.t_fwd += dt;
     for (uint32_t i = 0; i < nb; i++) am[i] = sample_argmax(g_k3_qwen.vlog + (size_t)i * DS4_N_VOCAB, DS4_N_VOCAB);
     if (getenv("DS4_K3_QWEN_TRACE_TOP")) {   /* diagnostics: each row's two best tokens */
@@ -63820,6 +63971,9 @@ static bool k3_qwen_block(k3_gpu_buffers *b, const ds4_model *model, const ds4_v
     if (commit < nb) {
         /* the KDA states go back to the snapshot and forward over the committed rows; the MLA caches follow the position */
         const double tr0 = now_sec();
+#if defined(__APPLE__)
+        (void)ds4_gpu_begin_commands();   /* step M26 */
+#endif
         for (uint32_t il = 0; il < L && ok; il++) {
             if (!ds4_k3_layer_is_kda(il)) continue;
             const ds4_layer_weights *l = &weights->layer[il];
@@ -63863,9 +64017,10 @@ static bool k3_qwen_block(k3_gpu_buffers *b, const ds4_model *model, const ds4_v
     if (getenv("DS4_K3_TRACE_TIMING")) {
         double wait1 = 0.0; uint64_t bytes1 = 0, cd1 = 0, ch1 = 0, cm1 = 0;
         ds4_gpu_k3_moe_raw_stats(&wait1, &bytes1); ds4_gpu_k3_cache_stats(&cd1, &ch1, &cm1);
-        fprintf(stderr, "ds4: K3 Qwen block %llu: %u rows at pos %u, accepted %u of %u, %.3f s (forward %.3f), waited %.3f s for %.2f GB; expert cache device %llu, host %llu, disk %llu\n",
+        fprintf(stderr, "ds4: K3 Qwen block %llu: %u rows at pos %u, accepted %u of %u, %.3f s (forward %.3f), waited %.3f s for %.2f GB; expert cache device %llu, host %llu, disk %llu; phases attn %.3f route %.3f moe %.3f\n",
                 (unsigned long long)g_k3_qwen.n_blocks, nb, pos, acc, nd, now_sec() - t0, dt, wait1 - wait0, (double)(bytes1 - bytes0) / 1e9,
-                (unsigned long long)(cd1 - cd0), (unsigned long long)(ch1 - ch0), (unsigned long long)(cm1 - cm0));
+                (unsigned long long)(cd1 - cd0), (unsigned long long)(ch1 - ch0), (unsigned long long)(cm1 - cm0),
+                g_k3_pf_attn - pa0, g_k3_pf_route - pr0, g_k3_pf_moe - pm0);
     }
     return true;
 }
@@ -63888,6 +64043,7 @@ static void k3_qwen_end(void) {
         fprintf(stderr, "ds4: K3 Qwen: blocks by rows:%s\n", line);
     } else if (g_k3_qwen.n_blocks) fprintf(stderr, "ds4: K3 Qwen: blocks by rows: 2:%llu 3:%llu 4:%llu 5:%llu 6:%llu 7:%llu 8:%llu\n", (unsigned long long)g_k3_qwen.by_rows[2], (unsigned long long)g_k3_qwen.by_rows[3], (unsigned long long)g_k3_qwen.by_rows[4],
                                     (unsigned long long)g_k3_qwen.by_rows[5], (unsigned long long)g_k3_qwen.by_rows[6], (unsigned long long)g_k3_qwen.by_rows[7], (unsigned long long)g_k3_qwen.by_rows[8]);
+    if (getenv("DS4_K3_BLOCK_TRACE")) { g_k3_trace_on = true; fprintf(stderr, "ds4: K3 verify-block trace follows\n"); k3_trace_report(); g_k3_trace_on = false; }
     g_k3_qwen.active = false;
     if (g_k3_qwen.bufs) {
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -64173,7 +64329,7 @@ static int generate_k3_cuda_argmax(
         /* step 56: one pass over the whole prompt; the KDA states at the prefix row are read out during it and the MLA
            rows are in the cache, so the checkpoint costs no second pass (step 39 ran the prefix as its own pass) */
         float **ck_conv = xcalloc(L, sizeof(float *)), **ck_state = xcalloc(L, sizeof(float *));
-        for (uint32_t il = 0; il < L; il++) if (ds4_k3_layer_is_kda(il)) { ck_conv[il] = xmalloc(b.kda_conv[il]->bytes); ck_state[il] = xmalloc(b.kda_state[il]->bytes); }
+        for (uint32_t il = 0; il < L; il++) if (ds4_k3_layer_is_kda(il)) { ck_conv[il] = xmalloc(ds4_gpu_tensor_bytes(b.kda_conv[il])); ck_state[il] = xmalloc(ds4_gpu_tensor_bytes(b.kda_state[il])); }
         if (!k3_gpu_prefill(&b, model, vocab, weights, ids, (uint32_t)n_ids, 0, &prefilled_anchor, (uint32_t)ckpt_split, ck_conv, ck_state)) {
             fprintf(stderr, "ds4: K3 batched prefill (with the prefix checkpoint) failed\n");
             for (uint32_t il = 0; il < L; il++) { free(ck_conv[il]); free(ck_state[il]); }
@@ -64329,6 +64485,14 @@ static int generate_k3_cuda_argmax(
                     fprintf(stderr, "ds4: K3 pos %u prefetch: issued %llu, adopted %llu\n", pos, (unsigned long long)(pi - pi_prev), (unsigned long long)(pa - pa_prev));
                 pi_prev = pi; pa_prev = pa;
             }
+            if (getenv("DS4_K3_EXPERT_CKPT_INDEX")) {   /* step M10: reads served by the checkpoint (tier 3; tier D shares the counter) */
+                static uint64_t r3_prev = 0, n3_prev = 0;
+                uint64_t r3 = 0, n3 = 0;
+                ds4_k3_expert_source_tier_stat(3, &r3, &n3);
+                if (r3 != r3_prev) fprintf(stderr, "ds4: K3 pos %u checkpoint reads: %llu, %.1f ms avg\n", pos, (unsigned long long)(r3 - r3_prev),
+                                           (double)(n3 - n3_prev) / 1e6 / (double)(r3 - r3_prev));
+                r3_prev = r3; n3_prev = n3;
+            }
             fprintf(stderr, "ds4: K3 pos %u expert pipeline: waited %.3f s for %.2f GB (%.1f GB/s); hot %llu reads %.1f ms avg, "
                     "cold %llu reads %.1f ms avg\n", pos,
                     wait_s - wait_prev, (double)(bytes - bytes_prev) / 1e9,
@@ -64396,6 +64560,9 @@ static int generate_k3_cuda_argmax(
             gen_s > 0.0 ? (double)produced / gen_s : 0.0, g_k3_cancel ? ", cancelled" : "");
     if (produced > 1 && t_first_end > t_gen0) {   /* step 73: the public protocol's split */
         const double first_s = t_first_end - t_gen0, steady_s = gen_s - first_s;
+#if defined(__APPLE__)
+        { extern void ds4_gpu_k3_lookahead_report(void); ds4_gpu_k3_lookahead_report(); }   /* step M24 statistics */
+#endif
         fprintf(stderr, "ds4: K3 decode split: first step %.2f s; steady %d tokens in %.2f s (%.2f tok/s); generation incl. first step %.2f tok/s\n",
                 first_s, produced - 1, steady_s, steady_s > 0.0 ? (double)(produced - 1) / steady_s : 0.0, gen_s > 0.0 ? (double)produced / gen_s : 0.0);
     }
