@@ -2,7 +2,8 @@
 """Qwen proposal sidecar for ds4's Kimi K3 decode (steps 79, 82, 86, 89 and 94b, experimental). ds4 sends the committed K3 token ids; this answers with up to `requested` K3 ids or none.
 Rules from deltafin's qwen_draft.rs and provider_qwen.cpp: greedy; generated rows stop at, and include, end-of-text; a proposal is cut at the first row below the
 confidence gate; translation goes through the decoded K3 text and must keep the history as an exact prefix; a failed round trip gives no proposal (soft skip);
-budget requested + 2 clamped to [3, 20], with one retry at 20 when the budget ran out short of `requested`. Generation stops early at the first row below the gate,
+budget requested + 2 clamped to [3, MAX_NEW], with one retry at MAX_NEW when the budget ran out short of `requested`; MAX_NEW is 20, or
+DS4_K3_QWEN_ROWS + 4 when that is more (blocks of up to 32 rows since step 120). Generation stops early at the first row below the gate,
 because nothing after it can be used, and the KV cache and predicted rows are reused as long as the text agrees. A proposal shorter than DS4_K3_QWEN_KMIN drafts is
 dropped, and ds4 runs a block of 1 + n rows for any other. While ds4 works on a block or a plain step, the sidecar can carry its greedy sequence on past the history
 (DS4_K3_QWEN_SPEC) and stops as soon as the next request arrives. Binary protocol on stdin/stdout, little endian:
@@ -11,7 +12,7 @@ dropped, and ds4 runs a block of 1 + n rows for any other. While ds4 works on a 
   Q  u32 n_new, n_new * u32 ids, u32 requested -> q  u32 nd, nd * u32 ids, f32 min_conf, f32 seconds, u32 steps, u32 flags (1 soft skip, 2 confidence stop, 4 retried)
   X                                          -> exits
 Environment: DS4_K3_QWEN_DIR (the Qwen3-0.6B-Base checkpoint), DS4_K3_QWEN_META (the folder with K3's tiktoken.model and tokenizer_config.json), DS4_K3_QWEN_CONF (gate, default 0.6),
-DS4_K3_QWEN_ADAPT=lo,hi,down,up (off unless set: the gate starts at DS4_K3_QWEN_CONF, drops by `down` after a proposal whose drafts were all kept and rises by `up` after
+DS4_K3_QWEN_ADAPT=lo,hi,down,up (default 0.6,0.95,0.02,0.1 except on macOS, 0 or off to disable: the gate starts at DS4_K3_QWEN_CONF, drops by `down` after a proposal whose drafts were all kept and rises by `up` after
 one that kept fewer than half, within [lo, hi]), DS4_K3_QWEN_KMIN (fewest drafts worth a block, default 2), DS4_K3_QWEN_SPEC=after_block,after_step (rows to have
 ready past the history, default 17,3), DS4_K3_QWEN_TOKENIZE (k3_tokenize.py, default: next to this file), DS4_K3_QWEN_DEVICE (default cuda).
 Needs torch with CUDA, transformers, tokenizers, tiktoken and regex.
@@ -29,10 +30,12 @@ from transformers import AutoModelForCausalLM
 QW = os.environ["DS4_K3_QWEN_DIR"]; META = os.environ["DS4_K3_QWEN_META"]
 TOKPY = os.environ.get("DS4_K3_QWEN_TOKENIZE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "k3_tokenize.py")
 GATE = float(os.environ.get("DS4_K3_QWEN_CONF", "0.6"))
-ADAPT = [float(x) for x in os.environ["DS4_K3_QWEN_ADAPT"].split(",")] if os.environ.get("DS4_K3_QWEN_ADAPT") else None
+_adapt = os.environ.get("DS4_K3_QWEN_ADAPT", "" if sys.platform == "darwin" else "0.6,0.95,0.02,0.1")   # default on CUDA since 10 Nov 2026; 0 or off switches it off
+ADAPT = None if _adapt.strip() in ("", "0", "off") else [float(x) for x in _adapt.split(",")]
 KMIN = int(os.environ.get("DS4_K3_QWEN_KMIN", "2"))
 SPEC = [int(x) for x in os.environ.get("DS4_K3_QWEN_SPEC", "17,3").split(",")]
-SLACK, MAX_NEW, EOS = 2, 20, 151643
+SLACK, EOS = 2, 151643
+MAX_NEW = max(20, int(os.environ.get("DS4_K3_QWEN_ROWS", "16" if sys.platform == "darwin" else "32")) + 4)   # step 120: the budget follows the block width
 dev = os.environ.get("DS4_K3_QWEN_DEVICE", "cuda")
 spec = importlib.util.spec_from_file_location("k3tok", TOKPY); kt = importlib.util.module_from_spec(spec); spec.loader.exec_module(kt); kt.META = META
 RANKS = kt.load_ranks(); INV = {v: k for k, v in RANKS.items()}

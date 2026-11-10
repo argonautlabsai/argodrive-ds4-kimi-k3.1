@@ -38099,6 +38099,19 @@ struct k3_lru {
         else { order.push_back(s); pos[s] = std::prev(order.end()); }
         return (int)s;
     }
+    /* step 113: the key a hot alloc() would evict now (coldest unpinned slab without a second chance); K3_NOKEY when a free
+       or transient slab would be taken instead, so admitting costs no resident entry */
+    uint64_t peek_victim(void) const {
+        if (decay_mode) return K3_NOKEY;
+        for (auto it = order.rbegin(); it != order.rend(); ++it) {
+            const uint32_t s = *it;
+            if (pinned[s]) continue;
+            if (key[s] == K3_NOKEY || transient[s]) return K3_NOKEY;
+            if (chance[s]) continue;
+            return key[s];
+        }
+        return K3_NOKEY;
+    }
     void drop(uint32_t s) {
         if (key[s] == K3_NOKEY) return;
         auto m = map.find(key[s]);
@@ -38135,6 +38148,18 @@ struct k3_raw_pool {
     uint32_t n_cp = 1;
     cudaStream_t copy_stream = nullptr;               /* step 28: victim copy-downs (device -> pinned host) */
     int victim = 1;                                   /* DS4_K3_CACHE_VICTIM (1): the host cache holds device evictions */
+    int wake_mode = 0;                                /* step 114: DS4_K3_WAKE (0 = every reader woken) */
+    uint32_t hpf_n = 0, hpf_rank = 8, hpf_inflight_max = 8, hpf_inflight = 0;   /* step 117: DS4_K3_PREFETCH_HOST(_RANK, _INFLIGHT) */
+    std::vector<uint8_t> hwait, hfail;               /* step 117, under mu: a host-only read is filling the host slab / it failed */
+    std::vector<uint8_t> hpf_busy, hup;              /* step 117, main thread: that read not yet settled / an upload from the slab pending */
+    std::vector<uint64_t> hpf_key;                   /* step 117, main thread: what a host-only read brought (use count) */
+    std::deque<uint32_t> hpf_done;                   /* step 117, under mu: host slabs whose host-only read finished */
+    std::condition_variable cv_hfill;
+    std::atomic<uint64_t> hpf_issued{0}, hpf_used{0}, hpf_failed{0};
+    int admit_mode = 0;                               /* step 113: DS4_K3_COPYDOWN_ADMIT (0 all, 1 TinyLFU, n > 1 uses >= n) */
+    std::vector<uint8_t> freq;                        /* step 113: (layer << 10 | expert) -> decode uses, halved each period */
+    uint64_t freq_ops = 0, freq_period = 0;
+    std::atomic<uint64_t> cd_skip{0};
     int pool_first = 0;  /* step 74: DS4_K3_POOL_FIRST */
     int pool_keep = 0;   /* step 75: DS4_K3_POOL_KEEP */
     cudaEvent_t lists_uploaded = nullptr;
@@ -38355,6 +38380,7 @@ static void k3_raw_worker(k3_raw_pool *p) {
                 const int intended = p->eta_mode ? (home < 4 ? home : -1) : (tier == 2 ? 2 : (tier == 1 ? 1 : -1));
                 if (intended >= 0 && used != intended) { p->fallback_reads++; p->fallback_bytes += job.len; }
             }
+            bool wake_cold = false;   /* step 114 */
             {
                 std::lock_guard<std::mutex> lk(p->mu);
                 if (p->eta_mode) {
@@ -38372,10 +38398,25 @@ static void k3_raw_worker(k3_raw_pool *p) {
                     if (tier == 1) { p->cold_now--; p->cold_ewma_ms += 0.1 * (ms - p->cold_ewma_ms); }
                     else { p->green_now--; p->green_reads++; p->green_ewma_ms += 0.1 * (ms - p->green_ewma_ms); }
                 }
-                p->cv_job.notify_all();
+                if (!p->wake_mode) p->cv_job.notify_all(); else wake_cold = !p->cold_q.empty();
             }
+            if (wake_cold) p->cv_job.notify_one();   /* step 114: the freed slot takes one waiting chunk */
             if (!ok) fprintf(stderr, "ds4: K3 expert file L%u-E%u chunk at %u read failed: %s\n", job.layer, job.expert, job.off, strerror(errno));
             else p->bytes += job.len;
+        }
+        if (job.dev < 0) {   /* step 117: a host-only prefetch: the host slab is filled, nothing to upload */
+            { std::lock_guard<std::mutex> lk2(p->mu); p->hwait[(uint32_t)job.host] = 0; p->hfail[(uint32_t)job.host] = ok ? 0 : 1; p->hpf_done.push_back((uint32_t)job.host); }
+            p->cv_hfill.notify_all();
+            continue;
+        }
+        if (!job.read && p->hpf_n) {   /* step 117: this host hit's slab may still be filling from a host-only prefetch */
+            bool redo = false;
+            { std::unique_lock<std::mutex> lk2(p->mu); p->cv_hfill.wait(lk2, [&] { return p->hwait[(uint32_t)job.host] == 0; }); redo = p->hfail[(uint32_t)job.host] != 0; }
+            if (redo) {   /* the prefetch read failed: read the file here */
+                int used = -1;
+                ok = ds4_k3_expert_source_read_range_tier(job.layer, job.expert, h, job.off, job.len, p->direct, -1, &used);
+                if (ok) { std::lock_guard<std::mutex> lk2(p->mu); p->hfail[(uint32_t)job.host] = 0; }
+            }
         }
         const cudaStream_t us = p->up_streams[(uint32_t)job.dev % p->n_up];   /* step 63 */
         if (ok) {
@@ -38388,7 +38429,7 @@ static void k3_raw_worker(k3_raw_pool *p) {
             }
         }
         if (p->trace_fills) { const double tu = k3_now_sec(); if (tu > p->tf_up[(uint32_t)job.dev]) p->tf_up[(uint32_t)job.dev] = tu; }   /* step 68 */
-        std::lock_guard<std::mutex> lk(p->mu);
+        std::unique_lock<std::mutex> lk(p->mu);
         if (!ok) p->chunk_failed[(uint32_t)job.dev] = 1;
         if (p->chunks_left[(uint32_t)job.dev] > 0u) p->chunks_left[(uint32_t)job.dev]--;
         if (p->chunks_left[(uint32_t)job.dev] != 0u) continue;   /* more chunks of this slab are still in flight */
@@ -38401,8 +38442,22 @@ static void k3_raw_worker(k3_raw_pool *p) {
         }
         if (!all_ok) { p->failed = 1; p->failed_slabs.push_back((uint32_t)job.dev); }
         p->ready_q.push_back((uint32_t)job.dev);
+        if (p->wake_mode) lk.unlock();   /* step 114 */
         p->cv_done.notify_all();
     }
+}
+
+/* step 117: a host-only read has landed (main thread, pool mutex held): the slab stays pinned while an upload from it is
+   pending; a failed read leaves no entry behind unless an upload (which re-reads) still owns the slab */
+static void k3_hpf_settle(k3_raw_pool &p, uint32_t h) {
+    if (!p.hpf_busy[h]) return;
+    p.hpf_busy[h] = 0; if (p.hpf_inflight) p.hpf_inflight--;
+    p.hc.filling[h] = 0;
+    if (p.hfail[h]) { p.hpf_failed++; if (!p.hup[h]) { p.hc.pinned[h] = 0; p.hc.drop(h); p.hfail[h] = 0; } return; }
+    if (!p.hup[h]) p.hc.pinned[h] = 0;
+}
+static void k3_hpf_drain(k3_raw_pool &p) {   /* pool mutex held */
+    while (!p.hpf_done.empty()) { const uint32_t hh = p.hpf_done.front(); p.hpf_done.pop_front(); k3_hpf_settle(p, hh); }
 }
 
 /* Step 28, victim cache: the expert that device slab d just gave up (key old) is copied down into a host slab on the
@@ -38410,6 +38465,19 @@ static void k3_raw_worker(k3_raw_pool *p) {
    re-recorded behind the copy, so d's refill and the host slab's next read or upload wait for it. */
 static void k3_victim_copy(k3_raw_pool &p, uint32_t d, uint64_t old) {
     if (p.hc.lookup(old, false) >= 0) return;
+    if (p.admit_mode > 0) {   /* step 113: copy down only experts likely to be reused */
+        const uint32_t fo_i = (uint32_t)(((old >> 20) << 10) | (old & 0x3ffu));
+        const unsigned fo = fo_i < p.freq.size() ? p.freq[fo_i] : 0u;
+        bool skip;
+        if (p.admit_mode == 1) {
+            const uint64_t hv = p.hc.peek_victim();
+            const uint32_t hv_i = hv == K3_NOKEY ? 0u : (uint32_t)(((hv >> 20) << 10) | (hv & 0x3ffu));
+            skip = hv != K3_NOKEY && hv_i < p.freq.size() && fo <= p.freq[hv_i];
+        } else {
+            skip = fo < (unsigned)p.admit_mode;
+        }
+        if (skip) { p.cd_skip++; return; }
+    }
     const bool cold = !ds4_k3_expert_source_is_primary((uint32_t)(old >> 20), (uint32_t)(old & 0xfffffu));
     const int h = p.hc.alloc(old, true, nullptr, cold);
     if (h < 0) return;
@@ -38518,6 +38586,34 @@ static bool k3_raw_pool_ensure(uint32_t ff, uint32_t latent) {
     p.dc.init(cap_dev);
     p.direct = getenv("DS4_K3_EXPERT_BUFFERED") ? 0 : 1;
     p.victim = getenv("DS4_K3_CACHE_VICTIM") ? (atoi(getenv("DS4_K3_CACHE_VICTIM")) != 0) : 1;
+    p.wake_mode = (int)k3_env_u32("DS4_K3_WAKE", 1u);   /* step 114: default on (10 Nov 2026) */
+    p.hpf_n = k3_env_u32("DS4_K3_PREFETCH_HOST", 4u);   /* step 117: default 4 (10 Nov 2026) */
+    p.hpf_rank = k3_env_u32("DS4_K3_PREFETCH_HOST_RANK", 8u); if (p.hpf_rank > 32u) p.hpf_rank = 32u;
+    p.hpf_inflight_max = k3_env_u32("DS4_K3_PREFETCH_HOST_INFLIGHT", 8u);
+    p.hwait.assign(cap_host, 0); p.hfail.assign(cap_host, 0); p.hpf_busy.assign(cap_host, 0); p.hup.assign(cap_host, 0); p.hpf_key.assign(cap_host, K3_NOKEY);
+    if (p.hpf_n) {
+        fprintf(stderr, "ds4: kimi-k3 host-only next-layer prefetch (step 117): up to %u per layer within the predicted top %u, %u in flight\n",
+                p.hpf_n, p.hpf_rank, p.hpf_inflight_max);
+        atexit([] {
+            k3_raw_pool &q = k3_raw_get();
+            fprintf(stderr, "ds4: K3 host-only prefetch (step 117): issued %llu, used %llu, failed %llu\n",
+                    (unsigned long long)q.hpf_issued.load(), (unsigned long long)q.hpf_used.load(), (unsigned long long)q.hpf_failed.load());
+        });
+    }
+    if (p.wake_mode) fprintf(stderr, "ds4: kimi-k3 targeted reader wake-ups (step 114): one reader per chunk, notified outside the pool mutex\n");
+    p.admit_mode = (int)k3_env_u32("DS4_K3_COPYDOWN_ADMIT", 1u);   /* step 113: default on (10 Nov 2026) */
+    if (p.admit_mode > 0) {
+        p.freq.assign((size_t)128u * 1024u, 0);
+        p.freq_period = k3_env_u32("DS4_K3_COPYDOWN_PERIOD", 92u * 16u * 32u);
+        if (p.freq_period == 0) p.freq_period = 92u * 16u * 32u;
+        fprintf(stderr, "ds4: kimi-k3 copy-down admission (step 113): %s, counts halved every %llu uses\n",
+                p.admit_mode == 1 ? "TinyLFU against the host pool's victim" : "a minimum use count", (unsigned long long)p.freq_period);
+        atexit([] {
+            k3_raw_pool &q = k3_raw_get();
+            fprintf(stderr, "ds4: K3 copy-down admission (step 113): copied down %llu, skipped %llu\n",
+                    (unsigned long long)q.copydowns.load(), (unsigned long long)q.cd_skip.load());
+        });
+    }
     p.pool_first = getenv("DS4_K3_POOL_FIRST") ? (atoi(getenv("DS4_K3_POOL_FIRST")) != 0) : 1;   /* step 74: default on (promoted 5 Nov 2026) */
     if (p.pool_first) fprintf(stderr, "ds4: kimi-k3 decode pool-first enqueue (step 74): device and host-pool experts visited before the disk reads\n");
     p.pool_keep = getenv("DS4_K3_POOL_KEEP") ? (atoi(getenv("DS4_K3_POOL_KEEP")) != 0) : 0;   /* step 75 */
@@ -38527,8 +38623,8 @@ static bool k3_raw_pool_ensure(uint32_t ff, uint32_t latent) {
     { const char *pf = getenv("DS4_K3_PREFETCH");
       /* step 51: on by default (+6 % decode with 3 per layer within the top 4, 6 in flight) */
       p.pf_mode = !pf ? 2 : !strcmp(pf, "all") ? 2 : !strcmp(pf, "coldfirst") ? 3 : (!strcmp(pf, "0") || !strcmp(pf, "off")) ? 0 : 1; }
-    p.pf_max = k3_env_u32("DS4_K3_PREFETCH_N", 3u);
-    p.pf_rank = k3_env_u32("DS4_K3_PREFETCH_RANK", 4u); if (p.pf_rank > 32u) p.pf_rank = 32u;
+    p.pf_max = k3_env_u32("DS4_K3_PREFETCH_N", 2u);   /* 2 since 10 Nov 2026 */
+    p.pf_rank = k3_env_u32("DS4_K3_PREFETCH_RANK", 3u);   /* 3 since 10 Nov 2026 */ if (p.pf_rank > 32u) p.pf_rank = 32u;
     p.pf_inflight_max = k3_env_u32("DS4_K3_PREFETCH_INFLIGHT", 6u);
     p.pf_tail_pending = k3_env_u32("DS4_K3_PREFETCH_TAIL", 2u);
     p.trace_fills = (int)k3_env_u32("DS4_K3_TRACE_FILLS", 0u);   /* step 68 */
@@ -39285,12 +39381,13 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
         std::lock_guard<std::mutex> lk(p.mu);
         p.failed = 0;
         p.failed_slabs.clear();
+        if (p.hpf_n) k3_hpf_drain(p);   /* step 117: before the fills that may have uploaded from those slabs */
         /* step 29: prefetch fills that completed since the previous layer are plain cache entries now */
         for (size_t i = 0; i < p.ready_q.size(); ) {
             const uint32_t d = p.ready_q[i];
             if (p.wanted[d]) { i++; continue; }
             const int h = p.dev_host[d];
-            if (h >= 0) { p.hc.pinned[(uint32_t)h] = 0; if (p.victim && !host_all && !(p.pool_keep && p.hhit[d])) p.hc.drop((uint32_t)h); }   /* step 75 */
+            if (h >= 0) { if (p.hpf_n) p.hup[(uint32_t)h] = 0; if (!(p.hpf_n && p.hpf_busy[(uint32_t)h])) { p.hc.pinned[(uint32_t)h] = 0; if (p.victim && !host_all && !(p.pool_keep && p.hhit[d])) p.hc.drop((uint32_t)h); } }   /* step 75 */
             p.dc.pinned[d] = p.pf_slab[d] ? 1 : 0; p.dc.filling[d] = 0; p.dev_host[d] = -1; p.cold_job[d] = 0;
             if (p.pf_pending) p.pf_pending--;
             p.ready_q.erase(p.ready_q.begin() + (long)i);
@@ -39318,21 +39415,26 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
             n_cold_layer++;
         }
         p.cold_backlog = n_cold_layer;
-        p.cv_job.notify_all();
+        if (!p.wake_mode || !p.cold_q.empty()) p.cv_job.notify_all();   /* step 114 */
     }
     /* step 38: a fill is `split` chunk jobs landing in the same slab; the worker homes each chunk */
     auto push_fill = [&](uint32_t L, uint32_t E, uint32_t d, int h, bool read, bool pf) {
         if (p.trace_fills) { p.tf_enq[d] = k3_now_sec(); p.tf_pick[d] = p.tf_r0[d] = p.tf_r1[d] = p.tf_up[d] = p.tf_rdy[d] = 0.0; p.tf_tier[d] = -1; }   /* step 68 */
         const uint32_t n = read ? ((bulk && p.split_decode_only) ? 1u : p.split) : 1u;
         const uint64_t pages = p.file_bytes / 4096u, per = (pages + n - 1u) / n;
-        std::lock_guard<std::mutex> lk(p.mu);
-        p.chunks_left[d] = (uint8_t)n; p.chunk_failed[d] = 0;
-        for (uint32_t i = 0; i < n; i++) {
-            const uint64_t off = (uint64_t)i * per * 4096u;
-            if (off >= p.file_bytes) { if (p.chunks_left[d]) p.chunks_left[d]--; continue; }
-            const uint64_t len = per * 4096u < p.file_bytes - off ? per * 4096u : p.file_bytes - off;
-            p.jobs.push_back({L, E, (int)d, h, read, bulk, pf, (uint32_t)off, (uint32_t)len, k3_now_sec()});
+        uint32_t pushed = 0;
+        {
+            std::lock_guard<std::mutex> lk(p.mu);
+            p.chunks_left[d] = (uint8_t)n; p.chunk_failed[d] = 0;
+            for (uint32_t i = 0; i < n; i++) {
+                const uint64_t off = (uint64_t)i * per * 4096u;
+                if (off >= p.file_bytes) { if (p.chunks_left[d]) p.chunks_left[d]--; continue; }
+                const uint64_t len = per * 4096u < p.file_bytes - off ? per * 4096u : p.file_bytes - off;
+                p.jobs.push_back({L, E, (int)d, h, read, bulk, pf, (uint32_t)off, (uint32_t)len, k3_now_sec()});
+                pushed++;
+            }
         }
+        if (p.wake_mode) for (uint32_t i = 0; i < pushed; i++) p.cv_job.notify_one();   /* step 114 */
     };
     bool pf_done = false;
     auto issue_prefetch = [&]() {
@@ -39346,7 +39448,7 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
             if (pf_cap < p.bulk_pf_min) pf_cap = p.bulk_pf_min;
             if (want_max > pf_cap) want_max = pf_cap;
         }
-        if (want_max == 0u) return;
+        if (want_max == 0u && !(hot && p.hpf_n)) return;   /* step 117: host-only reads may still go */
         const uint32_t want_rank = hot ? p.pf_rank : p.hint_n;
         const uint32_t want_inflight = hot ? p.pf_inflight_max : p.bulk_pf_inflight;
         uint32_t issued = 0;
@@ -39368,14 +39470,36 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
             const int d2 = p.dc.alloc(k2, hot, &ev2);   /* a prompt pass's prefetch is transient like its other fills */
             if (d2 < 0) { if (read2) p.hc.drop((uint32_t)h2); break; }
             p.hc.pinned[(uint32_t)h2] = 1; p.dc.pinned[(uint32_t)d2] = 1; p.dc.filling[(uint32_t)d2] = 1;
+            if (p.hpf_n) { p.hup[(uint32_t)h2] = 1; if (!read2 && p.hpf_key[(uint32_t)h2] == k2) { p.hpf_used++; p.hpf_key[(uint32_t)h2] = K3_NOKEY; } }   /* step 117 */
             p.dev_host[(uint32_t)d2] = h2; p.wanted[(uint32_t)d2] = 0; p.cold_job[(uint32_t)d2] = cold2 ? 1 : 0; p.hhit[(uint32_t)d2] = read2 ? 0 : 1;   /* step 75 */
             if (!hot) { p.pf_slab[(uint32_t)d2] = 1; p.pf_list.push_back((uint32_t)d2); }
             if (p.victim && hot && !host_all && ev2 != K3_NOKEY) k3_victim_copy(p, (uint32_t)d2, ev2);
             if (read2) p.misses++; else p.hits_host++;
             push_fill(nl, e2, (uint32_t)d2, h2, read2, true);
             if (cold2 && read2) { std::lock_guard<std::mutex> lk(p.mu); p.cold_backlog++; }
-            p.cv_job.notify_all();
+            if (!p.wake_mode) p.cv_job.notify_all();   /* step 114: push_fill woke its readers */
             p.pf_pending++; p.pf_issued++; issued++;
+        }
+        if (hot && p.hpf_n) {   /* step 117: no device slab, no upload, no copy-down */
+            uint32_t hissued = 0;
+            for (uint32_t i = 0; i < p.hint_n && i < p.hpf_rank && hissued < p.hpf_n && p.hpf_inflight < p.hpf_inflight_max; i++) {
+                const int32_t ei = p.hint_e[i];
+                if (ei < 0 || ei >= 1024) continue;
+                const uint32_t e2 = (uint32_t)ei;
+                const uint64_t k2 = ((uint64_t)nl << 20) | e2;
+                if (p.dc.lookup(k2, false) >= 0 || p.hc.lookup(k2, false) >= 0) continue;
+                const int h2 = p.hc.alloc(k2, true);
+                if (h2 < 0) break;
+                p.hc.pinned[(uint32_t)h2] = 1; p.hc.filling[(uint32_t)h2] = 1; p.hpf_busy[(uint32_t)h2] = 1; p.hup[(uint32_t)h2] = 0;
+                p.hpf_key[(uint32_t)h2] = k2; p.hpf_inflight++;
+                {
+                    std::lock_guard<std::mutex> lk(p.mu);
+                    p.hwait[(uint32_t)h2] = 1; p.hfail[(uint32_t)h2] = 0;
+                    p.jobs.push_back({nl, e2, -1, h2, true, false, true, 0u, (uint32_t)p.file_bytes, k3_now_sec()});
+                }
+                if (p.wake_mode) p.cv_job.notify_one(); else p.cv_job.notify_all();
+                p.misses++; p.hpf_issued++; hissued++;
+            }
         }
         p.hint_layer = ~0u;   /* one use per hint */
     };
@@ -39388,6 +39512,14 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
         }
         for (uint32_t i = 0; i < nm; i++) vis_buf[nh + i] = tailbuf[i];
         vis = vis_buf;
+    }
+    if (hot && p.admit_mode > 0) {   /* step 113: this decode call's experts, counted once each */
+        for (uint32_t i = 0; i < n_union; i++) {
+            const uint32_t fi = (uint32_t)((layer_key >> 20) << 10) | (uint32_t)(ulist[i] & 0x3ffu);
+            if (fi < p.freq.size() && p.freq[fi] < 255u) p.freq[fi]++;
+        }
+        p.freq_ops += n_union;
+        if (p.freq_ops >= p.freq_period) { for (auto &f : p.freq) f = (uint8_t)(f >> 1); p.freq_ops = 0; }
     }
     while (launched < n_union) {
         /* enqueue: device hits launch now; the rest become fills while the in-flight budget and free slabs allow */
@@ -39435,13 +39567,14 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
                                                    same-layer-next-token reuse falls off a cliff below one token (p3: hits 551 -> 60) */
             if (d < 0) { if (read) p.hc.drop((uint32_t)h); break; }
             p.hc.pinned[(uint32_t)h] = 1; p.dc.pinned[(uint32_t)d] = 1; p.dc.filling[(uint32_t)d] = 1;
+            if (p.hpf_n) { p.hup[(uint32_t)h] = 1; if (!read && p.hpf_key[(uint32_t)h] == k) { p.hpf_used++; p.hpf_key[(uint32_t)h] = K3_NOKEY; } }   /* step 117 */
             p.dev_host[(uint32_t)d] = h; p.hhit[(uint32_t)d] = read ? 0 : 1;   /* step 75 */
             if (p.victim && hot && !host_all && evicted != K3_NOKEY && !(verify_admit > 1 && verify && p.dc.last_evicted_transient)) k3_victim_copy(p, (uint32_t)d, evicted);   /* step 78 */
             if (read) p.misses++; else p.hits_host++;
             p.wanted[(uint32_t)d] = 1; p.cold_job[(uint32_t)d] = cold_tier ? 1 : 0;
             if (cold_tier) cold_inflight++;
             push_fill(layer, e, (uint32_t)d, h, read, false);
-            p.cv_job.notify_all();
+            if (!p.wake_mode) p.cv_job.notify_all();   /* step 114: push_fill woke its readers */
             pending++; next++;
         }
         /* decode: prefetch once the Samsung is free of this layer's reads; a prompt pass: once its last fill is
@@ -39454,6 +39587,7 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
         {
             std::unique_lock<std::mutex> lk(p.mu);
             p.cv_done.wait(lk, [&] { return p.failed || !p.ready_q.empty(); });
+            if (p.hpf_n) k3_hpf_drain(p);   /* step 117 */
             while (!p.ready_q.empty() && n_ready < 64u) {
                 const uint32_t dq = p.ready_q.front(); p.ready_q.pop_front();
                 if (p.cold_job[dq] && p.cold_backlog) p.cold_backlog--;
@@ -39466,7 +39600,7 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
             const uint32_t e = (uint32_t)(p.dc.key[d] & 0xfffffu);
             if (p.trace_fills) p.tf_rdy[d] = k3_now_sec();   /* step 68 */
             const int h = p.dev_host[d];
-            if (h >= 0) { p.hc.pinned[(uint32_t)h] = 0; if (p.victim && !host_all && !(p.pool_keep && p.hhit[d])) p.hc.drop((uint32_t)h); }   /* exclusive unless step 75 keeps a host hit's copy */
+            if (h >= 0) { if (p.hpf_n) p.hup[(uint32_t)h] = 0; if (!(p.hpf_n && p.hpf_busy[(uint32_t)h])) { p.hc.pinned[(uint32_t)h] = 0; if (p.victim && !host_all && !(p.pool_keep && p.hhit[d])) p.hc.drop((uint32_t)h); } }   /* exclusive unless step 75 keeps a host hit's copy */
             p.dc.pinned[d] = (p.pf_slab[d] && !p.wanted[d]) ? 1 : 0; p.dc.filling[d] = 0; p.dev_host[d] = -1;
             if (p.cold_job[d]) { p.cold_job[d] = 0; if (p.wanted[d] && cold_inflight) cold_inflight--; }
             if (!p.wanted[d]) { if (p.pf_pending) p.pf_pending--; continue; }   /* a prefetch for the next layer: done */
@@ -39486,13 +39620,13 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
             while (!p.ready_q.empty()) {
                 const uint32_t d = p.ready_q.front(); p.ready_q.pop_front();
                 const int h = p.dev_host[d];
-                if (h >= 0) p.hc.pinned[(uint32_t)h] = 0;
+                if (h >= 0) { if (p.hpf_n) p.hup[(uint32_t)h] = 0; if (!(p.hpf_n && p.hpf_busy[(uint32_t)h])) p.hc.pinned[(uint32_t)h] = 0; }   /* step 117 */
                 p.dc.pinned[d] = 0; p.dc.filling[d] = 0; p.dev_host[d] = -1;
                 if (pending) pending--;
             }
         }
         std::lock_guard<std::mutex> lk(p.mu);
-        for (uint32_t d : p.failed_slabs) { const int h = p.dev_host[d]; p.dc.drop(d); if (h >= 0) p.hc.drop((uint32_t)h); }
+        for (uint32_t d : p.failed_slabs) { const int h = p.dev_host[d]; p.dc.drop(d); if (h >= 0 && !(p.hpf_n && p.hpf_busy[(uint32_t)h])) p.hc.drop((uint32_t)h); }   /* step 117 */
         for (uint32_t i = next; i < n_union; i++) { (void)i; }
         p.wait_s += k3_now_sec() - t0;
         fprintf(stderr, "ds4: K3 expert pipeline failed (layer %u)\n", layer);
@@ -39551,6 +39685,11 @@ extern "C" void ds4_gpu_k3_moe_raw_stats(double *wait_s, uint64_t *bytes) {
 static bool k3_raw_quiesce(k3_raw_pool &p) {
     std::unique_lock<std::mutex> lk(p.mu);
     const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (p.hpf_inflight > 0) {   /* step 117 */
+        k3_hpf_drain(p);
+        if (p.hpf_inflight == 0) break;
+        if (!p.cv_hfill.wait_until(lk, limit, [&] { return !p.hpf_done.empty(); })) break;
+    }
     for (;;) {
         while (!p.ready_q.empty()) {
             const uint32_t d = p.ready_q.front(); p.ready_q.pop_front();
