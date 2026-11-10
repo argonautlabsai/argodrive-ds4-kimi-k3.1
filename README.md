@@ -27,6 +27,25 @@ This is a **source release**. Model weights, NVIDIA drivers, CUDA build tools (o
 
 Different machines, prompts and engine versions are separate experiments, not a single controlled speed comparison. [All measurements, definitions and limits](https://argonautlabs.ai/research/kimi-k31-single-gpu.html).
 
+### Footprint: quant, storage and memory
+
+| | RTX PRO 6000 (Linux, CUDA) | MacBook Pro M5 Max (macOS, Metal) |
+|---|---|---|
+| **Experts** | 82,432 files of 17.5 MB, 1.45 TB: MXFP4 exactly as in Moonshot's checkpoint, not re-quantized | the same files |
+| **Spine** (all non-expert weights) | 62 GB of GGUF Q8_0, converted from the checkpoint's BF16, held in VRAM | the same file, held in unified memory |
+| **Arithmetic** | fp32 activations, full-precision attention cache, no expert skipping | the same |
+| **Storage to run** | the spine and one copy of the experts, about 1.5 TB: one NVMe drive with room for both is enough | the same; the internal SSD alone is enough if it has the room |
+| **Storage to prepare** | the checkpoint (about 1.56 TB) plus the outputs: plan on about 3.5 TB free; afterwards the engine reads only the spine and the expert files | the same |
+| **Memory** | 96 GB of VRAM for the spine and an expert cache of about 27 GB; 70 GiB of host RAM with a 53.7 GB pinned expert pool (`DS4_K3_CACHE_RAM_GB`) | 128 GB unified: the spine, a 40 GB expert cache (`DS4_K3_CACHE_RAM_GB`) and buffers, at Metal's recommended working set (about 107 GiB) |
+| **Measured storage** | a RAID0 of three NVMe drives with the 79,365 most used experts and a second NVMe with the rest plus copies; on 6–8 November also a Thunderbolt NVMe with 74,000 copies | the internal SSD with 71,866 experts and two Thunderbolt 5 NVMe drives: one with the other 10,566 plus copies of the 33,600 most used, one with a full copy |
+| **Optional** | the Qwen3-0.6B drafter (about 2 GB of VRAM and 1.7 GB of host RAM); the K3.1 indexer for contexts beyond 2,048 tokens (a 357 MB file) | the drafter, on the GPU through PyTorch's MPS backend |
+
+Decode speed mostly follows the total read bandwidth of the expert drives: more drives, or copies of the most used experts on
+another drive, make it faster, and a larger expert cache means fewer reads. We haven't measured this release on a single
+drive, so expect it to decode slower than the numbers above. These are the tested setups, not minimum requirements. Before
+deleting the checkpoint, keep its `tiktoken.model` and `tokenizer_config.json` if you want the drafter, and cut the indexer
+file out with `k31_indexer_extract.py` if you want contexts beyond 2,048 tokens.
+
 ### Get started
 
 **First installation?** Follow the [step-by-step guide: get the engine, download and prepare the weights, then run Kimi](https://argonautlabs.ai/guides/install-kimi-k31.html). It includes copyable Linux commands and troubleshooting.
