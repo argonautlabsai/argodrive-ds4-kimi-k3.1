@@ -166,9 +166,13 @@ earlier runs, which is not part of this repository.
 |---|---|---|
 | `DS4_K3_CACHE_RAM_GB` | 50 | pinned host expert cache (yields to free RAM minus `DS4_K3_CACHE_RAM_RESERVE_MB`, 8192) |
 | `DS4_K3_CACHE_VRAM_RESERVE_MB` | 4096 | VRAM kept free for prompt-pass buffers; the device cache takes the rest |
-| `DS4_K3_PREFETCH` / `_N` / `_RANK` / `_INFLIGHT` | all / 3 / 4 / 6 | next-layer decode prefetch from the router prediction |
+| `DS4_K3_PREFETCH` / `_N` / `_RANK` / `_INFLIGHT` | all / 2 / 3 / 6 | next-layer decode prefetch into VRAM from the router prediction: up to `_N` reads among the `_RANK` most likely experts (3 of 4 before 10 November) |
+| `DS4_K3_PREFETCH_HOST`, `_HOST_RANK`, `_HOST_INFLIGHT` | 4, 8, 8 | then up to `DS4_K3_PREFETCH_HOST` more of the `_HOST_RANK` most likely experts are read into the host pool only, without a VRAM slab or an upload until they're used; 0 turns it off |
+| `DS4_K3_CUDA_OVERLAP`, `DS4_K3_CUDA_LOOKAHEAD` | 1, 1 | decode: the shared expert runs while the routed experts' reads are in flight, and the next layer's router runs with this layer's, so the prefetch hint needs no second readback |
+| `DS4_K3_VERIFY_HINTS` | 1 | verification blocks send next-layer prefetch hints, as prompt passes do (0 on a Mac, whose blocks have their own) |
 | `DS4_K3_SPLIT_READ`, `DS4_K3_SPLIT_DECODE_ONLY` | 2, 1 | decode fills read as two chunks; prompt-pass fills whole-file |
 | `DS4_K3_EXPERT_SLOTS`, `DS4_K3_EXPERT_THREADS` | 32, slots x split + 16 | fills in flight, reader threads |
+| `DS4_K3_WAKE` | 1 | each queued read chunk wakes one reader thread, after the pool lock is released; 0 wakes every reader at every enqueue and every landed chunk, as before 10 November |
 | `DS4_K3_SPLIT_ETA` | 2 | per-chunk homing across directories; mode 2 keeps each directory at its own depth for prompt passes (slow copies never end a layer) |
 | `DS4_K3_SPLIT_ETA_GBPS`, `DS4_K3_SPLIT_STREAM_GBPS` | 27,6.8,3.6[,3.6] / 6,6.7,3.6[,3.6] | aggregate and per-stream GB/s the balancer assumes per directory (measure yours) |
 | `DS4_K3_COLD_INFLIGHT`, `DS4_K3_GREEN_INFLIGHT`, `DS4_K3_DIRD_INFLIGHT` | 8, 16, 16 | in-flight caps for `dir_b`, tier C and tier D |
@@ -176,6 +180,7 @@ earlier runs, which is not part of this repository.
 | `DS4_K3_UPLOAD_STREAMS` | 8 | CUDA streams for slab uploads |
 | `DS4_K3_POOL_FIRST` | 1 | decode: the layer's experts already on the device or in the host pool are visited before the ones needing a disk read (+2 % measured; from the argodrive V4.1 fork) |
 | `DS4_K3_POOL_KEEP`, `DS4_K3_POOL_EVICT_BIAS` | 0, 0 | a host hit keeps its host copy; prefer evicting a slab the pool still holds (neutral to negative on this rig; kept for other cache geometries) |
+| `DS4_K3_COPYDOWN_ADMIT`, `DS4_K3_COPYDOWN_PERIOD` | 1, 47104 | an expert evicted from VRAM is copied down to the host pool only if its recent use count beats that of the pool entry it would displace (TinyLFU); the counts halve every `_PERIOD` expert uses, about 32 tokens of decode; 0 copies every eviction down, n > 1 only experts used at least n times |
 | `DS4_K3_POOL_LAZY` | unset | create the expert pool at the first token instead of at load |
 | `DS4_K3_PREFILL_SEQUENTIAL` | unset | process the prompt through the decode path one token at a time, about 0.7 s per token: 29 s vs 36 s fresh-process wall on the 5-token prompt, 192 s vs 39 s for a 286-token prompt pass. A different float path from the batched pass |
 | `DS4_K3_PREFILL_PREFETCH`, `_DIV`, `_MIN`, `_N`, `_INFLIGHT` | 2, 5, 0, 256, 256 | prompt pass: read ahead the next layer's predicted experts from any tier (1: the cold tier only, 0: off), n_tok / `_DIV` per layer but at least `_MIN` and at most `_N` (up to 1,024) |
@@ -195,9 +200,9 @@ earlier runs, which is not part of this repository.
 | `DS4_K3_QWEN_GRACE_MS` | 300 | the first drafter proposal waits at most this long for the sidecar; plain steps run until it is ready |
 | `DS4_K3_QWEN`, `DS4_K3_QWEN_PY`, `DS4_K3_QWEN_SCRIPT`, `DS4_K3_QWEN_DIR`, `DS4_K3_QWEN_META`, `DS4_K3_QWEN_CONF` | off, -, -, -, -, 0.6 | the optional Qwen drafter ([below](#the-optional-qwen-drafter)) |
 | `DS4_K3_QWEN_CHAT` | unset | allow the drafter on chat prompts; use it with the chat settings [below](#the-optional-qwen-drafter) |
-| `DS4_K3_QWEN_ROWS`, `DS4_K3_QWEN_KMIN` | 16, 2 | the most rows a verification block may take (2 to 16), and the fewest drafts worth a block |
+| `DS4_K3_QWEN_ROWS`, `DS4_K3_QWEN_KMIN` | 32 (16 on a Mac), 2 | the most rows a verification block may take (2 to 32; at most 16 on a Mac), and the fewest drafts worth a block |
 | `DS4_K3_QWEN_SPEC` | 17,3 | rows the sidecar prepares past the text while Kimi works, after a block and after a plain step; `0,0` turns it off |
-| `DS4_K3_QWEN_ADAPT` | unset | `lo,hi,down,up`: the gate drops by `down` after a proposal whose drafts were all kept and rises by `up` after one that kept fewer than half, within [`lo`, `hi`] |
+| `DS4_K3_QWEN_ADAPT` | 0.6,0.95,0.02,0.1 (unset on a Mac) | `lo,hi,down,up`: the gate drops by `down` after a proposal whose drafts were all kept and rises by `up` after one that kept fewer than half, within [`lo`, `hi`]; `0` keeps the gate fixed |
 | `DS4_K3_VERIFY_ADMIT`, `DS4_K3_VERIFY_AUTO` | auto, 4,3,2 | in a verification block, a fill used by fewer rows than the threshold stays transient: recycled first, never copied down. `auto` uses 4 for blocks of 7 rows or more, 3 for 5 or 6 and 2 for 4 or fewer (`DS4_K3_VERIFY_AUTO` sets the three); a number fixes it; 0: every fill goes to the hot end |
 | `DS4_K3_VERIFY_WARM` | 0 | a block's fill used by at least this many rows, but fewer than the threshold, is copied down to the host pool when it is evicted |
 | `DS4_K3_ROWS_GEMV`, `DS4_K3_ROWS_GEMV_CHECK` | 1, unset | Q8_0 spine matmuls of 2 to 64 rows (verification blocks, short prompt passes) load each weight block once per 8 rows instead of once per row; every row is bit-identical to the single-row call. `_CHECK=<n>` compares the first n calls with the per-row loop on the GPU |
@@ -308,11 +313,53 @@ With short prompts the difference is a few percent:
 | 512-token prompt, 128 generated, Qwen: prefill / decode | 18.7 / 2.69 | 18.0 / 2.66 |
 | 1,512-token prompt, 128 generated, Qwen: prefill / decode | 46 / 2.44 | 43 / 2.45 |
 
+### Faster decode on four drives (10 November 2026)
+
+At commit fd65719, one fresh process per run, greedy, raw prompts unless noted. The Thunderbolt NVMe wasn't attached: the
+RAID0 held the 79,365 hottest experts and the second NVMe the other 3,067 plus 8,701 copies. The previous release (5560b5e)
+ran beside it on the same drives.
+
+| test | previous release, plain / Qwen | this release, plain / Qwen |
+|---|---|---|
+| record prompt, 128 generated | 1.91 / 2.72 tok/s | 2.08 / 2.76–2.79 tok/s |
+| record prompt, 200 generated | 1.87 / 2.88 | 2.04 / 3.09–3.11 |
+| record prompt, 512 generated | 1.80 / 2.84 | 1.97 / 3.21 |
+| `prompt-512-tokens.txt`, 200 generated | 1.43 / 2.38 | 1.56 / 2.98 |
+| "The capital of France is", 17 generated | – / 2.08–2.09 | 2.06 / 2.15–2.16 |
+| 1,512-token prompt, 128 generated | – | 1.70–1.71 / 2.66 |
+| a 286-token chat prompt, 200 generated, chat settings | – | 1.96 / 2.02 |
+
+The prompt pass barely changed: 28.6 s against 28.9 s for the 286-token chat prompt, and 38.8 to 39.1 s against 40.0 s for a
+1,549-token one, with the same first-token logits. It reads at the drives' combined rate, 36 to 37 GB/s on these four.
+
+None of the changes touches the arithmetic:
+
+- Reader wake-ups (`DS4_K3_WAKE`). Every queued read and every landed chunk woke all 80 reader threads, and the decode thread
+  then queued behind them for the pool's lock; queueing a layer's six reads took about 1 ms. Now each chunk wakes one reader,
+  after the lock is released. In an Nsight Systems trace the decode thread's time waiting for the lock fell from 8.0 s to
+  0.19 s per 20 s, and a read is in flight 92 % of the time instead of 69 %.
+- Copy-down admission (`DS4_K3_COPYDOWN_ADMIT`): an expert evicted from VRAM goes down to the host pool only if it was used
+  more often lately than the entry it would push out.
+- From the Metal port: the shared expert runs while the routed experts' reads are in flight, and the next layer's router runs
+  with this layer's (`DS4_K3_CUDA_OVERLAP`, `DS4_K3_CUDA_LOOKAHEAD`).
+- Prefetch: 2 of the 3 most likely experts of the next layer into VRAM, then up to 4 more of the top 8 into the host pool only
+  (`DS4_K3_PREFETCH_HOST`); 59 to 69 % of those get used. Verification blocks send the hints too (`DS4_K3_VERIFY_HINTS`).
+- Verification blocks of up to 32 rows, with the adaptive gate ([below](#the-optional-qwen-drafter)).
+
+In A/B medians on the record prompt, plain decode went from 1.90 tok/s to 1.96 with the wake-ups, 1.99 with copy-down
+admission, 2.02 with the overlap and lookahead and 2.08 with the prefetch changes. Tried and dropped, because they were slower:
+reading the misses before using the cache hits, deeper host prefetch (5 of the top 12, 8 of the top 16) and sending more
+reads to the second NVMe.
+
+Every compared position matched: 7,507 logit hashes against the 8 November release's runs (the tests above, long context at
+4k, 8k and 16k, and the server at an 8k cache), 3,800 drafter logit vectors against plain decoding, and the server at 8k with
+the drafter on against the same server with it off (124 positions).
+
 ## The optional Qwen drafter
 
 Off by default. Greedy decoding only, and raw completions only unless you set `DS4_K3_QWEN_CHAT=1`.
 
-At each position `tools/kimi-k3/qwen_sidecar.py` runs Qwen3-0.6B-Base on the text so far, translates its continuation back to Kimi tokens and answers with up to 15 tokens or nothing. A proposal
+At each position `tools/kimi-k3/qwen_sidecar.py` runs Qwen3-0.6B-Base on the text so far, translates its continuation back to Kimi tokens and answers with up to 31 tokens (15 on a Mac) or nothing. A proposal
 stops at the first Qwen token below the confidence gate (`DS4_K3_QWEN_CONF`, default 0.6), and one shorter than 2 tokens is dropped. With n tokens the engine runs one verification block of 1 + n
 rows, the current token plus the drafts, and keeps the drafts up to the first one Kimi disagrees with. With nothing it takes an ordinary plain step. So the emitted tokens are always Kimi's own choices.
 
@@ -333,6 +380,10 @@ The recipe comes from the deltafin Kimi K3 work. Three things changed for this e
 - The width. Once rows got cheaper, both short and wide blocks paid. With perfect drafts, blocks of 8, 12 and 16 rows gave 3.45, 3.75 and 3.68 tok/s. With
   Qwen's drafts on the record prompt, 200 tokens, up to 8 rows gave 2.98 tok/s, up to 12 rows 2.97 and up to 16 rows 3.10, so a block may now take up to
   16 rows (`DS4_K3_QWEN_ROWS`). A full 16-row block takes about 3.8 s, against about 8 s for sixteen plain steps.
+  Since 10 November a block on CUDA may take up to 32 rows, with the adaptive gate below on by default there. Against 16 rows
+  and a fixed gate, on four drives: the record prompt over 200 tokens went from 3.02–3.03 to 3.09–3.10 tok/s,
+  `prompt-512-tokens.txt` over 128 from 2.67–2.68 to 3.00–3.01, and a code prompt over 200 from 2.18–2.19 to 2.31, with logits
+  identical to plain decoding in every run. The Mac keeps 16 rows and a fixed gate until wider blocks are measured there.
 
 Measured 7 November 2026 on the RTX PRO 6000 machine above, at commit 6808130, fresh process per run, gate 0.6, third drive on, monitoring off:
 

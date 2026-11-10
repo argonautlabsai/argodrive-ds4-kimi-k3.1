@@ -13,14 +13,15 @@ This is a **source release**. Model weights, NVIDIA drivers, CUDA build tools (o
 | Hardware | Workload | Measured speed | Version and scope |
 |---|---|---:|---|
 | **RTX PRO 6000** (96 GB, Linux, CUDA) | Short-prompt chat: 286 prompt / 200 output tokens | **2.01–2.02 tok/s decode** | 7 November, chat drafter settings |
-| **RTX PRO 6000** (96 GB, Linux, CUDA) | Raw financial text: 6 prompt / 512 output tokens | **3.05 tok/s decode** | 8 November, Qwen drafter, fp32 activations |
+| **RTX PRO 6000** (96 GB, Linux, CUDA) | Raw financial text: 6 prompt / 512 output tokens | **3.21 tok/s decode** | 10 November, Qwen drafter, fp32 activations |
+| **RTX PRO 6000** (96 GB, Linux, CUDA) | Long raw prompt: 512 prompt / 200 output tokens | **2.98 tok/s decode** | 10 November, Qwen drafter |
 | **RTX PRO 6000** (96 GB, Linux, CUDA) | Prompt processing: 1,512-token prompt | **43 tok/s prefill** | 8 November; not output generation speed |
 | **RTX PRO 6000** (96 GB, Linux, CUDA) | Long chat prompts: 6,769 / 13,167 tokens | **1.51 / 1.48 tok/s decode** | 8 November, 8k / 16k context caches |
 | **MacBook Pro M5 Max** (128 GB, macOS, Metal) | Raw financial text: 6 prompt / 512 output tokens | **2.04 tok/s decode** | 9 November, Qwen drafter, fp32 activations |
 | **MacBook Pro M5 Max** (128 GB, macOS, Metal) | Prompt processing: 512-token prompt | **8.4 tok/s prefill** | 9 November; not output generation speed |
 
 **Tested hardware, not minimum requirements:**
-- **RTX PRO 6000 (Linux, CUDA):** one RTX PRO 6000 Blackwell GPU with **96 GB VRAM**, **70 GiB RAM** assigned to the Ubuntu VM and **five physical NVMe devices** in three storage tiers. Context caches measured up to **16,384 tokens** using sparse attention.
+- **RTX PRO 6000 (Linux, CUDA):** one RTX PRO 6000 Blackwell GPU with **96 GB VRAM**, **70 GiB RAM** assigned to the Ubuntu VM and **five physical NVMe devices** in three storage tiers (**four** in two tiers for the 10 November results). Context caches measured up to **16,384 tokens** using sparse attention.
 - **MacBook Pro (macOS, Metal):** a MacBook Pro with an **M5 Max and 128 GB** of unified memory, its internal SSD and **two Thunderbolt 5 NVMe drives**. Contexts measured up to **2,048 tokens**.
 - Both run the same engine on the same **1.45 TB of unique MXFP4 experts**, plus spine, checkpoint and replicas. **Equivalence to Moonshot’s reference implementation remains unvalidated.**
 
@@ -38,19 +39,27 @@ Different machines, prompts and engine versions are separate experiments, not a 
 
 ### Standard benchmarks on the RTX PRO 6000 (Linux, CUDA)
 
-Measured on 8 November at commit b959c89 on one RTX PRO 6000 Blackwell (96 GB), one fresh process per run, greedy, raw prompts,
-with the Qwen drafter:
+Measured on 10 November at commit fd65719 on one RTX PRO 6000 Blackwell (96 GB), one fresh process per run, greedy, raw
+prompts. The experts were on four NVMe devices; the Thunderbolt NVMe of the earlier results was not attached.
 
-| test | prefill | decode |
-|---|---|---|
-| "The three main financial statements are" (6 tokens), 128 generated (tg128) | — | 2.88 tok/s |
-| 512-token prompt, 128 generated (pp512 / tg128) | 18.0 tok/s | 2.66 tok/s |
-| 1,512-token prompt, 128 generated (pp1512 / tg128) | 43 tok/s | 2.45 tok/s |
-| the same 6-token prompt, 512 generated | — | 3.05 tok/s |
+| test | prefill | decode, Qwen drafter | decode, plain |
+|---|---|---|---|
+| "The three main financial statements are" (6 tokens), 128 generated (tg128) | — | 2.76–2.79 tok/s | 2.08 tok/s |
+| 512-token prompt, 200 generated (pp512 / tg200) | 16.1 tok/s | 2.98 tok/s | 1.56 tok/s |
+| 1,512-token prompt, 128 generated (pp1512 / tg128) | 39 tok/s | 2.66 tok/s | 1.70 tok/s |
+| the same 6-token prompt, 512 generated | — | 3.21 tok/s | 1.97 tok/s |
 
-The drafter gives the same tokens as plain decoding: a block's rows run the same arithmetic as plain steps, and the logits of 3,800
-positions showed no differing bit. Decode depends on how predictable the text is, and chat runs at about 2 tok/s. The 512-token
-prompt is `prompt-512-tokens.txt` from the deltafin Kimi K3 benchmark.
+The previous release, run beside it on the same drives, decoded tg128 at 1.91 tok/s plain and 2.72 with the drafter, pp512 /
+tg200 at 1.43 and 2.38, and the 512-token generation at 1.80 and 2.84. So plain decode is about 9 % faster now, and decode
+with the drafter 2 to 25 %. Prefill barely changed (a 1,549-token prompt pass took 38.8 to 39.1 s against 40.0 s), because
+the prompt pass waits on the drives. On 8 November, with the fifth NVMe, the previous release prefilled at 18.0 tok/s on the
+512-token prompt and 43 tok/s on the 1,512-token one, and decoded tg128 with the drafter at 2.88 tok/s.
+
+The drafter gives the same tokens as plain decoding: a block's rows run the same arithmetic as plain steps, and the logits of
+3,800 positions showed no differing bit. The logits also matched the 8 November release's runs bit for bit (7,507 positions,
+long context and the server included). Decode depends on how predictable the text is, and chat runs at about 2 tok/s. The
+512-token prompt is `prompt-512-tokens.txt` from the deltafin Kimi K3 benchmark.
+[What changed](tools/kimi-k3/README.md#faster-decode-on-four-drives-10-november-2026)
 
 ### Standard benchmarks on a MacBook Pro M5 Max (macOS, Metal)
 
@@ -80,7 +89,7 @@ through a VRAM cache and a pinned RAM pool; on a Mac the spine and one expert ca
 
 The CUDA results come from one RTX PRO 6000 Blackwell (96 GB) in a 70 GiB VM. A RAID0 of three NVMe drives (19 GB/s) has the 79,365
 hottest experts, a second NVMe (6.2 GB/s) has the rest plus some copies, and a Thunderbolt NVMe (3.7 GB/s) has another 74,000
-copies.
+copies. The 10 November results ran without the Thunderbolt NVMe.
 
 The prompt pass is the interesting part. Once a prompt is a few hundred tokens long it hits most of the experts in every
 layer, so the pass reads most of the model once and the time barely changes with length. For this model, prefill is a
