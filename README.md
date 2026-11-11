@@ -12,11 +12,11 @@ This is a **source release**. Model weights, NVIDIA drivers, CUDA build tools (o
 
 | Hardware | Workload | Measured speed | Version and scope |
 |---|---|---:|---|
-| **RTX PRO 6000** (96 GB, Linux, CUDA) | Short-prompt chat: 286 prompt / 200 output tokens | **2.01–2.02 tok/s decode** | 7 November, chat drafter settings |
+| **RTX PRO 6000** (96 GB, Linux, CUDA) | Short-prompt chat: 286 prompt / 200 output tokens | **2.01–2.02 tok/s decode** | 11 November, chat drafter settings |
 | **RTX PRO 6000** (96 GB, Linux, CUDA) | Raw financial text: 6 prompt / 512 output tokens | **3.77–3.79 tok/s decode** | 11 November, Qwen drafter, fp32 activations |
 | **RTX PRO 6000** (96 GB, Linux, CUDA) | Long raw prompt: 512 prompt / 200 output tokens | **3.88–3.89 tok/s decode** | 11 November, Qwen drafter |
-| **RTX PRO 6000** (96 GB, Linux, CUDA) | Prompt processing: 1,512-token prompt | **43 tok/s prefill** | 8 November; not output generation speed |
-| **RTX PRO 6000** (96 GB, Linux, CUDA) | Long chat prompts: 6,769 / 13,167 tokens | **1.51 / 1.48 tok/s decode** | 8 November, 8k / 16k context caches |
+| **RTX PRO 6000** (96 GB, Linux, CUDA) | Prompt processing: 1,512-token / 6,769-token prompt | **40.8 / 120 tok/s prefill** | 11 November; not output generation speed |
+| **RTX PRO 6000** (96 GB, Linux, CUDA) | Long chat prompts: 6,769 / 13,167 tokens | **1.53 / 1.56 tok/s decode** | 11 November, 8k / 16k context caches |
 | **MacBook Pro M5 Max** (128 GB, macOS, Metal) | Raw financial text: 6 prompt / 512 output tokens | **2.49 tok/s decode** | 11 November, Qwen drafter, fp32 activations; 2.29 with the laptop in use |
 | **MacBook Pro M5 Max** (128 GB, macOS, Metal) | Prompt processing: 512-token prompt | **9.0–10.4 tok/s prefill** | 11 November; not output generation speed |
 
@@ -120,7 +120,7 @@ through a VRAM cache and a pinned RAM pool; on a Mac the spine and one expert ca
 
 The CUDA results come from one RTX PRO 6000 Blackwell (96 GB) in a 70 GiB VM. A RAID0 of three NVMe drives (19 GB/s) has the 79,365
 hottest experts, a second NVMe (6.2 GB/s) has the rest plus some copies, and a Thunderbolt NVMe (3.7 GB/s) has another 74,000
-copies. The 10 November results ran without the Thunderbolt NVMe.
+copies. The 10 and 11 November results ran without the Thunderbolt NVMe.
 
 The prompt pass is the interesting part. Once a prompt is a few hundred tokens long it hits most of the experts in every
 layer, so the pass reads most of the model once and the time barely changes with length. For this model, prefill is a
@@ -128,8 +128,8 @@ bandwidth problem.
 
 K3.1's sparse attention works: each of the 24 attention layers attends to the 2,048 positions its indexer scores highest, and
 the selections match a float64 reference. The attention cache keeps what it needs to rebuild keys and values exactly, 105 KB
-per position instead of 2.95 MB. On the RTX PRO 6000, a 6,769-token prompt takes 60 s at an 8k cache and then decodes at 1.51 tok/s; a
-13,167-token prompt takes 124 s and decodes at 1.48 tok/s. Up to 2,048 tokens nothing changes. To use it, cut the indexer
+per position instead of 2.95 MB. On the RTX PRO 6000, a 6,769-token prompt takes 56 s at an 8k cache and then decodes at 1.53 tok/s; a
+13,167-token prompt takes about 115 s and decodes at 1.56 tok/s. Up to 2,048 tokens nothing changes. To use it, cut the indexer
 weights out of the checkpoint with `tools/kimi-k3/k31_indexer_extract.py` and run with
 `DS4_K3_DSA=k31-indexer.bin DS4_K3_CACHE_CAP=16384` and `-c 16384`.
 
