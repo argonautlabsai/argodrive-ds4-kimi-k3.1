@@ -7548,8 +7548,10 @@ static void config_validate_kimi_k3_model(const ds4_model *m) {
     const uint64_t file_bytes = required_u64_compat(m, "kimi-k3.experts.file_bytes");
     ds4_k3_expert_source_configure(primary_z, dir_b_z[0] ? dir_b_z : NULL, file_bytes);
     {   /* step 37: prompt passes of up to this many rows run the spine's Q8 matmuls as f16 GEMMs (see ds4_cuda.cu) */
+#ifndef DS4_NO_GPU
         const char *e = getenv("DS4_K3_SPINE_GEMM_MAX");
         ds4_gpu_k3_set_spine_gemm_max(e ? (uint32_t)atoi(e) : 0u);   /* off by default: a 4..512-row prompt pass is then not bit-identical to the MMQ reference (served 50-token prompt 15.0 -> 14.3 s with 512) */
+#endif
     }
 }
 
