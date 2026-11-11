@@ -25,6 +25,16 @@
 #include "ds4.h"
 #include "ds4_gpu.h"
 #include "ds4_image.h"
+#include "argodrive_read.h"
+/* Routed-expert reads may be split over verified full copies of the model on other
+ * drives (DS4_ARGODRIVE_REPLICAS). Without that variable the reader is not opened and
+ * every read is the plain pread of the model descriptor. */
+static ar_reader g_argodrive_reader;
+/* Cumulative successful expert pread bytes per source; the observer subtracts phases. */
+void ar_expert_bytes_snapshot(uint64_t out[3]) {
+    for (unsigned i = 0; i < 3; i++)
+        out[i] = __atomic_load_n(&g_argodrive_reader.source[i].bytes, __ATOMIC_RELAXED);
+}
 #include "ds4_metal_device.h"
 
 /*
@@ -12268,6 +12278,7 @@ void ds4_gpu_cleanup(void) {
         g_moe_q4_up_slots_buffer = nil;
         g_moe_q4_down_slots_buffer = nil;
         g_attn_out_group_ids_buffer = nil;
+        ar_close(&g_argodrive_reader);
         g_model_fd = -1;
         g_model_map_ptr = NULL;
         g_model_map_size = 0;
@@ -13231,6 +13242,13 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
 
 int ds4_gpu_set_model_fd(int fd) {
     g_model_fd = fd;
+    if (!ar_open(&g_argodrive_reader, fd, getenv("DS4_ARGODRIVE_REPLICAS"),
+                 getenv("DS4_ARGODRIVE_PRIMARY_WEIGHT"))) {
+        fprintf(stderr, "ds4: invalid Argodrive replica configuration; expert reads will fail closed\n");
+        return 0;
+    }
+    if (g_argodrive_reader.count)
+        fprintf(stderr, "ds4: Argodrive expert reader sources=%u; Engram unchanged\n", g_argodrive_reader.count);
     return 1;
 }
 
@@ -13822,6 +13840,15 @@ static int ds4_gpu_stream_expert_pread_into(
     }
 
     const double t0 = ds4_gpu_now_ms();
+    if (g_argodrive_reader.invalid) return 0;
+    if (g_argodrive_reader.count) {
+        uint64_t actual = 0;
+        const int split_ok = ar_read(&g_argodrive_reader, offset, len, dst, &actual);
+        if (read_bytes) *read_bytes = actual;
+        if (ms_out) *ms_out = ds4_gpu_now_ms() - t0;
+        if (!split_ok) fprintf(stderr, "ds4: Argodrive partial expert read rejected\n");
+        return split_ok;
+    }
     uint64_t pos = 0;
     int ok = 1;
     while (pos < len) {
