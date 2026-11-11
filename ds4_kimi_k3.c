@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/uio.h>   /* step 132 */
 #include <unistd.h>
 #ifdef __APPLE__
 /* macOS has no O_DIRECT and no posix_fadvise: a private flag asks for F_NOCACHE after open (uncached reads, no alignment rules) */
@@ -235,6 +236,107 @@ static int k3_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
         done += (uint64_t)n;
     }
     return 1;
+}
+
+/* step 132 (experimental): an expert file may be stored with its scale planes recoded exactly ("v2", written by
+   tools/kimi-k3/k31_scale_recode.py): three sections [packed nibbles 5,505,024 | compact scales 90,112] instead of
+   [packed 5,505,024 | one scale byte per block 344,064], 16,785,408 bytes instead of 17,547,264 (4.34 % fewer bytes to read).
+   A compact block is the rows' base bytes (each row's largest scale), 2 bits per block (base - scale: 0, 1, 2; 3 = see the escape
+   table), and at 89,600 an escape table (u16 count, then u32 block index + u8 scale each). A v2 file is recognised by its size and
+   read into the same raw-v1 image in memory: the packed planes land at their raw-v1 offsets and the scales are expanded here, so
+   nothing downstream changes. Only for the K3.1 geometry below. */
+#define K3_V1_BYTES   17547264ull
+#define K3_V2_PACKED  5505024ull
+#define K3_V2_SCALE   344064ull
+#define K3_V2_COMPACT 90112ull
+#define K3_V2_ESC_OFF 89600u
+#define K3_V2_BYTES   (3ull * (K3_V2_PACKED + K3_V2_COMPACT))
+static const uint32_t k3_v2_rows[3] = {3072u, 3584u, 3072u}, k3_v2_blocks[3] = {112u, 96u, 112u};
+static atomic_uint_fast64_t g_stat_v2_reads, g_stat_v2_ns;
+void ds4_k3_expert_source_v2_stats(uint64_t *reads, uint64_t *expand_ns) {
+    if (reads) *reads = atomic_load(&g_stat_v2_reads);
+    if (expand_ns) *expand_ns = atomic_load(&g_stat_v2_ns);
+}
+static void k3_v2_report(void) {
+    const uint64_t r = atomic_load(&g_stat_v2_reads), ns = atomic_load(&g_stat_v2_ns);
+    if (r) fprintf(stderr, "ds4: kimi-k3 expert source: %llu chunk reads came from recoded (v2) files; expanding their scales took %.1f ms in all (%.3f ms per read)\n",
+                   (unsigned long long)r, (double)ns / 1e6, (double)ns / 1e6 / (double)r);
+}
+static int k3_preadv_full(int fd, struct iovec *iov, int n, uint64_t offset) {
+    while (n > 0) {
+        ssize_t r = preadv(fd, iov, n, (off_t)offset);
+        if (r < 0) { if (errno == EINTR) continue; return 0; }
+        if (r == 0) { errno = EIO; return 0; }
+        offset += (uint64_t)r;
+        while (n > 0 && (size_t)r >= iov->iov_len) { r -= (ssize_t)iov->iov_len; iov++; n--; }
+        if (n > 0 && r > 0) { iov->iov_base = (char *)iov->iov_base + r; iov->iov_len -= (size_t)r; }
+    }
+    return 1;
+}
+/* scale bytes [a, b) of plane i (offsets within its 344,064 bytes) from the plane's compact block; dst[0] is byte a */
+static void k3_v2_expand(const uint8_t *comp, int i, uint64_t a, uint64_t b, uint8_t *dst) {
+    const uint32_t rows = k3_v2_rows[i], blocks = k3_v2_blocks[i], q = blocks / 4u;
+    const uint8_t *codes = comp + rows;
+    const uint32_t r0 = (uint32_t)(a / blocks), r1 = (uint32_t)((b + blocks - 1u) / blocks);
+    for (uint32_t r = r0; r < r1 && r < rows; r++) {
+        const uint8_t *c = codes + (size_t)r * q; const uint8_t bs = comp[r];
+        const uint64_t s0 = (uint64_t)r * blocks;
+        uint8_t tmp[128];
+        uint8_t *row = (s0 >= a && s0 + blocks <= b) ? dst + (s0 - a) : tmp;   /* a whole row goes straight to its place */
+        for (uint32_t k = 0; k < q; k++) {
+            const uint8_t v = c[k];
+            row[4u * k] = (uint8_t)(bs - (v & 3u)); row[4u * k + 1u] = (uint8_t)(bs - ((v >> 2) & 3u));
+            row[4u * k + 2u] = (uint8_t)(bs - ((v >> 4) & 3u)); row[4u * k + 3u] = (uint8_t)(bs - (v >> 6));
+        }
+        if (row == tmp) {
+            const uint64_t lo = s0 < a ? a : s0, hi = s0 + blocks > b ? b : s0 + blocks;
+            memcpy(dst + (lo - a), tmp + (lo - s0), (size_t)(hi - lo));
+        }
+    }
+    uint16_t n_esc; memcpy(&n_esc, comp + K3_V2_ESC_OFF, 2);
+    for (uint32_t k = 0; k < n_esc && k < 100u; k++) {
+        uint32_t idx; memcpy(&idx, comp + K3_V2_ESC_OFF + 2u + 5u * k, 4);
+        if (idx >= a && idx < b) dst[idx - a] = comp[K3_V2_ESC_OFF + 2u + 5u * k + 4u];
+    }
+}
+/* [off, off+len) of the raw-v1 image of a v2 file into base+off: one preadv over the file's own contiguous extent */
+static int k3_v2_read_range(int fd, uint8_t *base, uint64_t off, uint64_t len) {
+    static _Thread_local uint8_t *scratch = NULL;   /* three compact blocks, page-aligned for direct I/O */
+    if (!scratch) { void *m = NULL; if (posix_memalign(&m, 4096, (size_t)(3u * K3_V2_COMPACT)) != 0) { errno = ENOMEM; return 0; } scratch = m; }
+    const uint64_t end = off + len, SEC1 = K3_V2_PACKED + K3_V2_SCALE, SEC2 = K3_V2_PACKED + K3_V2_COMPACT;
+    struct iovec iov[6]; int n = 0, have = 0; uint64_t start2 = 0;
+    uint64_t sa[3] = {0, 0, 0}, sb[3] = {0, 0, 0};
+    for (int i = 0; i < 3; i++) {
+        const uint64_t p0 = (uint64_t)i * SEC1, p1 = p0 + K3_V2_PACKED, s1 = p0 + SEC1;
+        const uint64_t a = off > p0 ? off : p0, b = end < p1 ? end : p1;
+        if (a < b) {
+            if (!have) { start2 = (uint64_t)i * SEC2 + (a - p0); have = 1; }
+            iov[n].iov_base = base + a; iov[n].iov_len = (size_t)(b - a); n++;
+        }
+        const uint64_t c = off > p1 ? off : p1, d = end < s1 ? end : s1;
+        if (c < d) {
+            if (!have) { start2 = (uint64_t)i * SEC2 + K3_V2_PACKED; have = 1; }
+            iov[n].iov_base = scratch + (size_t)i * K3_V2_COMPACT; iov[n].iov_len = (size_t)K3_V2_COMPACT; n++;
+            sa[i] = c; sb[i] = d;
+        }
+    }
+    if (n == 0) return 1;
+    if (!k3_preadv_full(fd, iov, n, start2)) return 0;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < 3; i++) {
+        if (sa[i] >= sb[i]) continue;
+        const uint64_t p1 = (uint64_t)i * SEC1 + K3_V2_PACKED;
+        k3_v2_expand(scratch + (size_t)i * K3_V2_COMPACT, i, sa[i] - p1, sb[i] - p1, base + sa[i]);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    if (atomic_fetch_add(&g_stat_v2_reads, 1) == 0) atexit(k3_v2_report);
+    atomic_fetch_add(&g_stat_v2_ns, (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ull + (uint64_t)(t1.tv_nsec - t0.tv_nsec));
+    return 1;
+}
+static int k3_fd_is_v2(int fd) {
+    struct stat st;
+    return g_file_bytes == K3_V1_BYTES && fstat(fd, &st) == 0 && (uint64_t)st.st_size == K3_V2_BYTES;
 }
 
 /* One raw-v1 row (cols/2 packed bytes, cols/32 scale bytes) -> block_mxfp4 row (cols/32 x 17 bytes).
@@ -523,7 +625,7 @@ int ds4_k3_expert_source_read_range_tier(uint32_t layer, uint32_t expert, void *
         }
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
-        const int ok = k3_pread_full(fd, out, len, off);
+        const int ok = k3_fd_is_v2(fd) ? k3_v2_read_range(fd, (uint8_t *)base, off, len) : k3_pread_full(fd, out, len, off);   /* step 132 */
         const int saved = errno;
         clock_gettime(CLOCK_MONOTONIC, &t1);
         /* a buffered read (a filesystem that refuses O_DIRECT, e.g. the kernel APFS driver on tier C) would otherwise
@@ -566,10 +668,11 @@ int ds4_k3_expert_source_read_file_tier(uint32_t layer, uint32_t expert, void *o
             return 0;
         }
         struct stat st;
-        if (fstat(fd, &st) != 0 || (uint64_t)st.st_size != g_file_bytes) { close(fd); errno = EIO; return 0; }
+        const int v2 = k3_fd_is_v2(fd);   /* step 132 */
+        if (!v2 && (fstat(fd, &st) != 0 || (uint64_t)st.st_size != g_file_bytes)) { close(fd); errno = EIO; return 0; }
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
-        const int ok = k3_pread_full(fd, out, g_file_bytes, 0);
+        const int ok = v2 ? k3_v2_read_range(fd, (uint8_t *)out, 0, g_file_bytes) : k3_pread_full(fd, out, g_file_bytes, 0);
         const int saved = errno;
         clock_gettime(CLOCK_MONOTONIC, &t1);
         close(fd);

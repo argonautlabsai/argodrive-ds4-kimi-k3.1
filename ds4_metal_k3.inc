@@ -325,7 +325,7 @@ int ds4_gpu_k3_pool_prepare_staging(uint32_t ff, uint32_t latent, uint32_t n_tok
    layer il's input) hands its ranked top-32 before layer il's experts are read; once those reads are done, while the
    GPU runs the rest of the layer, up to DS4_K3_METAL_PREFETCH (default 4, 0 = off) predicted experts that are not
    cached are read in the background into slabs marked in flight. A layer that routes to one waits for that read. */
-static struct { int k, rank, cold_only; int have; uint32_t layer; int32_t hint[32]; uint32_t n; dispatch_group_t group; uint64_t issued, adopted, dual_rr, used, wasted; uint8_t *pf; } g_k3p = { .k = -1 };
+static struct { int k, rank, cold_only; int have; uint32_t layer; int32_t hint[1024]; uint32_t n; dispatch_group_t group; uint64_t issued, adopted, dual_rr, used, wasted; uint8_t *pf; } g_k3p = { .k = -1 };
 static void k3p_init(void) {
     if (g_k3p.k >= 0) return;
     const char *e = getenv("DS4_K3_METAL_PREFETCH");
@@ -404,15 +404,19 @@ static int32_t k3m_victim(int for_prefetch) {
     }
     return found ? (int32_t)best : -1;
 }
-static void k3p_issue_k(uint32_t layer, int kmax);
+static void k3p_issue_n(uint32_t layer, int kmax, int bulk);
+static int k3m_bulk_pf_div(void);
+static double k3m_bulk_pf_divf(void);
+static void k3p_issue_k(uint32_t layer, int kmax) { k3p_issue_n(layer, kmax, 0); }
 static void k3p_issue(uint32_t layer) {   /* a plain step: DS4_K3_METAL_PREFETCH_ROW1 (default 0) predicted experts */
     static int k1 = -1;
     if (k1 < 0) { const char *e = getenv("DS4_K3_METAL_PREFETCH_ROW1"); k1 = e ? atoi(e) : 2; }
     k3p_issue_k(layer, k1);
 }
-static void k3p_issue_k(uint32_t layer, int kmax) {
-    if (!g_k3p.have || g_k3p.layer != layer || g_k3p.k == 0) return;
-    if (kmax > g_k3p.k) kmax = g_k3p.k;
+/* step M33: bulk = a prompt pass's read-ahead: up to kmax of every predicted expert, most-predicted first */
+static void k3p_issue_n(uint32_t layer, int kmax, int bulk) {
+    if (!g_k3p.have || g_k3p.layer != layer || (g_k3p.k == 0 && !bulk)) return;
+    if (!bulk && kmax > g_k3p.k) kmax = g_k3p.k;
     g_k3p.have = 0;
     const uint64_t S = g_k3m.file_bytes;
     int issued = 0;
@@ -422,7 +426,7 @@ static void k3p_issue_k(uint32_t layer, int kmax) {
         const char *ea = getenv("DS4_K3_RATE_A_GBS"), *eb = getenv("DS4_K3_RATE_B_GBS"), *ec = getenv("DS4_K3_RATE_C_GBS");
         prate[0] = ea && atof(ea) > 0 ? atof(ea) : 13.7; prate[1] = eb && atof(eb) > 0 ? atof(eb) : 7.1; prate[2] = ec && atof(ec) > 0 ? atof(ec) : 6.0;
     }
-    for (uint32_t r = 0; r < g_k3p.n && r < (uint32_t)g_k3p.rank && issued < kmax; r++) {
+    for (uint32_t r = 0; r < g_k3p.n && (bulk || r < (uint32_t)g_k3p.rank) && issued < kmax; r++) {
         const int32_t e = g_k3p.hint[r];
         if (e < 0 || e >= 1024) continue;
         const uint32_t key = (layer << 10) | (uint32_t)e;
@@ -438,7 +442,7 @@ static void k3p_issue_k(uint32_t layer, int kmax) {
         if (g_k3p.pf) { if (g_k3p.pf[v]) g_k3p.wasted++; g_k3p.pf[v] = 1; }   /* stats: a prefetched slab until first use */
         const int ha = ds4_k3_expert_source_has_tier(layer, (uint32_t)e, 0), hb = ds4_k3_expert_source_has_tier(layer, (uint32_t)e, 1);
         int tier = (hb && !ha) ? 1 : (ha && hb) ? ((g_k3p.dual_rr++ % 3u) == 2u ? 1 : 0) : (ha ? 0 : -1);
-        if (ds4_k3_expert_source_has_dir_c()) {   /* step M24: the home that finishes this call's prefetches first */
+        if (bulk || ds4_k3_expert_source_has_dir_c()) {   /* step M24: the home that finishes this call's prefetches first (M33: a read-ahead always) */
             const int hh[3] = { ha, hb, ds4_k3_expert_source_has_tier(layer, (uint32_t)e, 2) };
             double best = 1e300; tier = -1;
             for (int d = 0; d < 3; d++) if (hh[d]) { const double f = (pfl[d] + (double)S) / prate[d]; if (f < best) { best = f; tier = d; } }
@@ -459,11 +463,20 @@ static int k3m_cmp_u32(const void *a, const void *b) { const uint32_t x = *(cons
 /* one token's routed experts: out[latent] = sum, in ascending expert id, of w_e * expert_e(x) (the CUDA deterministic order) */
 /* One slab for (layer, e) at the current tick: a hit (waiting for a prefetch that is reading it), or a miss with a victim
    slab assigned; *miss tells which. A key assigned earlier in the same tick is a hit (its read is in the same batch). */
-static int k3m_lookup(uint32_t layer, uint32_t e, int32_t *slab, int *miss) {
+/* step M32: with `pend` the lookup does not wait for a prefetch that is still reading the slab: it answers a hit and sets *pend, and
+   the caller waits (k3m_wait_pending) after it has issued the layer's own reads, so the other drives work meanwhile */
+static int k3m_lookup2(uint32_t layer, uint32_t e, int32_t *slab, int *miss, int *pend) {
     const uint32_t key = (layer << 10) | e;
     int32_t s = g_k3m.slab_of[key];
     if (s >= 0) {
         int st = atomic_load_explicit(&g_k3m.inflight[s], memory_order_acquire);
+        if (st == 1 && pend) {   /* step M32: adopted while in flight */
+            *pend = 1;
+            if (g_k3m.last_use[s] != g_k3m.tick) { g_k3m.hits++; g_k3p.adopted++; }
+            if (g_k3p.pf && g_k3p.pf[s]) { g_k3p.pf[s] = 0; g_k3p.used++; }
+            if (!g_k3m_verify && g_k3m.val_of[s] == 0.0f) g_k3m.val_of[s] = k3m_keep_value(layer, e);
+            g_k3m.last_use[s] = g_k3m.tick; *slab = s; *miss = 0; return 1;
+        }
         if (st == 1) {   /* step M4: a prefetch is reading it */
             const double tw = ds4_gpu_now_ms();
             while ((st = atomic_load_explicit(&g_k3m.inflight[s], memory_order_acquire)) == 1) usleep(20);
@@ -490,18 +503,52 @@ static int k3m_lookup(uint32_t layer, uint32_t e, int32_t *slab, int *miss) {
     *slab = v; *miss = 1;
     return 1;
 }
+static int k3m_pend_on(void) {   /* step M32: DS4_K3_METAL_PEND, bit 0 = plain steps (on by default), bit 1 = batches (blocks; no gain measured, off); 0 = off */
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DS4_K3_METAL_PEND"); on = e ? atoi(e) : 1; if (on < 0) on = 0;   /* 1 since 11 Nov 2026: plain decode 1.375 -> 1.425 tok/s on three homes */
+                  if (on & 1) fprintf(stderr, "ds4: K3 on Metal: a plain step issues its reads before it waits for adopted prefetches (step M32)\n");
+                  if (on & 2) fprintf(stderr, "ds4: K3 on Metal: a block looks up its cached experts first and does not wait for adopted prefetches (step M32b)\n"); }
+    return on;
+}
 /* Read n missed experts into their slabs, all at once. Step M3: an expert with one home is read there; the experts on
    both the primary directory (tier 0) and dir_b (tier 1) are split at one 16 KB-aligned cut so both drives finish together at
    their rates (DS4_K3_RATE_A_GBS / DS4_K3_RATE_B_GBS, default 14 / 7; DS4_K3_BALANCE=0 reads the first home only). */
 typedef void (^k3m_ready_fn)(const uint32_t *ms, uint32_t k, int last);   /* step M25b: miss indices whose reads completed */
-static int k3m_read_misses_cb(uint32_t layer, const uint32_t *exps, const int32_t *slabs, uint32_t n, k3m_ready_fn ready, uint32_t chunk);
+/* step M33: adopt[m] != 0 marks an entry whose slab a prefetch is already reading: no read is issued for it, it completes (and, in
+   the chunked form, is handed to `ready`) when that prefetch is done; a failed prefetch is read here */
+static int k3m_read_misses_ad(uint32_t layer, const uint32_t *exps, const int32_t *slabs, uint32_t n, k3m_ready_fn ready, uint32_t chunk, const uint8_t *adopt);
 static int k3m_read_misses(uint32_t layer, const uint32_t *exps, const int32_t *slabs, uint32_t n) {
-    return k3m_read_misses_cb(layer, exps, slabs, n, nil, 0u);
+    return k3m_read_misses_ad(layer, exps, slabs, n, nil, 0u, NULL);
 }
-static int k3m_read_misses_cb(uint32_t layer, const uint32_t *exps, const int32_t *slabs, uint32_t n, k3m_ready_fn ready, uint32_t chunk) {
+static int k3m_read_whole(uint32_t layer, uint32_t e, uint8_t *dst) {   /* one expert from any home that has it */
+    for (int tier = 0; tier < 3; tier++)
+        if (ds4_k3_expert_source_has_tier(layer, e, tier) && ds4_k3_expert_source_read_range_tier(layer, e, dst, 0, g_k3m.file_bytes, 1, tier, NULL)) return 1;
+    return ds4_k3_expert_source_read_file_tier(layer, e, dst, 1, 0);
+}
+/* step M32: the prefetches a layer adopted while they were in flight; one that failed is read here, into the same slab */
+static int k3m_wait_pending(uint32_t layer, const uint32_t *exps, const int32_t *slabs, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        const int32_t s = slabs[i];
+        int st = atomic_load_explicit(&g_k3m.inflight[s], memory_order_acquire);
+        if (st == 1) {
+            const double tw = ds4_gpu_now_ms();
+            while ((st = atomic_load_explicit(&g_k3m.inflight[s], memory_order_acquire)) == 1) usleep(20);
+            g_k3m.wait_s += (ds4_gpu_now_ms() - tw) / 1e3;
+        }
+        if (st == 2) {
+            atomic_store_explicit(&g_k3m.inflight[s], 0, memory_order_release);
+            if (!k3m_read_misses(layer, &exps[i], &slabs[i], 1u)) return 0;
+        }
+    }
+    return 1;
+}
+static int k3m_read_misses_ad(uint32_t layer, const uint32_t *exps, const int32_t *slabs, uint32_t n, k3m_ready_fn ready, uint32_t chunk, const uint8_t *adopt) {
     if (n == 0u) return 1;
+    uint32_t n_adopt = 0;
+    if (adopt) for (uint32_t m = 0; m < n; m++) if (adopt[m]) n_adopt++;
+    if (n_adopt == 0u) adopt = NULL;
     int busy = g_k3m_batching != 1;   /* unbatched: synchronize as before */
-    for (uint32_t m = 0; m < n && !busy; m++) busy = g_batch_cb && g_k3m.epoch_of[slabs[m]] == g_k3m_epoch;
+    for (uint32_t m = 0; m < n && !busy; m++) busy = !(adopt && adopt[m]) && g_batch_cb && g_k3m.epoch_of[slabs[m]] == g_k3m_epoch;
     if (busy && !ds4_gpu_synchronize()) return 0;   /* nothing may still read a slab being refilled */
     static int bal = -1, three = 0; static double ra = 13.7, rb = 7.1, rc = 6.0;
     if (bal < 0) {
@@ -529,7 +576,7 @@ static int k3m_read_misses_cb(uint32_t layer, const uint32_t *exps, const int32_
                 const int h0 = ds4_k3_expert_source_has_tier(layer, exps[m], 0), h1 = ds4_k3_expert_source_has_tier(layer, exps[m], 1),
                           h2 = ds4_k3_expert_source_has_tier(layer, exps[m], 2);
                 const int nh = h0 + h1 + h2;
-                if (nh != want) continue;
+                if (nh != want || (adopt && adopt[m])) continue;
                 uint8_t *dst = k3m_slab_ptr((uint32_t)slabs[m], NULL, NULL);
                 if (nh == 0) { jobs[nj++] = (k3m_job){ exps[m], -1, 0, S, dst, m }; continue; }
                 int hs[3], k = 0;
@@ -563,6 +610,7 @@ static int k3m_read_misses_cb(uint32_t layer, const uint32_t *exps, const int32_
             }
     } else
     for (uint32_t m = 0; m < n; m++) {
+        if (adopt && adopt[m]) continue;
         uint8_t *dst = k3m_slab_ptr((uint32_t)slabs[m], NULL, NULL);
         const int ha = ds4_k3_expert_source_has_tier(layer, exps[m], 0), hb = ds4_k3_expert_source_has_tier(layer, exps[m], 1);
         if (bal && ha && hb) { dual[nd++] = m; continue; }
@@ -593,6 +641,15 @@ static int k3m_read_misses_cb(uint32_t layer, const uint32_t *exps, const int32_
                                        : ds4_k3_expert_source_read_range_tier(layer, jb.e, jb.dst, jb.off, jb.len, 1, jb.tier, NULL);
             if (!ok) fail = 1;
         });
+        if (adopt) for (uint32_t m = 0; m < n; m++) {   /* step M33 */
+            if (!adopt[m]) continue;
+            int st;
+            while ((st = atomic_load_explicit(&g_k3m.inflight[slabs[m]], memory_order_acquire)) == 1) usleep(20);
+            if (st == 2) {
+                atomic_store_explicit(&g_k3m.inflight[slabs[m]], 0, memory_order_release);
+                if (!k3m_read_whole(layer, exps[m], k3m_slab_ptr((uint32_t)slabs[m], NULL, NULL))) fail = 1;
+            }
+        }
     } else {   /* step M25b: the reads run on the workers; this thread encodes the completed experts in chunks */
         _Atomic uint32_t *left = calloc(n, sizeof(_Atomic uint32_t));
         uint32_t *doneq = malloc(sizeof(uint32_t) * n);
@@ -617,6 +674,32 @@ static int k3m_read_misses_cb(uint32_t layer, const uint32_t *exps, const int32_
                 }
             });
         });
+        if (adopt) {   /* step M33: one watcher hands over the adopted prefetches as they complete */
+            const uint8_t *ap = adopt;
+            dispatch_group_async(grp, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                uint8_t *dn = calloc(n, 1);
+                uint32_t rem = n_adopt;
+                while (rem) {
+                    int moved = 0;
+                    for (uint32_t m = 0; m < n; m++) {
+                        if (!ap[m] || (dn && dn[m])) continue;
+                        int st = atomic_load_explicit(&g_k3m.inflight[slabs[m]], memory_order_acquire);
+                        if (st == 1 && dn) continue;
+                        while (st == 1) { usleep(20); st = atomic_load_explicit(&g_k3m.inflight[slabs[m]], memory_order_acquire); }   /* no memory for the marks: in order */
+                        if (st == 2) {
+                            atomic_store_explicit(&g_k3m.inflight[slabs[m]], 0, memory_order_release);
+                            if (!k3m_read_whole(layer, exps[m], k3m_slab_ptr((uint32_t)slabs[m], NULL, NULL))) fail = 1;
+                        }
+                        if (dn) dn[m] = 1;
+                        rem--; moved = 1;
+                        os_unfair_lock_lock(&dq->lock); qp[dq->ndone++] = m; os_unfair_lock_unlock(&dq->lock);
+                        dispatch_semaphore_signal(sem);
+                    }
+                    if (!moved) usleep(50);
+                }
+                free(dn);
+            });
+        }
         uint32_t consumed = 0, seen = 0;
         if (chunk == 0u) chunk = 1u;
         while (consumed < n) {
@@ -642,7 +725,7 @@ static int k3m_read_misses_cb(uint32_t layer, const uint32_t *exps, const int32_
     }
     free(jobs); free(dual);
     g_k3m.wait_s += (ds4_gpu_now_ms() - t0) / 1e3;
-    g_k3m.bytes += (uint64_t)n * S;
+    g_k3m.bytes += (uint64_t)(n - n_adopt) * S;   /* the layer's own reads (a read-ahead's bytes are in the lookahead report) */
     if (fail) {
         for (uint32_t m = 0; m < n; m++) { const int32_t sl = slabs[m]; if (g_k3m.key_of[sl] != 0xffffffffu) g_k3m.slab_of[g_k3m.key_of[sl]] = -1; g_k3m.key_of[sl] = 0xffffffffu; g_k3m.last_use[sl] = 0; }
         fprintf(stderr, "ds4: K3 on Metal: expert read failed (layer %u)\n", layer);
@@ -807,20 +890,25 @@ int ds4_gpu_k3_moe_raw_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, cons
     k3m_batching_init();
     @autoreleasepool {
         uint32_t ord[64], mexp[64]; float w[64]; int32_t slab[64], mslab[64]; uint32_t n_miss = 0;
+        uint32_t pexp[64]; int32_t pslab[64]; uint32_t n_pend = 0;   /* step M32: adopted prefetches still in flight */
+        const int pend_on = k3m_pend_on() & 1;
         if (!k3m_order_row(selected, weights, n_used, ord, w)) return 0;
         g_k3m.tick++;
         for (uint32_t j = 0; j < n_used; j++) {
-            int miss = 0;
-            if (!k3m_lookup(layer, ord[j] >> 6, &slab[j], &miss)) return 0;
+            int miss = 0, pend = 0;
+            if (!k3m_lookup2(layer, ord[j] >> 6, &slab[j], &miss, pend_on ? &pend : NULL)) return 0;
             if (miss) { mexp[n_miss] = ord[j] >> 6; mslab[n_miss++] = slab[j]; }
+            else if (pend) { pexp[n_pend] = ord[j] >> 6; pslab[n_pend++] = slab[j]; }
         }
+        const uint32_t n_late = n_miss + n_pend;   /* what the layer cannot compute yet */
         static int ovl = -1;
         if (ovl < 0) { const char *e = getenv("DS4_K3_OVERLAP"); ovl = e ? atoi(e) != 0 : 1; }
-        if (ovl && g_k3m_batching == 1 && k3m_moe_v2() >= 2 && !getenv("DS4_K3_MOE_CHECK") && n_miss > 0u && n_miss < n_used) {
+        if (ovl && g_k3m_batching == 1 && k3m_moe_v2() >= 2 && !getenv("DS4_K3_MOE_CHECK") && n_late > 0u && n_late < n_used) {
             /* step M20: the cached experts first, committed without a wait, then the reads, then the missed experts and the reduce */
             int32_t sa[64], sbm[64];
             for (uint32_t j = 0; j < n_used; j++) {
                 int m = 0; for (uint32_t q = 0; q < n_miss; q++) if (mslab[q] == slab[j]) { m = 1; break; }
+                for (uint32_t q = 0; q < n_pend && !m; q++) if (pslab[q] == slab[j]) m = 1;   /* step M32 */
                 sa[j] = m ? -1 : slab[j]; sbm[j] = m ? slab[j] : -1;
             }
             int owned = 0;
@@ -832,6 +920,7 @@ int ds4_gpu_k3_moe_raw_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, cons
             ds4_gpu_end_compute_encoder(cb, enc);
             if (!ds4_gpu_flush_commands()) return 0;
             if (!k3m_read_misses(layer, mexp, mslab, n_miss)) return 0;
+            if (!k3m_wait_pending(layer, pexp, pslab, n_pend)) return 0;   /* step M32 */
             id<MTLComputePipelineState> pr = ds4_gpu_get_pipeline("kernel_k3_moe_reduce");
             if (!pr) return 0;
             cb = ds4_gpu_command_buffer(&owned);
@@ -851,6 +940,7 @@ int ds4_gpu_k3_moe_raw_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, cons
             return 1;
         }
         if (!k3m_read_misses(layer, mexp, mslab, n_miss)) return 0;
+        if (!k3m_wait_pending(layer, pexp, pslab, n_pend)) return 0;   /* step M32 */
         const int ok = k3m_encode_row(out, x, slab, w, n_used, ff, latent, beta, beta_linear);
         k3p_init();
         k3p_issue(layer + 1u);
@@ -1044,21 +1134,37 @@ int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x
             memset(cnt, 0, sizeof cnt);
             for (size_t q = 0; q < R; q++) { const int32_t e = selected[q]; if (e >= 0 && e < 1024 && cnt[e] < 255u) cnt[e]++; }
         }
+        /* step M33: a prompt pass that reads ahead looks its rows up in two rounds: first the experts that are cached or being read
+           ahead, then the missed ones, so a miss never takes the slab of an expert that a later row of this layer uses. It does not
+           wait for a read-ahead still in flight either: that expert joins the missed ones (adopt) and is computed when its read is
+           done, so the layer's own reads start at once. n_miss then counts both. Only the order of the reads changes. */
+        const int pend_b = (!g_k3m_verify && n_tok > 16u && k3m_bulk_pf_div() > 0) || (n_tok > 1u && (k3m_pend_on() & 2));   /* step M32b: blocks, by knob */
+        uint8_t *adoptf = pend_b ? calloc(R, 1) : NULL;
+        uint8_t pseen[1024]; uint32_t n_adopt = 0;
+        if (pend_b) { memset(pseen, 0, sizeof pseen); if (!adoptf) ok = 0; }
         if (ok) {
             g_k3m.tick++;
-            for (uint32_t t = 0; ok && t < n_tok; t++) {
+            for (uint32_t t = 0; ok && t < n_tok; t++)
                 ok = k3m_order_row(selected + (size_t)t * n_used, weights + (size_t)t * n_used, n_used, ord + (size_t)t * n_used, w + (size_t)t * n_used);
-                for (uint32_t j = 0; ok && j < n_used; j++) {
-                    const size_t q = (size_t)t * n_used + j;
-                    int miss = 0;
-                    ok = k3m_lookup(layer, ord[q] >> 6, &slab[q], &miss);
+            if (ok && pend_b) for (size_t q = 0; q < R; q++) slab[q] = -1;
+            for (int round = pend_b ? 0 : 1; ok && round < 2; round++)
+                for (size_t q = 0; ok && q < R; q++) {
+                    const uint32_t e = ord[q] >> 6;
+                    if (pend_b) {
+                        if (round == 0 ? !(e < 1024u && g_k3m.slab_of[(layer << 10) | e] >= 0) : slab[q] >= 0) continue;
+                    }
+                    int miss = 0, pend = 0;
+                    ok = k3m_lookup2(layer, e, &slab[q], &miss, pend_b ? &pend : NULL);
                     if (ok && miss) {
-                        mexp[n_miss] = ord[q] >> 6; mslab[n_miss++] = slab[q];
-                        if (admit && cnt[ord[q] >> 6] < admit) g_k3m.val_of[slab[q]] = 0.0f;   /* step M14: transient fill */
+                        mexp[n_miss] = e; mslab[n_miss++] = slab[q];
+                        if (admit && cnt[e] < admit) g_k3m.val_of[slab[q]] = 0.0f;   /* step M14: transient fill */
+                    } else if (ok && pend && e < 1024u && !pseen[e]) {
+                        pseen[e] = 1; adoptf[n_miss] = 1; n_adopt++;
+                        mexp[n_miss] = e; mslab[n_miss++] = slab[q];
                     }
                 }
-            }
         }
+        const uint8_t *adp = n_adopt ? adoptf : NULL;
         static int mt = -1, mt_check = -1;
         if (mt < 0) { const char *e = getenv("DS4_K3_MOE_MT"); mt = e ? atoi(e) != 0 : 1; const char *c = getenv("DS4_K3_MOE_MT_CHECK"); mt_check = c ? atoi(c) : 0; }
         static int ovl = -1;
@@ -1084,13 +1190,13 @@ int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x
             uint32_t *el = malloc(sizeof(uint32_t) * n_miss);
             if (!el) ok = 0;
             const uint32_t *mx = mexp; const uint32_t *ordp = ord; const float *wp = w; const int32_t *slp = slab; const uint8_t *emp = emiss;
-            if (ok) ok = k3m_read_misses_cb(layer, mexp, mslab, n_miss, ^(const uint32_t *ms, uint32_t k, int last) {
+            if (ok) ok = k3m_read_misses_ad(layer, mexp, mslab, n_miss, ^(const uint32_t *ms, uint32_t k, int last) {
                 if (!cok) return;
                 for (uint32_t i = 0; i < k; i++) el[i] = mx[ms[i]];
                 g_k3m_mt_elist = el; g_k3m_mt_ne = k;
                 cok = k3m_encode_batch_mt_ph(out, x, ordp, wp, slp, n_tok, n_used, ff, latent, beta, beta_linear, last ? 5 : 4, emp, 0u);
                 g_k3m_mt_elist = NULL; g_k3m_mt_ne = 0;
-            }, (n_miss + (uint32_t)nw_env - 1u) / (uint32_t)nw_env);
+            }, (n_miss + (uint32_t)nw_env - 1u) / (uint32_t)nw_env, adp);
             if (ok) ok = cok;
             free(el);
         } else if (ok && ph) {
@@ -1098,11 +1204,11 @@ int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x
             for (uint32_t wv = 0; ok && wv < W; wv++) {
                 uint32_t me = mb;
                 while (me < n_miss && emiss[mexp[me]] == wv + 1u) me++;
-                ok = k3m_read_misses(layer, mexp + mb, mslab + mb, me - mb);
+                ok = k3m_read_misses_ad(layer, mexp + mb, mslab + mb, me - mb, nil, 0u, adp ? adp + mb : NULL);
                 if (ok) ok = k3m_encode_batch_mt_ph(out, x, ord, w, slab, n_tok, n_used, ff, latent, beta, beta_linear, wv + 1u < W ? 3 : 2, emiss, wv);
                 mb = me;
             }
-        } else if (ok && !(ok = k3m_read_misses(layer, mexp, mslab, n_miss))) {
+        } else if (ok && !(ok = k3m_read_misses_ad(layer, mexp, mslab, n_miss, nil, 0u, adp))) {
         } else if (ok && mt && n_tok > 1u && n_used <= 16u && k3m_moe_v2() >= 3) {
             if (mt_check > 0) {   /* the per-row path into a side tensor first, compared after the batch */
                 ref = ds4_gpu_tensor_alloc((uint64_t)n_tok * latent * 4u);
@@ -1137,8 +1243,14 @@ int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x
                 k3m_views_free(&vs);
             }
         }
-        if (ok && n_tok <= 16u) { k3p_init(); k3p_issue_k(layer + 1u, g_k3p.k); }   /* step M24: the next layer's predicted experts */
-        free(ord); free(mexp); free(w); free(slab); free(mslab);
+        if (ok && (n_tok <= 16u || (g_k3m_verify && n_tok <= 64u))) { k3p_init(); k3p_issue_k(layer + 1u, g_k3p.k); }   /* step M24: the next layer's predicted experts; step M31: wider blocks too */
+        else if (ok && !g_k3m_verify && k3m_bulk_pf_div() > 0) {   /* step M33: a prompt pass's read-ahead */
+            k3p_init();
+            double kf = (double)n_tok / k3m_bulk_pf_divf();
+            int kb = kf > 1024.0 ? 1024 : (int)kf;
+            if (kb > 0) k3p_issue_n(layer + 1u, kb, 1);
+        }
+        free(ord); free(mexp); free(w); free(slab); free(mslab); free(adoptf);
         return ok;
     }
 }
@@ -1422,8 +1534,43 @@ int ds4_gpu_k3_dsa_mask_tensor(ds4_gpu_tensor *mask, const ds4_gpu_tensor *selec
         [enc dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }, "K3 DSA mask");
 }
+/* step M33: DS4_K3_METAL_PREFILL_PF=<d> (default 1, 0 = off; may be a fraction): a prompt pass of more than 16
+   tokens reads ahead one predicted expert of the next layer per d tokens (n_tok / d of them, most-predicted first), issued when this
+   layer's own reads are done, so the drives keep working through the layer's GPU tail and the next layer's attention. The
+   prediction is the CUDA engine's: the next layer's router on this layer's router input, each expert counted by the rows that
+   would route to it (counted on the host). */
+static double k3m_bulk_pf_divf(void) {
+    static double d = -1.0;
+    if (d < 0.0) { const char *e = getenv("DS4_K3_METAL_PREFILL_PF"); d = e ? atof(e) : 1.0; if (!(d > 0.0)) d = 0.0;   /* 1 since 11 Nov 2026: a 512-token pass 60.7 -> 44.9 s on three homes */
+                   if (d > 0.0) fprintf(stderr, "ds4: K3 on Metal: prompt passes read ahead one predicted expert of the next layer per %.2f tokens (step M33)\n", d); }
+    return d;
+}
+static int k3m_bulk_pf_div(void) { return k3m_bulk_pf_divf() > 0.0; }   /* on or off */
 int ds4_gpu_k3_route_hist(uint32_t *counts, const ds4_gpu_tensor *logits, const float *bias, uint32_t n_tok, uint32_t n_expert, uint32_t n_used) {
-    (void)counts; (void)logits; (void)bias; (void)n_tok; (void)n_expert; (void)n_used; return 0;
+    if (!counts || !logits || !bias || n_tok <= 16u || n_expert == 0u || n_expert > 1024u || n_used == 0u || n_used > 64u) return 0;
+    if (g_k3m_verify || k3m_bulk_pf_div() == 0) return 0;   /* blocks and short batches have the M24 lookahead */
+    const uint64_t bytes = (uint64_t)n_tok * n_expert * sizeof(float);
+    if (ds4_gpu_tensor_bytes(logits) < bytes) return 0;
+    float *lg = malloc((size_t)bytes);
+    if (!lg) return 0;
+    if (!ds4_gpu_tensor_read(logits, 0, lg, bytes)) { free(lg); return 0; }
+    memset(counts, 0, sizeof(uint32_t) * n_expert);
+    for (uint32_t t = 0; t < n_tok; t++) {
+        const float *row = lg + (size_t)t * n_expert;
+        float tc[64]; uint32_t te[64], n = 0;
+        for (uint32_t e = 0; e < n_expert; e++) {
+            const float x = row[e];
+            const float c = (x >= 0.0f ? 1.0f / (1.0f + expf(-x)) : expf(x) / (1.0f + expf(x))) + bias[e];
+            if (n == n_used && !(c > tc[n - 1u])) continue;
+            uint32_t i = n < n_used ? n : n - 1u;
+            while (i > 0 && c > tc[i - 1u]) { tc[i] = tc[i - 1u]; te[i] = te[i - 1u]; i--; }
+            tc[i] = c; te[i] = e;
+            if (n < n_used) n++;
+        }
+        for (uint32_t i = 0; i < n; i++) counts[te[i]]++;
+    }
+    free(lg);
+    return 1;
 }
 int ds4_gpu_k3_cache_grow(void) { return 1; }
 uint64_t ds4_gpu_k3_cache_lend(void) { return 0; }
@@ -1446,8 +1593,8 @@ void ds4_gpu_k3_skip_stats(uint64_t *skipped, double *mass, uint64_t *obs_n, uin
 uint64_t ds4_gpu_k3_cache_copydowns(void) { return 0; }
 void ds4_gpu_k3_prefetch_hint(uint32_t layer, const int32_t *experts, uint32_t n) {
     k3p_init();
-    if (g_k3p.k == 0 || !experts || layer >= 128u) return;
-    g_k3p.n = n > 32u ? 32u : n;
+    if ((g_k3p.k == 0 && k3m_bulk_pf_div() == 0) || !experts || layer >= 128u) return;
+    g_k3p.n = n > 1024u ? 1024u : n;   /* step M33: a prompt pass hands every predicted expert (plain steps and blocks use the first 32) */
     memcpy(g_k3p.hint, experts, sizeof(int32_t) * g_k3p.n);
     g_k3p.layer = layer; g_k3p.have = 1;
 }
@@ -1458,6 +1605,9 @@ void ds4_gpu_k3_lookahead_report(void) {   /* step M24 stats */
                               (unsigned long long)g_k3p.wasted, (unsigned long long)g_k3p.adopted);
 }
 void ds4_gpu_k3_set_verify(int on) { g_k3m_verify = on; }   /* step M14 */
+void *ds4_gpu_k3_host_alloc(uint64_t bytes, int *pinned) { if (pinned) *pinned = 0; return malloc((size_t)bytes); }   /* unified memory: nothing to pin */
+void ds4_gpu_k3_host_free(void *p, int pinned) { (void)pinned; free(p); }
+int ds4_gpu_k3_verify_prepare(uint32_t rows, uint32_t n_used, uint32_t n_expert, uint32_t latent) { (void)rows; (void)n_used; (void)n_expert; (void)latent; return 1; }   /* CUDA step 128 */
 int ds4_gpu_k3_mla_cache_elem_bytes(void) { return 4; }
 void ds4_gpu_k3_queue_stats(double *wait_s, uint64_t *n_waits, uint64_t *pf_hit) { if (wait_s) *wait_s = 0; if (n_waits) *n_waits = 0; if (pf_hit) *pf_hit = 0; }
 void ds4_gpu_k3_set_spine_gemm_max(uint32_t n) { (void)n; }

@@ -3732,6 +3732,9 @@ int ds4_gpu_k3_memset_tensor(ds4_gpu_tensor *t, uint64_t offset, int value, uint
 void ds4_gpu_k3_prefetch_hint(uint32_t layer, const int32_t *experts, uint32_t n);   /* ranked candidates for a layer */
 void ds4_gpu_k3_prefetch_stats(uint64_t *issued, uint64_t *adopted);
 void ds4_gpu_k3_set_verify(int on);
+void *ds4_gpu_k3_host_alloc(uint64_t bytes, int *pinned);   /* step 129b: page-locked when the backend can (CUDA), else malloc; *pinned says which */
+void ds4_gpu_k3_host_free(void *p, int pinned);
+int ds4_gpu_k3_verify_prepare(uint32_t rows, uint32_t n_used, uint32_t n_expert, uint32_t latent);   /* step 128: partials for blocks of up to `rows` rows; 1 = ready */
 int ds4_gpu_k3_mla_cache_elem_bytes(void);   /* step 48: 4 (fp32) or 2 (DS4_K3_MLA_CACHE=f16|bf16) */
 /* step 46: the native DSpark drafter (ds4_k3_draft.cuh) */
 int ds4_gpu_k3_draft_load(const char *dir, uint32_t cache_cap);

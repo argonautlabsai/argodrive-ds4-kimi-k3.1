@@ -32,6 +32,7 @@ int  ds4_k3_expert_source_has_dir_c(void);
 int  ds4_k3_expert_source_has_dir_d(void);   /* step 67: tier D (DS4_K3_EXPERT_DIR_D), a fourth home */
 int  ds4_k3_expert_source_has_tier(uint32_t layer, uint32_t expert, int tier);   /* step 38: 0 primary, 1 dir_b, 2 dir_c */
 int  ds4_k3_expert_source_probe_tier(int tier, uint32_t layer, uint32_t expert);   /* step 42: 1 direct I/O, 2 buffered only, -1 no file, 0 tier unset */
+void ds4_k3_expert_source_v2_stats(uint64_t *reads, uint64_t *expand_ns);   /* step 132: chunk reads of recoded (v2) files and the nanoseconds spent expanding their scales */
 int  ds4_k3_expert_source_read_range_tier(uint32_t layer, uint32_t expert, void *base, uint64_t off, uint64_t len,
                                           int direct, int want_tier, int *tier_used);   /* step 38: chunk read from one tier (-1 chain) */
 void ds4_k3_expert_source_tier_stat(int tier, uint64_t *reads, uint64_t *ns);   /* 0 primary, 1 dir_b (Samsung), 2 dir_c */

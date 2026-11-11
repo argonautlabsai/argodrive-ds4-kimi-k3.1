@@ -38120,6 +38120,13 @@ struct k3_lru {
         transient[s] = 1;
         order.erase(pos[s]); order.push_back(s); pos[s] = std::prev(order.end());
     }
+    /* step 124: an entry that turned out not to be needed keeps its content but goes to the cold end as a transient, so the next
+       allocation takes it before any resident entry (a later lookup still hits it and makes it resident again) */
+    void demote(uint32_t s) {
+        if (key[s] == K3_NOKEY) return;
+        transient[s] = 1; warm[s] = 0; chance[s] = 0; score[s] = -1e30f;
+        order.erase(pos[s]); order.push_back(s); pos[s] = std::prev(order.end());
+    }
     /* step 97: slabs n.. leave the cache (the caller dropped them and owns their memory) */
     void shrink(uint32_t n) {
         for (uint32_t s = n; s < cap; s++) { drop(s); order.erase(pos[s]); }
@@ -38156,6 +38163,20 @@ struct k3_raw_pool {
     std::deque<uint32_t> hpf_done;                   /* step 117, under mu: host slabs whose host-only read finished */
     std::condition_variable cv_hfill;
     std::atomic<uint64_t> hpf_issued{0}, hpf_used{0}, hpf_failed{0};
+    /* step 121: DS4_K3_VERIFY_PF_SCALE (0 off): a verification block reads ahead one plain-step quota per this many rows;
+       DS4_K3_VERIFY_PF_DEV=0 scales the host-only reads alone */
+    uint32_t vpf_scale = 0; int vpf_dev = 1;
+    /* step 124: DS4_K3_PREFETCH_HOST_COLD (0 off): a host-only read the layer it was aimed at did not use leaves the hot end */
+    int hpf_cold = 0;
+    std::vector<uint32_t> hpf_list, hpf_tgt;         /* main thread: host slabs of unresolved host-only reads / the layer each is for (~0: none) */
+    std::vector<uint8_t> hpf_dem;                    /* main thread: demote when its read settles */
+    std::atomic<uint64_t> hpf_demoted{0};
+    /* step 126: DS4_K3_PREFILL_PREFETCH_HOST (0 off): past the device read-ahead a prompt pass reads up to this many more of the
+       next layer's predicted experts into the host pool alone, held there until that layer has used or passed them, so the
+       drives keep working through a long pass's attention and spine GEMMs */
+    uint32_t bulk_hpf_max = 0, bulk_hpf_inflight = 256;
+    std::vector<uint8_t> hpf_hold;                   /* main thread: host slab -> 1 while it is held for its layer */
+    std::atomic<uint64_t> bhpf_issued{0}, bhpf_used{0}, bhpf_dropped{0};
     int admit_mode = 0;                               /* step 113: DS4_K3_COPYDOWN_ADMIT (0 all, 1 TinyLFU, n > 1 uses >= n) */
     std::vector<uint8_t> freq;                        /* step 113: (layer << 10 | expert) -> decode uses, halved each period */
     uint64_t freq_ops = 0, freq_period = 0;
@@ -38169,6 +38190,7 @@ struct k3_raw_pool {
     uint32_t part_cap = 0;
     uint32_t *host_tok = nullptr, *dev_tok = nullptr; /* (token, weight) lists grouped by expert: pinned + device */
     uint32_t *host_tent = nullptr, *dev_tent = nullptr, *dev_iota = nullptr; float *dev_cpart = nullptr; size_t cpart_cap = 0;   /* step 76 */
+    size_t vprep_floats = 0;                        /* step 133: what verification blocks need of dev_cpart (ds4_gpu_k3_verify_prepare) */
     float *host_tw = nullptr, *dev_tw = nullptr;
     size_t list_cap = 0;
     int device = 0, direct = 1;
@@ -38453,8 +38475,17 @@ static void k3_hpf_settle(k3_raw_pool &p, uint32_t h) {
     if (!p.hpf_busy[h]) return;
     p.hpf_busy[h] = 0; if (p.hpf_inflight) p.hpf_inflight--;
     p.hc.filling[h] = 0;
-    if (p.hfail[h]) { p.hpf_failed++; if (!p.hup[h]) { p.hc.pinned[h] = 0; p.hc.drop(h); p.hfail[h] = 0; } return; }
-    if (!p.hup[h]) p.hc.pinned[h] = 0;
+    const bool dem = p.hpf_dem[h] != 0;   /* steps 124, 126: its layer passed without using it while the read was in flight */
+    p.hpf_dem[h] = 0;
+    if (p.hfail[h]) { p.hpf_failed++; if (!p.hup[h]) { p.hc.pinned[h] = 0; p.hc.drop(h); p.hfail[h] = 0; p.hpf_hold[h] = 0; } return; }
+    if (p.hup[h]) return;   /* an upload from the slab is pending: it stays pinned, and that fill's completion releases it */
+    const bool mine = p.hpf_key[h] != K3_NOKEY && p.hc.key[h] == p.hpf_key[h];
+    if (p.hpf_hold[h]) {    /* step 126: held for its layer; released here only when that layer has already passed */
+        if (dem) { p.hpf_hold[h] = 0; p.hc.pinned[h] = 0; if (mine) { p.hc.drop(h); p.bhpf_dropped++; } }
+        return;
+    }
+    p.hc.pinned[h] = 0;
+    if (dem && mine) { p.hc.demote(h); p.hpf_demoted++; }
 }
 static void k3_hpf_drain(k3_raw_pool &p) {   /* pool mutex held */
     while (!p.hpf_done.empty()) { const uint32_t hh = p.hpf_done.front(); p.hpf_done.pop_front(); k3_hpf_settle(p, hh); }
@@ -38591,6 +38622,29 @@ static bool k3_raw_pool_ensure(uint32_t ff, uint32_t latent) {
     p.hpf_rank = k3_env_u32("DS4_K3_PREFETCH_HOST_RANK", 8u); if (p.hpf_rank > 32u) p.hpf_rank = 32u;
     p.hpf_inflight_max = k3_env_u32("DS4_K3_PREFETCH_HOST_INFLIGHT", 8u);
     p.hwait.assign(cap_host, 0); p.hfail.assign(cap_host, 0); p.hpf_busy.assign(cap_host, 0); p.hup.assign(cap_host, 0); p.hpf_key.assign(cap_host, K3_NOKEY);
+    p.vpf_scale = k3_env_u32("DS4_K3_VERIFY_PF_SCALE", 0u);   /* step 121 */
+    p.vpf_dev = (int)k3_env_u32("DS4_K3_VERIFY_PF_DEV", 1u);
+    if (p.vpf_scale) fprintf(stderr, "ds4: kimi-k3 verification block read-ahead (step 121): one plain-step quota per %u rows, %s\n",
+                             p.vpf_scale, p.vpf_dev ? "device and host-only reads" : "host-only reads");
+    p.hpf_cold = p.hpf_n ? (int)k3_env_u32("DS4_K3_PREFETCH_HOST_COLD", 0u) : 0;   /* step 124 */
+    p.hpf_tgt.assign(cap_host, ~0u); p.hpf_dem.assign(cap_host, 0); p.hpf_hold.assign(cap_host, 0);
+    p.bulk_hpf_max = p.hpf_n ? k3_env_u32("DS4_K3_PREFILL_PREFETCH_HOST", 768u) : 0u;   /* step 126: on by default (prompt passes of 3.5k to 16k tokens 10 % shorter, 10 Nov 2026); 0 = off */
+    if (p.bulk_hpf_max > 1024u) p.bulk_hpf_max = 1024u;
+    if (p.bulk_hpf_max > cap_host / 3u) p.bulk_hpf_max = cap_host / 3u;   /* two layers' worth may be held at once */
+    p.bulk_hpf_inflight = k3_env_u32("DS4_K3_PREFILL_PREFETCH_HOST_INFLIGHT", 256u);
+    if (p.bulk_hpf_max) {
+        fprintf(stderr, "ds4: kimi-k3 prompt-pass host read-ahead (step 126): up to %u more of the next layer's predicted experts into the host pool, %u in flight\n",
+                p.bulk_hpf_max, p.bulk_hpf_inflight);
+        atexit([] {
+            k3_raw_pool &q = k3_raw_get();
+            fprintf(stderr, "ds4: K3 prompt-pass host read-ahead (step 126): issued %llu, used %llu, dropped unused %llu\n",
+                    (unsigned long long)q.bhpf_issued.load(), (unsigned long long)q.bhpf_used.load(), (unsigned long long)q.bhpf_dropped.load());
+        });
+    }
+    if (p.hpf_cold) {
+        fprintf(stderr, "ds4: kimi-k3 host-only prefetch hygiene (step 124): a read its layer did not use is recycled first\n");
+        atexit([] { fprintf(stderr, "ds4: K3 host-only prefetch (step 124): demoted unused %llu\n", (unsigned long long)k3_raw_get().hpf_demoted.load()); });
+    }
     if (p.hpf_n) {
         fprintf(stderr, "ds4: kimi-k3 host-only next-layer prefetch (step 117): up to %u per layer within the predicted top %u, %u in flight\n",
                 p.hpf_n, p.hpf_rank, p.hpf_inflight_max);
@@ -39175,6 +39229,26 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
         }
     }
     const size_t n_list = (size_t)n_tok * n_used;
+    {   /* step 128: see vcompact below (the same condition: a verification block whose dense partials would not fit) */
+        static uint32_t vt_cap_mb = 0;
+        if (!vt_cap_mb) vt_cap_mb = k3_env_u32("DS4_K3_PARTIALS_MB", 256u);
+        if (p.verify != 0 && n_tok > 1u && !getenv("DS4_K3_NONDETERMINISTIC") &&
+            (size_t)n_union * n_tok * latent * sizeof(float) > ((size_t)vt_cap_mb << 20)) {
+            for (uint32_t t = 0; t < n_tok; t++) {
+                uint32_t *row = p.host_tent + (size_t)t * n_used;
+                const int32_t *sel = selected + (size_t)t * n_used;
+                uint32_t ord[64], tmp[64];
+                for (uint32_t i = 0; i < n_used; i++) ord[i] = i;
+                for (uint32_t i = 1; i < n_used; i++) {   /* insertion sort of the slots by expert id */
+                    const uint32_t v = ord[i]; uint32_t j = i;
+                    while (j > 0 && sel[ord[j - 1u]] > sel[v]) { ord[j] = ord[j - 1u]; j--; }
+                    ord[j] = v;
+                }
+                for (uint32_t i = 0; i < n_used; i++) tmp[i] = row[ord[i]];
+                memcpy(row, tmp, sizeof(uint32_t) * n_used);
+            }
+        }
+    }
     if (cudaMemcpyAsync(p.dev_tok, p.host_tok, sizeof(uint32_t) * n_list, cudaMemcpyHostToDevice, stream) != cudaSuccess ||
         cudaMemcpyAsync(p.dev_tw, p.host_tw, sizeof(float) * n_list, cudaMemcpyHostToDevice, stream) != cudaSuccess ||
         cudaMemcpyAsync(p.dev_tent, p.host_tent, sizeof(uint32_t) * n_list, cudaMemcpyHostToDevice, stream) != cudaSuccess ||   /* step 76 */
@@ -39237,6 +39311,10 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
     if (!part_cap_mb) part_cap_mb = k3_env_u32("DS4_K3_PARTIALS_MB", 256u);
     const size_t part_floats = (size_t)n_union * n_tok * latent;
     const bool use_part = determ && part_floats * sizeof(float) <= (size_t)part_cap_mb << 20;
+    /* step 128: a verification block too wide for the dense partials (32 rows fit the 256 MB by 21 MB: 512 experts x 32 rows x
+       latent; 64 rows could need 822 MB) takes the compact ones with each row's slots listed in ascending expert id (vtent above),
+       so its reduce adds a row's sixteen experts in the plain step's order: [rows x 16 x latent] instead of [union x rows x latent] */
+    const bool vcompact = determ && verify && n_tok > 1u && !use_part;
     uint32_t part_idx[1024];
     if (use_part) {
         if (p.part_cap < part_floats) {
@@ -39254,10 +39332,10 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
        buffer [n_list x latent] and reduces each token's slots in the router's order: bit-stable long prompt passes */
     static int cpart_on = -1; static uint32_t cpart_cap_mb = 0;
     if (cpart_on < 0) { cpart_on = getenv("DS4_K3_PROMPT_COMPACT") ? (atoi(getenv("DS4_K3_PROMPT_COMPACT")) != 0) : 1;   /* default on (5 Nov 2026) */ cpart_cap_mb = k3_env_u32("DS4_K3_CPART_MB", 0u); }   /* step 97: 0 = no cap */
-    bool use_cpart = determ && !use_part && n_tok > 1u && cpart_on;
+    bool use_cpart = determ && !use_part && n_tok > 1u && (cpart_on || vcompact);
     if (use_cpart) {
         const size_t cfloats = (size_t)n_list * latent;
-        if (cpart_cap_mb && cfloats * sizeof(float) > ((size_t)cpart_cap_mb << 20)) {
+        if (!vcompact && cpart_cap_mb && cfloats * sizeof(float) > ((size_t)cpart_cap_mb << 20)) {
             static int warned = 0;
             if (!warned) { warned = 1; fprintf(stderr, "ds4: K3 compact partials: %zu MB needed, cap %u MB (DS4_K3_CPART_MB); this pass accumulates in arrival order\n", (size_t)((cfloats * sizeof(float)) >> 20), cpart_cap_mb); }
             use_cpart = false;
@@ -39442,15 +39520,22 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
         if (p.hint_layer != layer + 1u || p.hint_n == 0u) return;
         if (hot ? p.pf_mode == 0 : p.bulk_pf_mode == 0) return;
         const uint32_t nl = layer + 1u;
-        uint32_t want_max = hot ? p.pf_max : p.bulk_pf_max;
+        /* step 121: a verification block's GPU phase before its next MoE stage grows with its rows, and its hint ranks the next
+           layer's experts by how many rows predict them, so the read-ahead scales with the block (a plain step keeps its quota) */
+        uint32_t vmult = 1u;
+        if (verify && n_tok > 1u && p.vpf_scale) { vmult = n_tok / p.vpf_scale; if (vmult < 1u) vmult = 1u; if (vmult > 8u) vmult = 8u; }
+        const uint32_t dmult = p.vpf_dev ? vmult : 1u;
+        uint32_t want_max = hot ? p.pf_max * dmult : p.bulk_pf_max;
+        uint32_t pf_cap_all = 0;   /* step 126: what the pass's idle drive time absorbs, before the device read-ahead's own limit */
         if (!hot) {   /* step 36b: only what the bubble can absorb; step 88: at least bulk_pf_min */
             uint32_t pf_cap = n_tok / p.bulk_pf_div;
             if (pf_cap < p.bulk_pf_min) pf_cap = p.bulk_pf_min;
             if (want_max > pf_cap) want_max = pf_cap;
+            pf_cap_all = pf_cap;
         }
         if (want_max == 0u && !(hot && p.hpf_n)) return;   /* step 117: host-only reads may still go */
-        const uint32_t want_rank = hot ? p.pf_rank : p.hint_n;
-        const uint32_t want_inflight = hot ? p.pf_inflight_max : p.bulk_pf_inflight;
+        const uint32_t want_rank = hot ? p.pf_rank * dmult : p.hint_n;
+        const uint32_t want_inflight = hot ? p.pf_inflight_max * dmult : p.bulk_pf_inflight;
         uint32_t issued = 0;
         const int passes = (hot && p.pf_mode == 3) ? 2 : 1;   /* step 50: cold-tier candidates first, then the rest */
         for (int pass = 0; pass < passes; pass++)
@@ -39470,7 +39555,7 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
             const int d2 = p.dc.alloc(k2, hot, &ev2);   /* a prompt pass's prefetch is transient like its other fills */
             if (d2 < 0) { if (read2) p.hc.drop((uint32_t)h2); break; }
             p.hc.pinned[(uint32_t)h2] = 1; p.dc.pinned[(uint32_t)d2] = 1; p.dc.filling[(uint32_t)d2] = 1;
-            if (p.hpf_n) { p.hup[(uint32_t)h2] = 1; if (!read2 && p.hpf_key[(uint32_t)h2] == k2) { p.hpf_used++; p.hpf_key[(uint32_t)h2] = K3_NOKEY; } }   /* step 117 */
+            if (p.hpf_n) { p.hup[(uint32_t)h2] = 1; if (!read2 && p.hpf_key[(uint32_t)h2] == k2) { if (p.hpf_hold[(uint32_t)h2]) { p.hpf_hold[(uint32_t)h2] = 0; p.bhpf_used++; } else p.hpf_used++; p.hpf_key[(uint32_t)h2] = K3_NOKEY; } }   /* steps 117, 126 */
             p.dev_host[(uint32_t)d2] = h2; p.wanted[(uint32_t)d2] = 0; p.cold_job[(uint32_t)d2] = cold2 ? 1 : 0; p.hhit[(uint32_t)d2] = read2 ? 0 : 1;   /* step 75 */
             if (!hot) { p.pf_slab[(uint32_t)d2] = 1; p.pf_list.push_back((uint32_t)d2); }
             if (p.victim && hot && !host_all && ev2 != K3_NOKEY) k3_victim_copy(p, (uint32_t)d2, ev2);
@@ -39480,9 +39565,34 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
             if (!p.wake_mode) p.cv_job.notify_all();   /* step 114: push_fill woke its readers */
             p.pf_pending++; p.pf_issued++; issued++;
         }
+        if (!hot && p.bulk_hpf_max && pf_cap_all > issued) {   /* step 126: the rest of the pass's quota, into held host slabs */
+            uint32_t hissued = 0;
+            const uint32_t hwant = pf_cap_all - issued < p.bulk_hpf_max ? pf_cap_all - issued : p.bulk_hpf_max;
+            for (uint32_t i = 0; i < p.hint_n && hissued < hwant && p.hpf_inflight < p.bulk_hpf_inflight; i++) {
+                const int32_t ei = p.hint_e[i];
+                if (ei < 0 || ei >= 1024) continue;
+                const uint32_t e2 = (uint32_t)ei;
+                if (p.bulk_pf_mode == 1 && ds4_k3_expert_source_is_primary(nl, e2)) continue;   /* step 85: cold tier only */
+                const uint64_t k2 = ((uint64_t)nl << 20) | e2;
+                if (p.dc.lookup(k2, false) >= 0 || p.hc.lookup(k2, false) >= 0) continue;
+                const int h2 = p.hc.alloc(k2, false);
+                if (h2 < 0) break;
+                p.hc.pinned[(uint32_t)h2] = 1; p.hc.filling[(uint32_t)h2] = 1; p.hpf_busy[(uint32_t)h2] = 1; p.hup[(uint32_t)h2] = 0;
+                p.hpf_key[(uint32_t)h2] = k2; p.hpf_inflight++; p.hpf_hold[(uint32_t)h2] = 1;
+                if (p.hpf_tgt[(uint32_t)h2] == ~0u) p.hpf_list.push_back((uint32_t)h2);
+                p.hpf_tgt[(uint32_t)h2] = nl; p.hpf_dem[(uint32_t)h2] = 0;
+                {
+                    std::lock_guard<std::mutex> lk(p.mu);
+                    p.hwait[(uint32_t)h2] = 1; p.hfail[(uint32_t)h2] = 0;
+                    p.jobs.push_back({nl, e2, -1, h2, true, true, true, 0u, (uint32_t)p.file_bytes, k3_now_sec()});
+                }
+                if (p.wake_mode) p.cv_job.notify_one(); else p.cv_job.notify_all();
+                p.misses++; p.bhpf_issued++; hissued++;
+            }
+        }
         if (hot && p.hpf_n) {   /* step 117: no device slab, no upload, no copy-down */
             uint32_t hissued = 0;
-            for (uint32_t i = 0; i < p.hint_n && i < p.hpf_rank && hissued < p.hpf_n && p.hpf_inflight < p.hpf_inflight_max; i++) {
+            for (uint32_t i = 0; i < p.hint_n && i < p.hpf_rank * vmult && hissued < p.hpf_n * vmult && p.hpf_inflight < p.hpf_inflight_max * vmult; i++) {   /* step 121 */
                 const int32_t ei = p.hint_e[i];
                 if (ei < 0 || ei >= 1024) continue;
                 const uint32_t e2 = (uint32_t)ei;
@@ -39492,6 +39602,10 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
                 if (h2 < 0) break;
                 p.hc.pinned[(uint32_t)h2] = 1; p.hc.filling[(uint32_t)h2] = 1; p.hpf_busy[(uint32_t)h2] = 1; p.hup[(uint32_t)h2] = 0;
                 p.hpf_key[(uint32_t)h2] = k2; p.hpf_inflight++;
+                if (p.hpf_cold) {   /* step 124: provisional until layer nl has passed */
+                    if (p.hpf_tgt[(uint32_t)h2] == ~0u) p.hpf_list.push_back((uint32_t)h2);
+                    p.hpf_tgt[(uint32_t)h2] = nl; p.hpf_dem[(uint32_t)h2] = 0;
+                }
                 {
                     std::lock_guard<std::mutex> lk(p.mu);
                     p.hwait[(uint32_t)h2] = 1; p.hfail[(uint32_t)h2] = 0;
@@ -39557,7 +39671,13 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
                 if (h < 0) break;
             }
             uint64_t evicted = K3_NOKEY;
-            const int adm = verify_auto ? (n_tok >= 7u ? auto_admit[0] : n_tok >= 5u ? auto_admit[1] : auto_admit[2]) : verify_admit;   /* step 86 */
+            int adm = verify_auto ? (n_tok >= 7u ? auto_admit[0] : n_tok >= 5u ? auto_admit[1] : auto_admit[2]) : verify_admit;   /* step 86 */
+            /* step 127: DS4_K3_VERIFY_ADMIT_PCT (0 off): a wide block admits only experts that at least this share of its rows use, so
+               what stays resident fits the device cache (a 32-row block's fills used by 4 rows alone outnumber its slabs) */
+            static int admit_pct = -1;
+            if (admit_pct < 0) { admit_pct = (int)k3_env_u32("DS4_K3_VERIFY_ADMIT_PCT", 20u);   /* 20 by default: about +1 % at 32 and 64 rows (10 Nov 2026) */ if (admit_pct > 100) admit_pct = 100;
+                                 if (admit_pct) fprintf(stderr, "ds4: kimi-k3 verification block admission (step 127): at least %d %% of the rows\n", admit_pct); }
+            if (verify && n_tok > 1u && adm > 1 && admit_pct > 0) { const int a2 = (int)((n_tok * (uint32_t)admit_pct + 99u) / 100u); if (a2 > adm) adm = a2; }
             const int wrm = verify_auto ? (adm > 2 ? 2 : 0) : verify_warm;
             bool fill_hot = hot && !(verify && n_tok > 1u && adm > 1 && count[e] < (uint32_t)adm);   /* step 78 */
             bool fill_warm = hot && !fill_hot && wrm > 0 && count[e] >= (uint32_t)wrm;   /* step 81 */
@@ -39567,7 +39687,7 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
                                                    same-layer-next-token reuse falls off a cliff below one token (p3: hits 551 -> 60) */
             if (d < 0) { if (read) p.hc.drop((uint32_t)h); break; }
             p.hc.pinned[(uint32_t)h] = 1; p.dc.pinned[(uint32_t)d] = 1; p.dc.filling[(uint32_t)d] = 1;
-            if (p.hpf_n) { p.hup[(uint32_t)h] = 1; if (!read && p.hpf_key[(uint32_t)h] == k) { p.hpf_used++; p.hpf_key[(uint32_t)h] = K3_NOKEY; } }   /* step 117 */
+            if (p.hpf_n) { p.hup[(uint32_t)h] = 1; if (!read && p.hpf_key[(uint32_t)h] == k) { if (p.hpf_hold[(uint32_t)h]) { p.hpf_hold[(uint32_t)h] = 0; p.bhpf_used++; } else p.hpf_used++; p.hpf_key[(uint32_t)h] = K3_NOKEY; } }   /* steps 117, 126 */
             p.dev_host[(uint32_t)d] = h; p.hhit[(uint32_t)d] = read ? 0 : 1;   /* step 75 */
             if (p.victim && hot && !host_all && evicted != K3_NOKEY && !(verify_admit > 1 && verify && p.dc.last_evicted_transient)) k3_victim_copy(p, (uint32_t)d, evicted);   /* step 78 */
             if (read) p.misses++; else p.hits_host++;
@@ -39659,6 +39779,24 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
         }
         i++;
     }
+    /* step 124: host-only reads aimed at this layer (or an earlier one) that were not used leave the hot end of the host cache:
+       they are recycled before any resident entry instead of pushing one out; one whose read is still in flight follows at settle */
+    if (!p.hpf_list.empty()) {
+        for (size_t i = 0; i < p.hpf_list.size(); ) {
+            const uint32_t h = p.hpf_list[i];
+            if (p.hpf_tgt[h] == layer + 1u) { i++; continue; }   /* issued by this call, for the next layer */
+            const bool mine = p.hpf_key[h] != K3_NOKEY && p.hc.key[h] == p.hpf_key[h];   /* unused and still in its slab */
+            if (p.hpf_hold[h]) {   /* step 126: a held read-ahead slab its layer did not use goes back to the pool */
+                if (p.hpf_busy[h]) p.hpf_dem[h] = 1;   /* at settle */
+                else { p.hpf_hold[h] = 0; if (!p.hup[h]) { p.hc.pinned[h] = 0; if (mine) { p.hc.drop(h); p.bhpf_dropped++; } } }
+            } else if (p.hpf_cold && mine) {   /* step 124 */
+                if (p.hpf_busy[h]) p.hpf_dem[h] = 1;
+                else if (!p.hc.pinned[h]) { p.hc.demote(h); p.hpf_demoted++; }
+            }
+            p.hpf_tgt[h] = ~0u;
+            p.hpf_list[i] = p.hpf_list.back(); p.hpf_list.pop_back();
+        }
+    }
     if (multi) {
         for (uint32_t i = 0; i < p.ms_n; i++) {
             if (cudaEventRecord(p.ms_join[i], p.ms_stream[i]) != cudaSuccess ||
@@ -39727,8 +39865,28 @@ extern "C" int ds4_gpu_k3_cache_grow(void) {
             g = k3_gemm32_scratch();
         }
     }
+    /* step 133: the prompt pass's compact partials ([tokens x 16 x latent] floats: 357 MB after a 1,557-token prompt, 1.5 GB after
+       6,769 tokens) are of no use to decode beyond what a verification block needs; the cache gets the rest of that VRAM, and the
+       next prompt pass allocates its own again while the cache lends it its region. DS4_K3_KEEP_CPART=1 keeps them. */
+    if (p.dev_cpart && p.cpart_cap > p.vprep_floats && !getenv("DS4_K3_KEEP_CPART")) {
+        (void)cudaStreamSynchronize(cuda_decode_stream());
+        cudaFree(p.dev_cpart); p.dev_cpart = nullptr; p.cpart_cap = 0;
+        if (p.vprep_floats) {
+            if (cudaMalloc(&p.dev_cpart, p.vprep_floats * sizeof(float)) == cudaSuccess) p.cpart_cap = p.vprep_floats;
+            else { (void)cudaGetLastError(); p.dev_cpart = nullptr; }
+        }
+    }
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) { cudaGetLastError(); return 1; }
+    /* step 136: a decode step's dense partials (DS4_K3_PARTIALS_MB) are made here, not by the first step after the cache has
+       taken the free VRAM. At 16k context with the drafter on, the sidecar's forward over a 13k-token prompt held what the cache
+       had left at that moment: the step's allocation failed and the answer ended after one token (11 Nov 2026). free_b was read
+       before this allocation, so the cache gets exactly the slabs it got when the first step allocated them. */
+    if (!p.dev_part) {
+        const size_t want = (size_t)k3_env_u32("DS4_K3_PARTIALS_MB", 256u) << 20;
+        if (cudaMalloc(&p.dev_part, want) == cudaSuccess) p.part_cap = (uint32_t)(want / sizeof(float));
+        else { (void)cudaGetLastError(); p.dev_part = nullptr; p.part_cap = 0; }   /* the first step tries again */
+    }
     const uint64_t reserve = (uint64_t)k3_env_u32("DS4_K3_CACHE_VRAM_RESERVE_MB", 4096u) << 20;   /* step 54: 4 GB again (long prompt passes chunk) */
     uint64_t budget = free_b > reserve ? free_b - reserve : 0;
     const uint32_t cap_gb = k3_env_u32("DS4_K3_CACHE_VRAM_GB", 0);
@@ -39821,6 +39979,37 @@ extern "C" void ds4_gpu_k3_prefetch_stats(uint64_t *issued, uint64_t *adopted) {
     if (adopted) *adopted = p.pf_adopted.load();
 }
 extern "C" void ds4_gpu_k3_set_verify(int on) { k3_raw_get().verify = on ? 1 : 0; }   /* step 44 */
+/* step 128: the compact partials for verification blocks of up to `rows` rows, made before the device cache takes the free VRAM, so
+   a wide block never has to allocate (or fail) in the middle of a request. 1 = ready */
+extern "C" int ds4_gpu_k3_verify_prepare(uint32_t rows, uint32_t n_used, uint32_t n_expert, uint32_t latent) {
+    k3_raw_pool &p = k3_raw_get();
+    if (!p.ready || rows < 2u) return 1;
+    (void)n_expert;
+    const size_t need = (size_t)rows * n_used * latent;   /* floats: one row per (token, slot) */
+    if (need > p.vprep_floats) p.vprep_floats = need;
+    if (p.cpart_cap >= need) return 1;
+    if (cudaStreamSynchronize(cuda_decode_stream()) != cudaSuccess) { cudaGetLastError(); return 0; }
+    if (p.dev_cpart) cudaFree(p.dev_cpart);
+    p.dev_cpart = nullptr; p.cpart_cap = 0;
+    if (cudaMalloc(&p.dev_cpart, need * sizeof(float)) != cudaSuccess) { cudaGetLastError(); return 0; }
+    p.cpart_cap = need;
+    return 1;
+}
+/* step 129b: host memory for a wide verification block's KDA inputs. Pageable by default: the copies then cost about 0.18 s per
+   64-row block (10 Nov 2026), and the machine's page-locked budget stays what the expert pool was sized against.
+   DS4_K3_QWEN_KIN_PINNED=1 asks for page-locked memory (1.1 GB at 64 rows): measured 0.09 s per block, +0.3 % on prose. */
+extern "C" void *ds4_gpu_k3_host_alloc(uint64_t bytes, int *pinned) {
+    void *p = nullptr;
+    const char *e = getenv("DS4_K3_QWEN_KIN_PINNED");
+    if (e && atoi(e) != 0 && cudaMallocHost(&p, (size_t)bytes) == cudaSuccess && p) { if (pinned) *pinned = 1; return p; }
+    (void)cudaGetLastError();
+    if (pinned) *pinned = 0;
+    return malloc((size_t)bytes);
+}
+extern "C" void ds4_gpu_k3_host_free(void *p, int pinned) {
+    if (!p) return;
+    if (pinned) (void)cudaFreeHost(p); else free(p);
+}
 extern "C" int ds4_gpu_k3_skip_mode(void) { return k3_raw_get().skip_mode; }   /* step 57 */
 extern "C" void ds4_gpu_k3_skip_stats(uint64_t *skipped, double *mass, uint64_t *obs_n, uint64_t obs[6]) {   /* step 57 */
     k3_raw_pool &p = k3_raw_get();
