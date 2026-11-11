@@ -4053,6 +4053,8 @@ int ar_prefill_stage_ids_finish_part(uint32_t part, uint32_t parts);
 uint32_t ar_prefill_stage_ids_topup_count(void);
 uint32_t ar_prefill_stage_ids_hint(const int32_t *ids, uint32_t n_ids);
 int ds4_gpu_argodrive_prefill_prewarm(uint64_t gate_bytes, uint64_t up_bytes, uint64_t down_bytes);
+/* Single-host keep-alive scope of one decode token (DS4_ARGODRIVE_GAP_KEEPALIVE=2). */
+void ds4_gpu_argodrive_keepalive_token(int active, uint32_t position);
 #endif
 
 #endif

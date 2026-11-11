@@ -44407,9 +44407,21 @@ static uint32_t ds41_decode_flush_layers(void) {
     return (uint32_t)cached;
 }
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+static void ar_keepalive_scope_end(int *active) {
+    if (*active) ds4_gpu_argodrive_keepalive_token(0, 0);
+}
+#endif
+
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* The cleanup covers error exits too: a failed request cannot leave the keep-alive running. */
+    int ar_keepalive_scope __attribute__((cleanup(ar_keepalive_scope_end))) =
+        g->streaming && g->tp_world == 1 && !g->quality && !g->imatrix;
+    if (ar_keepalive_scope) ds4_gpu_argodrive_keepalive_token(1, g->pos);
+#endif
     uint32_t ids[2][DS4_ENGRAM_COLS];
     ds4_engram_history next_history = g->history;
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;

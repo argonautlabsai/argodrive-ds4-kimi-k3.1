@@ -10911,6 +10911,11 @@ static uint32_t ds4_gpu_tp_keepalive_tgs_from_env(void) {
     return ka_tgs;
 }
 
+/* Single-host streaming decode can own the keep-alive thread (DS4_ARGODRIVE_GAP_KEEPALIVE);
+ * the TP gate machinery does not run then. */
+static int g_ar_keepalive_owned;
+static volatile int g_ar_keepalive_stop;
+
 static void *ds4_gpu_tp_keepalive_thread(void *arg) {
     (void)arg;
     /* Swept on the M5 Max pair: too few iterations lets clocks sag.  Current
@@ -10930,7 +10935,7 @@ static void *ds4_gpu_tp_keepalive_thread(void *arg) {
         fprintf(stderr, "ds4: TP keep-alive pipeline missing\n");
         return NULL;
     }
-    while (!g_tp_shutdown) {
+    while (!g_tp_shutdown && !(g_ar_keepalive_owned && g_ar_keepalive_stop)) {
         if (g_tp_keepalive_paused) {
             usleep(200);
             continue;
@@ -10949,6 +10954,69 @@ static void *ds4_gpu_tp_keepalive_thread(void *arg) {
         }
     }
     return NULL;
+}
+
+/* DS4_ARGODRIVE_GAP_KEEPALIVE: decode issues tens of command buffers per token with CPU waits
+ * between them, and the GPU drops to low-power states in the waits. Mode 1 runs the ALU
+ * keep-alive kernel (its own queue) only while the expert pread pool is waited on; mode 2
+ * runs it for the whole of each decode token. Off unless the variable is 1 or 2, and never
+ * together with the TP gate machinery, which has its own. Output is not touched. */
+static int g_ar_keepalive_started;
+static int g_ar_keepalive_mode = -1;
+static int ds4_gpu_argodrive_keepalive_mode(void) {
+    if (g_ar_keepalive_mode < 0) {
+        const char *e = getenv("DS4_ARGODRIVE_GAP_KEEPALIVE");
+        g_ar_keepalive_mode = e ? atoi(e) : 0;
+        if (g_ar_keepalive_mode < 0 || g_ar_keepalive_mode > 2) g_ar_keepalive_mode = 0;
+    }
+    return g_ar_keepalive_mode;
+}
+static void ds4_gpu_argodrive_keepalive_start(void) {
+    if (g_ar_keepalive_started || ds4_gpu_argodrive_keepalive_mode() <= 0 ||
+        g_tp_keepalive_running || g_tp_thread_running) return;
+    g_ar_keepalive_started = 1;
+    g_tp_shutdown = 0;   /* a prior TP session may have left the shared stop flag set */
+    const uint32_t ka_tgs = ds4_gpu_tp_keepalive_tgs_from_env();
+    g_tp_keepalive_paused = 1;
+    g_tp_keepalive_queue = [g_device newCommandQueueWithMaxCommandBufferCount:1];
+    g_tp_keepalive_queue.label = @"Argodrive keepalive";
+    g_tp_keepalive_buffer = [g_device newBufferWithLength:(NSUInteger)ka_tgs * 256u * sizeof(float)
+                                                  options:MTLResourceStorageModeShared];
+    if (g_tp_keepalive_buffer) memset(g_tp_keepalive_buffer.contents, 0, g_tp_keepalive_buffer.length);
+    g_ar_keepalive_owned = 1;
+    g_ar_keepalive_stop = 0;
+    if (g_tp_keepalive_queue && g_tp_keepalive_buffer &&
+        ds4_gpu_get_pipeline("kernel_dsv4_tp_keepalive") &&
+        pthread_create(&g_tp_keepalive_thread, NULL, ds4_gpu_tp_keepalive_thread, NULL) == 0) {
+        g_tp_keepalive_running = 1;
+        fprintf(stderr, "ds4: Argodrive keep-alive started (mode %d, %u threadgroups)\n",
+                ds4_gpu_argodrive_keepalive_mode(), ka_tgs);
+    } else {
+        g_ar_keepalive_owned = 0;
+        g_tp_keepalive_queue = nil;
+        g_tp_keepalive_buffer = nil;
+    }
+}
+static void ds4_gpu_argodrive_keepalive_gap(int in_gap) {
+    if (ds4_gpu_argodrive_keepalive_mode() != 1) return;
+    ds4_gpu_argodrive_keepalive_start();
+    if (g_ar_keepalive_owned) g_tp_keepalive_paused = !in_gap;
+}
+void ds4_gpu_argodrive_keepalive_token(int active, uint32_t position) {
+    (void)position;
+    if (ds4_gpu_argodrive_keepalive_mode() != 2 || g_tp_thread_running) return;
+    if (active) ds4_gpu_argodrive_keepalive_start();
+    if (g_ar_keepalive_owned) g_tp_keepalive_paused = !active;
+}
+static void ds4_gpu_argodrive_keepalive_stop(void) {
+    if (!g_ar_keepalive_owned) return;
+    g_ar_keepalive_stop = 1;
+    g_tp_keepalive_paused = 1;
+    pthread_join(g_tp_keepalive_thread, NULL);
+    g_tp_keepalive_running = g_ar_keepalive_owned = 0;
+    g_tp_keepalive_queue = nil;
+    g_tp_keepalive_buffer = nil;
+    g_ar_keepalive_started = 0;
 }
 
 static void *ds4_gpu_tp_service_thread(void *arg) {
@@ -12348,6 +12416,7 @@ void ds4_gpu_cleanup(void) {
         g_moe_q4_up_slots_buffer = nil;
         g_moe_q4_down_slots_buffer = nil;
         g_attn_out_group_ids_buffer = nil;
+        ds4_gpu_argodrive_keepalive_stop();
         ar_close(&g_argodrive_reader);
         g_model_fd = -1;
         g_model_map_ptr = NULL;
@@ -14835,6 +14904,7 @@ static int ds4_gpu_stream_expert_pread_pool_begin(
 
 static int ds4_gpu_stream_expert_pread_pool_wait(void) {
     if (!g_stream_expert_pread_pool_initialized) return 0;
+    ds4_gpu_argodrive_keepalive_gap(1);
 
     pthread_mutex_lock(&g_stream_expert_pread_pool_mutex);
     while (g_stream_expert_pread_pool_remaining_workers != 0) {
@@ -14842,6 +14912,7 @@ static int ds4_gpu_stream_expert_pread_pool_wait(void) {
                           &g_stream_expert_pread_pool_mutex);
     }
     pthread_mutex_unlock(&g_stream_expert_pread_pool_mutex);
+    ds4_gpu_argodrive_keepalive_gap(0);
     return 1;
 }
 
