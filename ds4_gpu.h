@@ -4024,4 +4024,35 @@ int ds4_gpu_k3_kda_decode_batch(ds4_gpu_tensor *out, ds4_gpu_tensor *conv_state,
                                 uint32_t n_heads, float gate_lower_bound, float norm_eps, int a_log_per_channel,
                                 uint32_t n_tok);
 
+/* Prompt-pass staging of the routed experts through the Argodrive reader (Metal). The caller
+ * owns the phase boundaries: nothing may be staged while a command batch that reads a
+ * published set is still open. */
+#ifdef __APPLE__
+int ar_prefill_stage(const void *map, uint64_t size, const uint64_t offsets[3], const uint64_t sizes[3]);
+int ar_prefill_stage_ahead(const void *map, uint64_t size, const uint64_t offsets[3], const uint64_t sizes[3]);
+int ar_prefill_clear(void);
+int ar_prefill_reader_ready(void);
+int ar_prefill_release(void);
+int ar_prefill_stage_ids(const void *map, uint64_t size, const uint64_t offsets[3], const uint64_t sizes[3],
+                         uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                         const int32_t *ids, uint32_t n_ids);
+/* Read-ahead of the next layer's ranked experts into the spare staging set while the GPU
+ * computes the current layer; collected by the next stage call. ranked_ids must stay valid
+ * until then. */
+int ar_prefill_prestage_start(const void *map, uint64_t size, const uint64_t offsets[3], const uint64_t sizes[3],
+                              uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                              const int32_t *ranked_ids, uint32_t n_ranked);
+/* Two-phase selective staging: begin() publishes the views and reports, per id, whether the
+ * read-ahead already landed that expert (landed[k], may be NULL); finish() reads the rest.
+ * Kernels encoded in between may only touch landed experts. */
+int ar_prefill_stage_ids_begin(const void *map, uint64_t size, const uint64_t offsets[3], const uint64_t sizes[3],
+                               uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                               const int32_t *ids, uint32_t n_ids, uint8_t *landed);
+int ar_prefill_stage_ids_finish(void);
+int ar_prefill_stage_ids_finish_part(uint32_t part, uint32_t parts);
+uint32_t ar_prefill_stage_ids_topup_count(void);
+uint32_t ar_prefill_stage_ids_hint(const int32_t *ids, uint32_t n_ids);
+int ds4_gpu_argodrive_prefill_prewarm(uint64_t gate_bytes, uint64_t up_bytes, uint64_t down_bytes);
+#endif
+
 #endif

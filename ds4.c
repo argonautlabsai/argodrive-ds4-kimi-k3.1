@@ -44040,6 +44040,276 @@ static bool ds41_router_batch(ds41_gpu_graph *g, const ds4_model *m,
 
 /* Without shared_down the shared expert's down projection waits for
  * ds41_moe_expand_batch, which folds it into the expand. */
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* Prompt-pass staging of the routed experts through the Argodrive reader (Metal only).
+ * DS4_ARGODRIVE_PREFILL_SPLIT=1 switches it on for a sweep; everything below is inert
+ * without it. The sweep sets these two while it runs. */
+static bool ar_prefill_sweep_live;
+static bool ar_prefill_sweep_selective;   /* decided once per sweep, from the whole prompt */
+static const ds4_layer_weights *ar_prefill_next_layer;
+static int ar_prefill_selective_enabled(void) {
+    static int checked, on;
+    if (!checked) { const char *e = getenv("DS4_ARGODRIVE_PREFILL_SELECTIVE"); on = e && strcmp(e, "0") != 0; checked = 1; }
+    return on;
+}
+/* Selective staging trades the read-ahead overlap for fewer bytes, so it only wins
+ * while the chunk's expert union is small enough. Measured 2026-09-15 (512-token
+ * prompt, three drives): 512 tokens touch 48.8 % of the experts and selective wins
+ * by 7.2 %; 1024 touch 60.1 % and it loses by 13 %; 2048 touch 70.7 % and it loses
+ * by 25 %. The break-even is coverage < 1 - compute/read, which lands between 512
+ * and 1024 tokens. */
+static int ar_prefill_selective_for(uint32_t count) {
+    if (!ar_prefill_selective_enabled()) return 0;
+    static int checked; static uint32_t max_count;
+    if (!checked) {
+        const char *e = getenv("DS4_ARGODRIVE_PREFILL_SELECTIVE_MAX");
+        long v = e && *e ? strtol(e, NULL, 10) : 512;
+        max_count = v > 0 ? (uint32_t)v : 0;
+        checked = 1;
+        fprintf(stderr, "ds4: Argodrive selective prefill staging for chunks <= %u tokens\n", max_count);
+    }
+    return count <= max_count;
+}
+/* Stage only the experts this chunk routed to. The router needs nothing but resident
+ * weights, so running it before any expert byte is read costs one drain per layer and
+ * halves the bytes: a 512-token chunk touches ~187 of 384 experts. */
+/* Argodrive 2026-09-30 diagnostic (DS4_ARGODRIVE_PREFILL_IDS_DUMP=path): append one
+ * line per staged layer, "il n_ids id:count ...", so a hotness prior for read-ahead
+ * staging can be scored offline. Off unless the variable names a writable file. */
+static FILE *ar_prefill_ids_dump(void) {
+    static int checked; static FILE *fp;
+    if (!checked) {
+        checked = 1;
+        const char *e = getenv("DS4_ARGODRIVE_PREFILL_IDS_DUMP");
+        if (e && *e) fp = fopen(e, "a");
+    }
+    return fp;
+}
+/* Argodrive 2026-09-30 (ARGODRIVE_PREFILL_HOT): DS4_ARGODRIVE_PREFILL_HOT=K reads the
+ * next layer's K likeliest experts into the spare staging set while this layer
+ * computes. The ranking comes from DS4_ARGODRIVE_HOTLIST, a text file of lines
+ * "layer n id:count ..." produced from prefill selection dumps of other prompts; the
+ * loader ranks each layer's experts by count. Nothing else changes: the ids the
+ * router selects are still all staged before the routed MoE runs. */
+static int ar_prefill_trace_on(void) {
+    static int checked, on;
+    if (!checked) { const char *e = getenv("DS4_ARGODRIVE_PREFILL_TRACE"); on = e && strcmp(e, "0") != 0; checked = 1; }
+    return on;
+}
+static uint32_t ar_prefill_hot_k(void) {
+    static int checked; static uint32_t k;
+    if (!checked) {
+        checked = 1; const char *e = getenv("DS4_ARGODRIVE_PREFILL_HOT");
+        if (e && *e) { char *end = NULL; unsigned long n = strtoul(e, &end, 10); if (end != e && !*end && n <= 65536) k = (uint32_t)n; }
+        if (k) fprintf(stderr, "ds4: Argodrive prefill read-ahead of up to %u ranked experts per layer\n", k);
+    }
+    return k;
+}
+static int32_t *ar_hot_ids;   /* [n_layer][n_expert], ranked by descending count */
+static uint32_t *ar_hot_n;    /* ranked experts per layer */
+static uint32_t ar_hot_layers;
+static int ar_hot_cmp(const void *a, const void *b) {
+    const uint64_t *x = a, *y = b; /* (count << 32 | id): higher count first, then lower id */
+    if ((*x >> 32) != (*y >> 32)) return (*x >> 32) < (*y >> 32) ? 1 : -1;
+    return (uint32_t)*x < (uint32_t)*y ? -1 : (uint32_t)*x > (uint32_t)*y;
+}
+static int ar_hotlist_load(void) {
+    static int checked, ok;
+    if (checked) return ok;
+    checked = 1;
+    const char *path = getenv("DS4_ARGODRIVE_HOTLIST");
+    if (!path || !*path) return 0;
+    FILE *fp = fopen(path, "r");
+    if (!fp) { fprintf(stderr, "ds4: Argodrive hotlist %s: %s\n", path, strerror(errno)); return 0; }
+    const uint32_t n_layer = DS4_N_LAYER, n_expert = DS4_N_EXPERT;
+    ar_hot_ids = calloc((size_t)n_layer * n_expert, sizeof(int32_t));
+    ar_hot_n = calloc(n_layer, sizeof(uint32_t));
+    uint64_t *keys = calloc(n_expert, sizeof(uint64_t));
+    uint8_t *seen = calloc(n_expert, 1);
+    char *line = NULL; size_t cap = 0; ssize_t len;
+    uint32_t layers_seen = 0;
+    if (ar_hot_ids && ar_hot_n && keys && seen) {
+        while ((len = getline(&line, &cap, fp)) > 0) {
+            char *p = line; char *end = NULL;
+            unsigned long il = strtoul(p, &end, 10);
+            if (end == p || il >= n_layer) continue;
+            p = end;
+            (void)strtoul(p, &end, 10); /* count of pairs, informational */
+            if (end == p) continue;
+            p = end;
+            memset(seen, 0, n_expert);
+            uint32_t n = 0;
+            for (;;) {
+                while (*p == ' ' || *p == '\t') p++;
+                if (*p == '\n' || *p == '\0' || *p == '\r') break;
+                unsigned long id = strtoul(p, &end, 10);
+                if (end == p) break;
+                p = end;
+                unsigned long count = 1;
+                if (*p == ':') { p++; count = strtoul(p, &end, 10); if (end == p) break; p = end; }
+                if (id < n_expert && !seen[id]) { seen[id] = 1; keys[n++] = ((uint64_t)count << 32) | (uint32_t)id; }
+            }
+            if (!n) continue;
+            qsort(keys, n, sizeof(uint64_t), ar_hot_cmp);
+            for (uint32_t k = 0; k < n; k++) ar_hot_ids[il * n_expert + k] = (int32_t)(uint32_t)keys[k];
+            if (!ar_hot_n[il]) layers_seen++;
+            ar_hot_n[il] = n;
+        }
+        ok = layers_seen > 0;
+    }
+    free(line); free(keys); free(seen); fclose(fp);
+    ar_hot_layers = ok ? n_layer : 0;
+    fprintf(stderr, "ds4: Argodrive prefill hotlist %s: %u of %u layers ranked%s\n", path, layers_seen, n_layer, ok ? "" : " (disabled)");
+    return ok;
+}
+/* Argodrive 2026-10-04 (ARGODRIVE_COOC): conditional read-ahead prior. DS4_ARGODRIVE_COOC=path loads an
+ * "ARCOOC01" table (40 layers, 384 experts: uint16 counts of (e at L, e' at L+1) over a corpus of other
+ * prompts, then uint32 per-layer marginals). With it, the next layer's read-ahead order is
+ * score[e'] = sum_e hits_L[e] * C[L][e][e'], the marginal breaking ties, where hits_L are this prompt's
+ * routed counts at the layer just staged; the hotlist stays the fallback (layer 0, missing table). Read
+ * order only: routing, weights, arithmetic and output are unchanged. */
+static uint16_t *ar_cooc_c; static uint32_t *ar_cooc_m; static int ar_cooc_state;
+static int ar_cooc_load(void) {
+    if (ar_cooc_state) return ar_cooc_state > 0;
+    ar_cooc_state = -1;
+    const char *path = getenv("DS4_ARGODRIVE_COOC");
+    if (!path || !*path) return 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "ds4: Argodrive cooc prior %s: %s\n", path, strerror(errno)); return 0; }
+    char magic[8]; uint32_t nl = 0, ne = 0;
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "ARCOOC01", 8) != 0 || fread(&nl, 4, 1, f) != 1 ||
+        fread(&ne, 4, 1, f) != 1 || nl != DS4_N_LAYER || ne != DS4_N_EXPERT || ne > DS4_MAX_EXPERT) {
+        fprintf(stderr, "ds4: Argodrive cooc prior %s: header does not match this model\n", path); fclose(f); return 0;
+    }
+    const size_t nc = (size_t)(nl - 1u) * ne * ne, nm = (size_t)nl * ne;
+    ar_cooc_c = malloc(nc * sizeof(uint16_t)); ar_cooc_m = malloc(nm * sizeof(uint32_t));
+    if (!ar_cooc_c || !ar_cooc_m || fread(ar_cooc_c, sizeof(uint16_t), nc, f) != nc || fread(ar_cooc_m, sizeof(uint32_t), nm, f) != nm) {
+        fprintf(stderr, "ds4: Argodrive cooc prior %s: short read\n", path);
+        free(ar_cooc_c); free(ar_cooc_m); ar_cooc_c = NULL; ar_cooc_m = NULL; fclose(f); return 0;
+    }
+    fclose(f); ar_cooc_state = 1;
+    fprintf(stderr, "ds4: Argodrive cooc prior %s: %u layers, %u experts\n", path, nl, ne);
+    return 1;
+}
+static uint32_t ar_cur_hits[DS4_MAX_EXPERT]; static uint32_t ar_cur_il = UINT32_MAX;
+static int32_t ar_cooc_rank[2][DS4_MAX_EXPERT]; static unsigned ar_cooc_rank_sel;
+static uint64_t ar_cooc_score[DS4_MAX_EXPERT];
+static int ar_cooc_cmp(const void *a, const void *b) {
+    const int32_t x = *(const int32_t *)a, y = *(const int32_t *)b;
+    if (ar_cooc_score[x] != ar_cooc_score[y]) return ar_cooc_score[x] > ar_cooc_score[y] ? -1 : 1;
+    return x < y ? -1 : x > y;
+}
+static const int32_t *ar_cooc_ranked(uint32_t next_il, uint32_t *n_out) {
+    if (!ar_cooc_load() || next_il == 0 || next_il >= DS4_N_LAYER || ar_cur_il != next_il - 1u) return NULL;
+    const uint32_t L = next_il - 1u, ne = DS4_N_EXPERT;
+    for (uint32_t e2 = 0; e2 < ne; e2++) ar_cooc_score[e2] = 0;
+    for (uint32_t e = 0; e < ne; e++) {
+        const uint64_t h = ar_cur_hits[e];
+        if (!h) continue;
+        const uint16_t *row = ar_cooc_c + ((size_t)L * ne + e) * ne;
+        for (uint32_t e2 = 0; e2 < ne; e2++) ar_cooc_score[e2] += h * row[e2];
+    }
+    /* marginal of the next layer as the tie-breaker (bounded by 2^20 in any sane corpus) */
+    for (uint32_t e2 = 0; e2 < ne; e2++) ar_cooc_score[e2] = (ar_cooc_score[e2] << 21) | (ar_cooc_m[(size_t)next_il * ne + e2] & 0x1fffffu);
+    int32_t *out = ar_cooc_rank[ar_cooc_rank_sel ^= 1u];
+    for (uint32_t e2 = 0; e2 < ne; e2++) out[e2] = (int32_t)e2;
+    qsort(out, ne, sizeof(int32_t), ar_cooc_cmp);
+    *n_out = ne;
+    return out;
+}
+static void ar_prefill_prestage_next(const ds4_model *m, const ds4_layer_weights *next_l, uint32_t next_il) {
+    const uint32_t k = ar_prefill_hot_k();
+    if (!k || !next_l || !next_l->ffn_gate_exps || !next_l->ffn_up_exps || !next_l->ffn_down_exps) return;
+    if (!ar_hotlist_load() || next_il >= ar_hot_layers || !ar_hot_n[next_il]) return;
+    const uint64_t gate_row = routed_expert_row_bytes(next_l->ffn_gate_exps);
+    const uint64_t down_row = routed_expert_row_bytes(next_l->ffn_down_exps);
+    const uint64_t offsets[3] = { next_l->ffn_gate_exps->abs_offset, next_l->ffn_up_exps->abs_offset,
+                                  next_l->ffn_down_exps->abs_offset };
+    const uint64_t sizes[3] = { next_l->ffn_gate_exps->bytes, next_l->ffn_up_exps->bytes, next_l->ffn_down_exps->bytes };
+    uint32_t n = ar_hot_n[next_il]; if (n > k) n = k;
+    const int32_t *ranked = &ar_hot_ids[(size_t)next_il * DS4_N_EXPERT];
+    uint32_t n_cooc = 0;
+    const int32_t *cooc = ar_cooc_ranked(next_il, &n_cooc);
+    if (cooc) { ranked = cooc; n = n_cooc < k ? n_cooc : k; }
+    (void)ar_prefill_prestage_start(m->map, m->size, offsets, sizes, gate_row * DS4_N_FF_EXP, down_row * DS4_N_EMBD,
+                                    ranked, n);
+}
+static bool ds41_stage_selected_for_layer(ds41_gpu_graph *g, const ds4_model *m,
+                                          const ds4_layer_weights *l, uint32_t il, uint32_t count,
+                                          const ds4_layer_weights *next_l) {
+    if (!ar_prefill_sweep_selective) return true;
+    if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) return false;
+    /* DS4_ARGODRIVE_PREFILL_TRACE=1: per-layer CPU timeline. since_publish = previous
+     * layer's publish to this drain start (encode + GPU + everything else), drain = wait
+     * for the router ids, stage = staging/top-up until publish. */
+    static double trace_last_publish;
+    const int trace_on = ar_prefill_trace_on();
+    const double t_drain0 = trace_on ? now_sec() : 0;
+    const int had_batch = ds4_gpu_commands_active() != 0;
+    if (had_batch && !ds4_gpu_end_commands()) return false;
+    const double t_ids = trace_on ? now_sec() : 0;
+    const int32_t *selected = ds4_gpu_tensor_contents(g->batch.selected);
+    bool ok = selected != NULL;
+    if (ok) {
+        static uint8_t seen[DS4_MAX_EXPERT];
+        static uint32_t hits[DS4_MAX_EXPERT];
+        static int32_t ids[DS4_MAX_EXPERT];
+        memset(seen, 0, sizeof(seen));
+        memset(hits, 0, sizeof(hits));
+        uint32_t n_ids = 0;
+        for (uint32_t t = 0; ok && t < count; t++) {
+            for (uint32_t j = 0; j < DS4_N_EXPERT_USED; j++) {
+                const int32_t id = selected[t * DS4_N_EXPERT_USED + j];
+                if (id < 0 || (uint32_t)id >= DS4_N_EXPERT) { ok = false; break; }
+                seen[id] = 1; hits[id]++;
+            }
+        }
+        if (ok) {
+            for (uint32_t i = 0; i < DS4_N_EXPERT; i++) if (seen[i]) ids[n_ids++] = (int32_t)i;
+            memcpy(ar_cur_hits, hits, sizeof(ar_cur_hits)); ar_cur_il = il; /* ARGODRIVE_COOC: this layer's counts rank the next */
+            FILE *dump = ar_prefill_ids_dump();
+            if (dump) {
+                fprintf(dump, "%u %u", il, n_ids);
+                for (uint32_t i = 0; i < n_ids; i++) fprintf(dump, " %d:%u", ids[i], hits[ids[i]]);
+                fputc('\n', dump); fflush(dump);
+            }
+            /* Argodrive 2026-10-04 diagnostic (DS4_ARGODRIVE_PREFILL_TOKENS_DUMP=path): every token's six
+             * routed ids per layer, "il t id0..id5", for building conditional read-ahead priors offline. */
+            { static FILE *tdump; static int tchecked;
+              if (!tchecked) { tchecked = 1; const char *tp = getenv("DS4_ARGODRIVE_PREFILL_TOKENS_DUMP"); if (tp && *tp) tdump = fopen(tp, "w"); }
+              if (tdump) {
+                  for (uint32_t t = 0; t < count; t++) {
+                      fprintf(tdump, "%u %u", il, t);
+                      for (uint32_t j = 0; j < DS4_N_EXPERT_USED; j++) fprintf(tdump, " %d", selected[t * DS4_N_EXPERT_USED + j]);
+                      fputc('\n', tdump);
+                  }
+                  fflush(tdump);
+              } }
+            const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
+            const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
+            const uint64_t offsets[3] = { l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                                          l->ffn_down_exps->abs_offset };
+            const uint64_t sizes[3] = { l->ffn_gate_exps->bytes, l->ffn_up_exps->bytes,
+                                        l->ffn_down_exps->bytes };
+            ok = n_ids > 0 && ar_prefill_stage_ids(m->map, m->size, offsets, sizes,
+                                                   gate_row * DS4_N_FF_EXP, down_row * DS4_N_EMBD,
+                                                   ids, n_ids) != 0;
+            /* This layer is published; the drives are idle until the next router runs. */
+            if (ok) ar_prefill_prestage_next(m, next_l, il + 1);
+            if (trace_on) {
+                const double t_pub = now_sec();
+                fprintf(stderr, "ds4: Argodrive prefill trace layer=%u since_publish_ms=%.1f drain_ms=%.1f stage_ms=%.1f ids=%u\n",
+                        il, trace_last_publish ? (t_drain0 - trace_last_publish) * 1000 : 0.0,
+                        (t_ids - t_drain0) * 1000, (t_pub - t_ids) * 1000, n_ids);
+                trace_last_publish = t_pub;
+            }
+        }
+    }
+    if (had_batch && !ds4_gpu_begin_commands()) return false;
+    return ok;
+}
+#endif
+
 static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, uint32_t count,
                            bool shared_owner, bool shared_down) {
@@ -44058,9 +44328,15 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
             m->map, m->size, l->ffn_exp_probs_b->abs_offset, DS4_N_EXPERT, DS4_N_EXPERT_USED,
             DS4_EXPERT_WEIGHT_SCALE, count);
 #endif
-    return (routed ||
-        (ds41_router_batch(g, m, l, count) &&
-         ds41_route_batch(g, m, l, count))) &&
+    if (!(routed ||
+          (ds41_router_batch(g, m, l, count) &&
+           ds41_route_batch(g, m, l, count)))) return false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* The router has run: a staging sweep reads this chunk's routed experts now. */
+    if (ar_prefill_sweep_live &&
+        !ds41_stage_selected_for_layer(g, m, l, il, count, ar_prefill_next_layer)) return false;
+#endif
+    return
         ((shared_owner && !balance_shared && g->tp_rank != (il & 1u)) ||
         (((count <= DS4_TP_BATCH_MAX_ROWS &&
            l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 && l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
@@ -44631,6 +44907,26 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                               ds4_session_progress_fn progress, void *progress_ud,
                               int total, ds4_session_cancel_fn cancel, void *cancel_ud,
                               bool encoder_only, bool resume_encoder) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* DS4_ARGODRIVE_PREFILL_SPLIT=1: read each routed layer through the Argodrive reader into
+     * a staging set instead of paging it in through the mmap of the primary file. Single-host
+     * streaming only; anything else keeps the stock path. */
+    const char *ar_prefill_env = getenv("DS4_ARGODRIVE_PREFILL_SPLIT");
+    const bool ar_prefill_wanted = ar_prefill_env && strcmp(ar_prefill_env, "0") != 0 &&
+        g->streaming && g->tp_world == 1 && !g->encoder_resident && !g->quality;
+    const bool ar_prefill = ar_prefill_wanted && ar_prefill_reader_ready();
+    if (ar_prefill_wanted && !ar_prefill) {
+        static int ar_prefill_told;
+        if (!ar_prefill_told) {
+            ar_prefill_told = 1;
+            fprintf(stderr, "ds4: Argodrive prefill staging needs the reader: set DS4_ARGODRIVE_PRIMARY_NOCACHE=1 "
+                            "or DS4_ARGODRIVE_REPLICAS; using the stock prompt pass\n");
+        }
+    }
+#else
+    const bool ar_prefill = false;
+#endif
+    (void)ar_prefill;
     const uint32_t encoder_chunk = ds41_encoder_chunk_cap(g, total_count);
     /* Short sweeps prune the decoder suffix inside the plain schedule's
      * chunks too, with the same kernels per row, so the output is unchanged
@@ -44676,7 +44972,16 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
      * decode cache from it before advancing to the next layer. */
     row.streaming = false;
     ds41_engram_prefetch engram_prefetch = {0};
-    const bool overlap_engram = total_count >= 1024u &&
+    /* DS4_ARGODRIVE_ENGRAM_PREFETCH_MIN=<tokens> lowers the prompt length from which the two
+     * Engram row tables are read beside the sweep (default 1024: unchanged). Same rows, same
+     * bytes; with staging on, the drives are busy when the sweep thread would read them. */
+    static long ar_engram_prefetch_min = -1;
+    if (ar_engram_prefetch_min < 0) {
+        const char *ar_epm = getenv("DS4_ARGODRIVE_ENGRAM_PREFETCH_MIN");
+        ar_engram_prefetch_min = ar_epm && *ar_epm ? strtol(ar_epm, NULL, 10) : 1024;
+        if (ar_engram_prefetch_min < 1) ar_engram_prefetch_min = 1;
+    }
+    const bool overlap_engram = total_count >= (uint32_t)ar_engram_prefetch_min &&
         !getenv("DS4_METAL_DISABLE_V41_ENGRAM_PREFETCH") &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_ENGRAM");
     const bool pipeline_engram = overlap_engram &&
@@ -44685,8 +44990,22 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
         ds41_engram_prefetch_start(&engram_prefetch, g, 0, total_count);
     bool ok = !g->streaming || metal_graph_stream_map_token(m, w);
     metal_graph_stream_prepare_slot prepare = {0};
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    ar_prefill_sweep_live = ar_prefill;
+    /* Selective only when the whole prompt is one chunk the router sees at once. */
+    ar_prefill_sweep_selective = ar_prefill && total_count <= encoder_chunk &&
+        ar_prefill_selective_for(total_count);
+    ar_prefill_next_layer = NULL;
+    /* Layer 0 has no previous layer to hide its staging behind: its read-ahead starts here,
+     * in front of the embedding and the layer-0 attention. */
+    if (ok && ar_prefill_sweep_selective && DS4_N_LAYER > 0)
+        ar_prefill_prestage_next(m, &w->layer[0], 0);
+#endif
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         if (cancel && cancel(cancel_ud)) { ok = false; break; }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        ar_prefill_next_layer = ar_prefill && il + 1u < DS4_N_LAYER ? &w->layer[il + 1u] : NULL;
+#endif
         if (encoder_only && il == 20u) {
             /* Publish every encoder key, but leave the decoder invalid until
              * the last sweep rebuilds its exact 2541-token dependency suffix. */
@@ -44703,7 +45022,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
         if (g->streaming) {
 #ifdef __APPLE__
             const uint32_t first_count = total_count < encoder_chunk ? total_count : encoder_chunk;
-            if (!g->encoder_resident || il >= 20)
+            if (!ar_prefill && (!g->encoder_resident || il >= 20))
                 ok = metal_graph_stream_prepare_join_layer(NULL, m, w, il, first_count,
                         false, true, false, false, &prepare, 1);
 #endif
@@ -44719,7 +45038,36 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 ok = ds4_gpu_stream_expert_cache_load_layer(&table) != 0;
             }
 #else
-            if (ok) ok = metal_graph_stream_map_layer(m, w, il);
+            if (ok) ok = ar_prefill ? metal_graph_stream_map_layer_decode(m, w, il) :
+                metal_graph_stream_map_layer(m, w, il);
+#endif
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+            if (ok && ar_prefill && !ar_prefill_sweep_selective) {
+                /* Whole-layer staging; the selective case stages after the router, in ds41_moe_batch. */
+                const ds4_layer_weights *sl = &w->layer[il];
+                if (!sl->ffn_gate_exps || !sl->ffn_up_exps || !sl->ffn_down_exps) {
+                    fprintf(stderr, "ds4: Argodrive prefill layer %u has no routed expert tensors\n", il);
+                    ok = false;
+                } else {
+                    const uint64_t offsets[3] = { sl->ffn_gate_exps->abs_offset, sl->ffn_up_exps->abs_offset,
+                                                  sl->ffn_down_exps->abs_offset };
+                    const uint64_t sizes[3] = { sl->ffn_gate_exps->bytes, sl->ffn_up_exps->bytes,
+                                                sl->ffn_down_exps->bytes };
+                    ok = ar_prefill_stage(m->map, m->size, offsets, sizes) != 0;
+                    /* Read the next layer while this one computes. The stage above synchronized,
+                     * so the set this fills is one the GPU has left. */
+                    if (ok && il + 1u < DS4_N_LAYER) {
+                        const ds4_layer_weights *nl = &w->layer[il + 1u];
+                        if (nl->ffn_gate_exps && nl->ffn_up_exps && nl->ffn_down_exps) {
+                            const uint64_t noff[3] = { nl->ffn_gate_exps->abs_offset, nl->ffn_up_exps->abs_offset,
+                                                       nl->ffn_down_exps->abs_offset };
+                            const uint64_t nsz[3] = { nl->ffn_gate_exps->bytes, nl->ffn_up_exps->bytes,
+                                                      nl->ffn_down_exps->bytes };
+                            (void)ar_prefill_stage_ahead(m->map, m->size, noff, nsz);
+                        }
+                    }
+                }
+            }
 #endif
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
             /* File-ordered selected reads are the default. Whole-layer
@@ -44741,7 +45089,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #endif
 #ifdef __APPLE__
             /* CUDA reads into its device cache: warming mmap would read twice. */
-            if (ok && il + 1u < (encoder_only ? 20u : DS4_N_LAYER) &&
+            if (ok && !ar_prefill && il + 1u < (encoder_only ? 20u : DS4_N_LAYER) &&
                 (!g->encoder_resident || il + 1u >= 20))
                 ok = metal_graph_stream_prepare_start_if_needed(NULL, m, w, il + 1u, first_count,
                         false, true, false, false, &prepare, 1);
@@ -45001,6 +45349,12 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     if (g->streaming) ds4_gpu_stream_expert_cache_prefetch_finish(true);
 #endif
     if (!metal_graph_stream_prepare_join_all(&prepare, 1)) ok = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    ar_prefill_sweep_live = false;
+    ar_prefill_sweep_selective = false;
+    ar_prefill_next_layer = NULL;
+    if (ar_prefill && !ar_prefill_release()) ok = false;
+#endif
     if (g->streaming && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (ok && !encoder_only) {
         ok = ds4_gpu_begin_commands() &&
