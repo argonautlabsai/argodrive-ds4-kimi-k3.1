@@ -17,8 +17,8 @@ This is a **source release**. Model weights, NVIDIA drivers, CUDA build tools (o
 | **RTX PRO 6000** (96 GB, Linux, CUDA) | Long raw prompt: 512 prompt / 200 output tokens | **3.88–3.89 tok/s decode** | 11 November, Qwen drafter |
 | **RTX PRO 6000** (96 GB, Linux, CUDA) | Prompt processing: 1,512-token prompt | **43 tok/s prefill** | 8 November; not output generation speed |
 | **RTX PRO 6000** (96 GB, Linux, CUDA) | Long chat prompts: 6,769 / 13,167 tokens | **1.51 / 1.48 tok/s decode** | 8 November, 8k / 16k context caches |
-| **MacBook Pro M5 Max** (128 GB, macOS, Metal) | Raw financial text: 6 prompt / 512 output tokens | **2.04 tok/s decode** | 9 November, Qwen drafter, fp32 activations |
-| **MacBook Pro M5 Max** (128 GB, macOS, Metal) | Prompt processing: 512-token prompt | **8.4 tok/s prefill** | 9 November; not output generation speed |
+| **MacBook Pro M5 Max** (128 GB, macOS, Metal) | Raw financial text: 6 prompt / 512 output tokens | **2.49 tok/s decode** | 11 November, Qwen drafter, fp32 activations; 2.29 with the laptop in use |
+| **MacBook Pro M5 Max** (128 GB, macOS, Metal) | Prompt processing: 512-token prompt | **9.0–10.4 tok/s prefill** | 11 November; not output generation speed |
 
 **Tested hardware, not minimum requirements:**
 - **RTX PRO 6000 (Linux, CUDA):** one RTX PRO 6000 Blackwell GPU with **96 GB VRAM**, **70 GiB RAM** assigned to the Ubuntu VM and **five physical NVMe devices** in three storage tiers (**four** in two tiers for the 10 and 11 November results). Context caches measured up to **16,384 tokens** using sparse attention.
@@ -84,23 +84,29 @@ the text is. The 512-token prompt is `prompt-512-tokens.txt` from the deltafin K
 
 ### Standard benchmarks on a MacBook Pro M5 Max (macOS, Metal)
 
-Since 9 November the same engine runs Kimi K3.1 Pro on a MacBook Pro with an M5 Max and 128 GB of unified memory, through
-Metal, with the experts streamed from the internal SSD and two Thunderbolt 5 NVMe drives: 2.04 tok/s decode on raw
-completions with the Qwen drafter (512 generated), 1.93 tok/s over 128. Measured on 9 November at commit 5560b5e, median
-of three fresh processes per row, greedy, raw prompts, with the Qwen drafter:
+The same engine runs Kimi K3.1 Pro on a MacBook Pro with an M5 Max and 128 GB of unified memory, through Metal, with the
+experts streamed from the internal SSD and two Thunderbolt 5 NVMe drives: 2.49 tok/s decode on raw completions with the Qwen
+drafter (512 generated). Measured on 11 November at commit bb5c53b, fresh processes, greedy, raw prompts, with the Qwen
+drafter: the median of three runs for the 6-token prompt and both runs for the 512-token prompt. The last column is the same
+build with the 9 November settings, in the same session (one or two runs), with other applications open but nobody at the
+laptop:
 
-| test | prefill | decode |
-|---|---|---|
-| "The three main financial statements are" (6 tokens), 128 generated (tg128) | — | 1.93 tok/s |
-| 512-token prompt, 128 generated (pp512 / tg128) | 8.4 tok/s | 1.47 tok/s |
-| the same 6-token prompt, 512 generated | — | 2.04 tok/s |
+| test | prefill | decode | 9 November settings |
+|---|---|---|---|
+| "The three main financial statements are" (6 tokens), 128 generated (tg128) | — | 1.79 tok/s | 1.78–1.82 tok/s |
+| 512-token prompt, 128 generated (pp512 / tg128) | 9.0–9.4 tok/s | 2.44–2.47 tok/s | 7.9 tok/s prefill, 1.42 decode |
+| the same 6-token prompt, 512 generated | — | 2.49 tok/s | 1.99 tok/s |
+
+A second session ran the two settings alternately, three times each, with the laptop in use. Its medians are 2.29 against
+1.81 tok/s on the 512-token generation, 2.40 against 1.36 after the 512-token prompt (prefill 10.4 against 8.1 tok/s) and
+1.58 against 1.72 on the 128-token test. So long, predictable text decodes about 25 % faster than with the 9 November
+settings and the answer after the 512-token prompt about 75 % faster, with a prompt pass 15 to 20 % shorter. A short
+generation does not gain: the 128-token test was equal in the first session and 8 % slower in the second. Machine load moves
+all of these by several percent, which is why each comparison stays inside one session; the 9 November release's own table
+read 1.93 tok/s, 1.47 at 8.4 tok/s prefill, and 2.04.
 
 The Metal path computes with fp32 activations throughout, and the drafter's runs gave the same logits as plain decoding
-(2,955 positions compared). Setup, drive layout and knobs: [Apple silicon](tools/kimi-k3/README.md#apple-silicon-metal).
-
-These are the 9 November release's measurements. The 11 November release also changes three defaults on the Mac
-(verification blocks of up to 64 rows, read-ahead in the prompt pass, and plain steps that issue their reads first);
-measurements with them will follow here.
+(9,940 positions compared on 11 November). Setup, drive layout and knobs: [Apple silicon](tools/kimi-k3/README.md#apple-silicon-metal).
 
 ### Architecture and validation
 

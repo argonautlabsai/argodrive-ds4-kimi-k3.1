@@ -85,28 +85,39 @@ GPU's own input, agreed within a relative error of 1.7e-5 (`DS4_K3_STAGE_CHECK=4
 the check hooks the one-token path, so the prompt must not be batched). The drafter is exact here too: with it on, every
 logit we hashed matched plain decoding.
 
-Tested on a MacBook Pro with an M5 Max and 128 GB of unified memory, measured on 9 November 2026 at commit 5560b5e, median of
-three fresh processes per row, greedy, raw prompts, with the Qwen drafter:
+Tested on a MacBook Pro with an M5 Max and 128 GB of unified memory, measured on 11 November 2026 at commit bb5c53b, fresh
+processes, greedy, raw prompts, with the Qwen drafter, in two sessions. Each cell is this release's defaults against the same
+build with the 9 November settings (`DS4_K3_QWEN_ROWS=16 DS4_K3_QWEN_KEEP=0 DS4_K3_METAL_PEND=0 DS4_K3_METAL_PREFILL_PF=0`).
+In the first session other applications were open but nobody was at the laptop: the median of three runs for the 6-token
+prompt and both runs for the 512-token prompt, against one or two runs of the old settings. The second ran the two settings
+alternately, three times each, with the laptop in use (medians):
 
-| test | prefill | decode |
+| test | first session | second session |
 |---|---|---|
-| "The three main financial statements are" (6 tokens), 128 generated (tg128) | — | 1.93 tok/s |
-| 512-token prompt, 128 generated (pp512 / tg128) | 8.4 tok/s | 1.47 tok/s |
-| the same 6-token prompt, 512 generated | — | 2.04 tok/s |
+| "The three main financial statements are" (6 tokens), 128 generated (tg128) | 1.79 against 1.78–1.82 tok/s | 1.58 against 1.72 tok/s |
+| 512-token prompt (pp512), prefill | 9.0–9.4 against 7.9 tok/s | 10.4 against 8.1 tok/s |
+| 512-token prompt, 128 generated (tg128) | 2.44–2.47 against 1.42 tok/s | 2.40 against 1.36 tok/s |
+| the same 6-token prompt, 512 generated | 2.49 against 1.99 tok/s | 2.29 against 1.81 tok/s |
 
-Plain decode (no drafter) on the 6-token prompt runs at 1.40 tok/s over 128 tokens and 1.29 over 512. The first token
-of a short prompt comes after about 6 to 9 s. `prompt-512-tokens.txt` is the prompt from the deltafin Kimi K3 benchmark, as above.
+Long, predictable text gains about 25 % and the answer after the 512-token prompt about 75 %. A short generation does not:
+the 128-token test was equal in the first session and 8 % slower in the second, and the four variables above bring the old
+behaviour back. All logits matched plain decoding (9,940 positions over both sessions).
 
-Those numbers are from 9 November. Since the 11 November release three defaults differ on the Mac, none of them in the
-arithmetic, and measurements with them will follow:
+Three defaults changed on the Mac since 9 November, none of them in the arithmetic:
 
 - a verification block may take up to 64 rows (16 before), and the sidecar keeps the rows it has already computed
-  ([the drafter](#the-optional-qwen-drafter));
+  ([the drafter](#the-optional-qwen-drafter)). On the 512-generated test the widths gave 1.91 to 1.93 tok/s at 16 rows,
+  2.00 at 32 and 2.50 at 64. A block of 64 kept drafts takes about 25 s here, almost all of it expert reads, so this is
+  what the three drives allow;
 - a prompt pass of more than 16 tokens reads ahead one predicted expert of the next layer per token while the current
-  layer computes (`DS4_K3_METAL_PREFILL_PF`);
-- a plain step issues its own reads before it waits for the prefetches it adopted (`DS4_K3_METAL_PEND`).
+  layer computes (`DS4_K3_METAL_PREFILL_PF`), which is the prefill difference in the table;
+- a plain step issues its own reads before it waits for the prefetches it adopted (`DS4_K3_METAL_PEND`): plain decode on
+  the 6-token prompt over 128 tokens went from 1.37–1.38 to 1.41–1.44 tok/s.
 
-`DS4_K3_QWEN_ROWS=16 DS4_K3_QWEN_KEEP=0 DS4_K3_METAL_PEND=0 DS4_K3_METAL_PREFILL_PF=0` restores the 9 November settings.
+Machine load moves these numbers by several percent, which is why each comparison stays inside one session; the 9 November
+release's own table read 1.93 tok/s, 1.47 at 8.4 tok/s prefill, and 2.04. Plain decode (no drafter) on the 6-token prompt ran
+at 1.45 tok/s over 128 tokens and 1.32 over 512 (single runs). The first token of a short prompt comes after about 6 to 9 s.
+`prompt-512-tokens.txt` is the prompt from the deltafin Kimi K3 benchmark, as above.
 
 Where the model lives:
 
