@@ -2,7 +2,7 @@
 
 # Argodrive DS4 Kimi K3.1
 
-## Run Kimi K3.1 Pro locally on one GPU
+## Run Kimi K3.1 Pro locally on one NVIDIA GPU or on a Mac
 
 **This repository is the inference engine.** It already includes the ds4-based runtime, the Kimi K3/K3.1 CUDA port and its Metal port for Apple silicon, NVMe expert streaming, expert caches and weight-preparation tools. Clone and build this repository; **no separate upstream ds4 installation or Argodrive Mac app is needed**.
 
@@ -144,6 +144,8 @@ Weight layout, knobs, how we measured and what is and isn't bit-identical are al
     git clone --branch main https://github.com/argonautlabsai/argodrive-ds4-kimi-k3.1.git
     cd argodrive-ds4-kimi-k3.1
     make ds4 CUDA_ARCH=sm_120
+
+On a Mac with Apple silicon the build is `make ds4`; the rest is in [Apple silicon (Metal)](tools/kimi-k3/README.md#apple-silicon-metal).
 
 
 ## Where to find the Kimi code
