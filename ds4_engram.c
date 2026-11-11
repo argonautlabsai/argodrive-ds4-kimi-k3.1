@@ -211,7 +211,7 @@ static int request_order(const void *a, const void *b) {
     return (x->row > y->row) - (x->row < y->row);
 }
 
-enum { ENGRAM_READERS = 16 };
+enum { ENGRAM_READERS = 16, AR_ENGRAM_BATCH_MAX = 256 };
 #ifdef __APPLE__
 enum { ENGRAM_PARALLEL_MIN_ROWS = 8 };
 #else
@@ -224,7 +224,7 @@ typedef struct {
     const engram_request *request;
     float *out;
     size_t count, readers;
-    int error[ENGRAM_READERS];
+    int error[AR_ENGRAM_BATCH_MAX];
 } engram_batch;
 
 static void read_batch_part(void *context, size_t part) {
@@ -246,6 +246,45 @@ static void read_batch_part(void *context, size_t part) {
         }
     }
 }
+
+#ifdef __APPLE__
+/* DS4_ARGODRIVE_ENGRAM_BATCH_READERS=<n>: the batch path issues its random 264-byte reads
+ * from 16 GCD workers. While prompt-pass staging keeps the drive queues full of large expert
+ * reads, each small read waits behind them, and more outstanding reads finish the same rows
+ * in proportionally less wall time. Unset keeps the 16 workers; above 16 the slices run on
+ * pthreads. Same rows into the same disjoint slots. */
+static unsigned ar_engram_batch_readers(void) {
+    static long n = -1;
+    if (n < 0) {
+        const char *e = getenv("DS4_ARGODRIVE_ENGRAM_BATCH_READERS");
+        n = e && *e ? strtol(e, NULL, 10) : 0;
+        if (n < 0) n = 0;
+        if (n > AR_ENGRAM_BATCH_MAX) n = AR_ENGRAM_BATCH_MAX;
+    }
+    return (unsigned)n;
+}
+typedef struct { engram_batch *batch; size_t part; } ar_engram_batch_arg;
+static void *ar_engram_batch_thread(void *arg) {
+    const ar_engram_batch_arg *a = arg;
+    read_batch_part(a->batch, a->part);
+    return NULL;
+}
+static void ar_engram_batch_threads(engram_batch *batch) {
+    pthread_t th[AR_ENGRAM_BATCH_MAX];
+    ar_engram_batch_arg args[AR_ENGRAM_BATCH_MAX];
+    unsigned char running[AR_ENGRAM_BATCH_MAX];
+    pthread_attr_t attr;
+    const int has_attr = pthread_attr_init(&attr) == 0;
+    if (has_attr) (void)pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INITIATED, 0);
+    for (size_t i = 0; i < batch->readers; i++) {
+        args[i] = (ar_engram_batch_arg){batch, i};
+        running[i] = pthread_create(&th[i], has_attr ? &attr : NULL, ar_engram_batch_thread, &args[i]) == 0;
+        if (!running[i]) read_batch_part(batch, i);   /* out of threads: this slice inline */
+    }
+    for (size_t i = 0; i < batch->readers; i++) if (running[i]) pthread_join(th[i], NULL);
+    if (has_attr) pthread_attr_destroy(&attr);
+}
+#endif
 
 #ifndef __APPLE__
 typedef struct {
@@ -306,7 +345,10 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
         if (count >= (size_t)engram_par_min) {
             batch.readers = count < ENGRAM_READERS ? count : ENGRAM_READERS;
 #ifdef __APPLE__
-            dispatch_apply_f(batch.readers,
+            const unsigned ar_readers = ar_engram_batch_readers();
+            if (ar_readers) batch.readers = count < ar_readers ? count : ar_readers;
+            if (batch.readers > ENGRAM_READERS) ar_engram_batch_threads(&batch);
+            else dispatch_apply_f(batch.readers,
                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &batch, read_batch_part);
 #else
             pthread_t threads[ENGRAM_READERS - 1];
