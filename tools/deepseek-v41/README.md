@@ -1,0 +1,191 @@
+# DeepSeek V4.1 Flash on a Mac: streaming from one or two drives
+
+DeepSeek V4.1 Flash does not fit in the memory of a 128 GB Mac: the October checkpoint
+(`DeepSeek-V4.1-Flash-1017-MXFP4-experts.gguf`, 501.6 GB) keeps 9.4 GiB of weights resident and streams its
+15,360 routed experts (17.9 MiB each) from disk into a cache. With `--ssd-streaming` the engine does that out of the
+box. This directory documents the switches in this fork that make the streaming faster on Apple silicon, the numbers
+they give on a MacBook Pro M5 Max, and the tools used to measure them.
+
+All of the switches are off unless set. None of them changes a kernel, a weight or the arithmetic: every run reported
+here produced the same text as the same binary without switches.
+
+## Measured on a MacBook Pro M5 Max (128 GB), 12 November 2026
+
+`ds4-bench`, prompt `speed-bench/promessi_sposi.txt`, 200 generated tokens, every arm a fresh process with the page
+cache of the model files dropped first, other applications open but idle. Decode is the steady rate after the first
+token. Medians of three runs for the rows with switches on the internal SSD, single runs for the others; the three
+runs of a row lay within 0.3 % of each other.
+
+| setup | prompt | prefill | decode |
+|---|---|---|---|
+| no switches, internal SSD, 3,600 cached experts | 512 tokens | 17.6 tok/s | 13.0 tok/s |
+| switches, internal SSD | 512 tokens | 41.8 tok/s | 16.4 tok/s |
+| switches, internal SSD + one Thunderbolt 5 NVMe drive | 512 tokens | 55.7 tok/s | 18.3 tok/s |
+| switches, Thunderbolt 5 NVMe drive only | 512 tokens | 19.2 tok/s | 11.3 tok/s |
+| no switches, internal SSD | 2,048 tokens | 70.1 tok/s | 11.9 tok/s |
+| switches, internal SSD | 2,048 tokens | 118.4 tok/s | 14.8 tok/s |
+| switches, internal SSD + one Thunderbolt 5 NVMe drive | 2,048 tokens | 160.7 tok/s | 16.7 tok/s |
+| switches, Thunderbolt 5 NVMe drive only | 2,048 tokens | 52.9 tok/s | 9.8 tok/s |
+| no switches, internal SSD | 4,096 tokens | 126.9 tok/s | 12.2 tok/s |
+| switches, internal SSD + one Thunderbolt 5 NVMe drive | 4,096 tokens | 249.2 tok/s | 16.5 tok/s |
+| no switches, internal SSD | 8,192 tokens | 234.1 tok/s | 13.1 tok/s |
+| switches, internal SSD + one Thunderbolt 5 NVMe drive | 8,192 tokens | 410.8 tok/s | 17.3 tok/s |
+
+The rows with switches run a cache of 4,368 experts in the memory the 3,600-expert row uses (see *Memory* below).
+The 4,096- and 8,192-token rows are single runs with 100 generated tokens, a 16,384-token context and 4,000 cached
+experts (3,600 without switches). Up to 2,048 prompt tokens the pass reads only the experts the prompt routes to;
+above that it stages whole layers, which was faster than selective reading at both sizes (249 against 236 tok/s and
+411 against 357).
+Without switches the same file on the Thunderbolt 5 drive alone gave 7.5 to 8.6 tok/s prefill and 8.2 to 8.5 tok/s
+decode on 11 November: the drive under the model matters as much as the switches. These numbers move with the
+machine: while other applications were busy on the same laptop, the two-drive decode fell from 18.3 to between 14.8
+and 15.3 tok/s for a few minutes and came back.
+
+A three-turn chat through `ds4-server` (831, 1,626 and 1,638 prompt tokens; 160, 160 and 80 generated; temperature 0)
+took 21.5, 23.0 and 17.4 s per turn with the switches on two drives and 49.8, 51.6 and 41.7 s without switches on the internal
+SSD. The three answers were identical in both runs. The server re-reads the whole conversation on every turn (the
+thinking tokens are not part of the next prompt), so in a chat the prompt pass is most of the time.
+
+## The switches
+
+Reading (`argodrive_read.h`, the reader in `ds4_metal.m`):
+
+| switch | effect |
+|---|---|
+| `DS4_ARGODRIVE_PRIMARY_NOCACHE=1` | routed experts are read uncached through their own descriptor instead of through the page cache |
+| `DS4_ARGODRIVE_REPLICAS=/abs/path*W[,/abs/path*W]` | up to two byte-identical copies of the model file on other drives; every expert read is split across the drives in 256 KiB blocks in proportion to the weights |
+| `DS4_ARGODRIVE_PRIMARY_WEIGHT=W` | the first drive's weight (default 2) |
+| `DS4_ARGODRIVE_DECODE_WEIGHTS=a,b[,c]` | a different split for decode loads |
+
+Prompt pass (staging the routed experts of each layer into two staging sets):
+
+| switch | effect |
+|---|---|
+| `DS4_ARGODRIVE_PREFILL_SPLIT=1` | the staged prompt pass; needs the reader (one of the two switches above) |
+| `DS4_ARGODRIVE_PREFILL_SELECTIVE=1` | read only the experts the prompt routes to, after the router has run |
+| `DS4_ARGODRIVE_PREFILL_SELECTIVE_MAX=N` | selective up to N prompt tokens in one chunk (default 512; 2,048 measured here) |
+| `DS4_ARGODRIVE_PREFILL_AHEAD=1`, `DS4_ARGODRIVE_PREFILL_LANES=8` | read the next layer while this one computes; reads in flight per staged tensor |
+| `DS4_ARGODRIVE_PREFILL_HOT=384`, `DS4_ARGODRIVE_HOTLIST=<file>` | before the router's answer is known, read the next layer's likeliest experts in the order of a ranking file |
+| `DS4_ARGODRIVE_PREFILL_CACHE_COPY=1` | experts the cache already holds are copied from memory instead of read again |
+| `DS4_ARGODRIVE_ENGRAM_PREFETCH_MIN=1`, `DS4_ARGODRIVE_ENGRAM_BATCH_READERS=128` | start the Engram table reads early and keep more of them in flight |
+
+Decode:
+
+| switch | effect |
+|---|---|
+| `DS4_ARGODRIVE_CACHE_SHARE=1` | the staging sets stay allocated and lend their 768 expert positions to the cache between prompt passes |
+| `DS4_ARGODRIVE_GAP_KEEPALIVE=2`, `DS4_TP_KEEPALIVE_TGS=1`, `DS4_TP_KEEPALIVE_ITERS=300000` | a small kernel keeps the GPU out of its low-power states between the command buffers of a token |
+
+`m5max-two-drives.env.example` is the set used for the two-drive rows. For one drive, leave out the two lines that
+name the replica.
+
+## Two drives
+
+A replica must be the same file byte for byte: the reader checks size and identity of the file, not content, and a
+read is assembled from blocks of every drive. Copy the file, then compare a checksum of the copy with the published
+one before using it. Weights should follow what the drives deliver together; 7 for an M5 Max internal SSD against 3
+for an 80 Gb/s Thunderbolt 5 NVMe enclosure was the best of the splits tried here, for the prompt pass and for decode
+alike.
+
+## Memory
+
+A decode step is about 30 ms of GPU work, which is close to what the memory bandwidth of the machine allows for
+13 GB of weights per token, plus about 1.2 ms for every expert that is not in the cache. The cache size is therefore
+the remaining lever, and it is bounded by memory:
+
+| cached experts | experts loaded per decode token |
+|---|---|
+| 3,600 | 20.1 |
+| 4,368 | 14.9 |
+| 4,800 | 12.3 |
+| 5,200 | 10.5 |
+| 6,000 | 7.8 |
+
+(route replay of a 512-token prompt and 600 generated tokens with `route_cache_sim.py`; the engine measured 20.4 and
+15.6 at the first two sizes.)
+
+The staged prompt pass needs two staging sets, 13.45 GiB for this model. Without `DS4_ARGODRIVE_CACHE_SHARE` they
+are allocated on top of the cache for every prompt pass. With it, `--ssd-streaming-cache-experts N` is the whole
+budget: the prompt pass runs with N − 768 cached experts, decode with N, and the resident size does not move between
+the two (86.5 GiB here at N = 4,368: 76.5 GiB of experts, 9.4 GiB of resident weights, the rest buffers). Choose N so
+that this fits beside whatever else the machine runs; a cache that pushes the system into swap is slower than a
+smaller one.
+
+There is a second bound. The engine keeps the resident weights locked in memory only while they and the cache
+together stay under seven eighths of Metal's recommended working set less the context buffers, rounded down to a
+GiB: 92 GiB on this machine at a 4,096-token context, which is 4,719 experts (4,434 at a 16,384-token context).
+Measured on the 512-token benchmark with two drives:
+
+| cached experts | prefill | decode | |
+|---|---|---|---|
+| 4,368 | 55.7 tok/s | 18.3 tok/s | the rows above |
+| 4,700 | 55.6 tok/s | 19.1 tok/s | 93.5 GiB planned; needs about 7 GiB more free memory than 4,368 |
+| 4,800 | 31.0 tok/s | 19.3 tok/s | past the bound: the resident weights become pageable and the prompt pass slows |
+
+## The ranking file
+
+`hotlists/deepseek-v4.1-flash-1017-readahead.txt` ranks each layer's experts by how often 22 prompts of 512 tokens
+routed to them: nine slices of *I Promessi Sposi* from 100 KB into the book onward, eight slices of the two English
+long-context prompts in `tests/`, three C sources, the Makefile and a Metal shader, all from this repository. None
+overlaps a measured prompt (the benchmark reads the head of the book). It only decides the order of the read-ahead; a
+different list changes speed, never output. With it the read-ahead had 41 % of a layer's experts in place before the
+router answered on the benchmark prompt, 36 % on English prose and 34 % on C code.
+
+To build one for another model or corpus:
+
+```
+python3 tools/deepseek-v41/make_corpus.py . /tmp/corpus
+# for each file: one 512-token prompt pass with DS4_ARGODRIVE_PREFILL_IDS_DUMP=/tmp/dumps/<name>.txt
+python3 tools/deepseek-v41/make_hotlist.py my-ranking.txt /tmp/dumps/*.txt
+```
+
+Never include a prompt you are going to measure.
+
+## Tools
+
+- `make_corpus.py`, `make_hotlist.py`: the ranking, as above.
+- `route_cache_sim.py`: replays a recorded run (`DS4_ARGODRIVE_PREFILL_TOKENS_DUMP`, `DS4_MOE_RECORD_SELECTED_IDS`)
+  through a model of the expert cache, to size a cache or compare eviction rules without running the engine. It
+  reproduced the engine's loads per token within 1 % at three cache sizes.
+
+## CUDA: one GPU that streams its experts
+
+The CUDA backend carries the switches that have served a DeepSeek V4.1 Flash endpoint on one RTX PRO 6000 (96 GB)
+since October 2026. They are off unless set, and with none set the expert loader takes upstream's path.
+
+| switch | effect |
+|---|---|
+| `DS4_CUDA_HOST_EXPERT_CACHE_GB=N`, `DS4_CUDA_HOST_TIER_LOAD=<ranking>`, `DS4_CUDA_HOST_TIER_DUMP=<file>` | a pinned host-RAM tier of routed experts behind the VRAM cache, preloaded from a ranking; the dump writes the ranking a session observed |
+| `DS4_CUDA_POOL_FIRST=1`, `DS4_CUDA_POOL_EVICT_BIAS=N` | a miss is served from the host tier before the drive; experts the tier still holds are evicted from VRAM first |
+| `DS4_CUDA_PARALLEL_EXPERT_READ=1`, `DS4_CUDA_EXPERT_READERS=N`, `DS4_CUDA_READ_THREADS=N`, `DS4_CUDA_STAGE_RING=N`, `DS4_CUDA_UPLOAD_ON_READY=1` | several readers per load, a larger staging ring, and the upload issued by the reader that finished the read |
+| `DS4_CUDA_REPLICAS=/abs/path*W`, `DS4_CUDA_PRIMARY_WEIGHT=W` | reads split between the model file and a full or partial copy on a second drive |
+| `DS4_CUDA_SHARED_ASYNC=1` | the shared expert runs on a side stream while the host loads the routed ones |
+| `DS4_CUDA_PREFILL_WAVES=1`, `DS4_CUDA_PREFILL_COLD=1` | prompt pass: resident experts first, and prompt-pass fills marked cold for the decode cache |
+| `DS4_CUDA_MOE_Q4_MMA_WIDE=1` | the wide tensor-core tile kernels for Q4_K experts |
+| `DS4_CUDA_VRAM_RESERVE_MB=N`, `DS4_STREAMING_CACHE_IGNORE_HOST_BUDGET=1` | how much VRAM stays free, and a VRAM cache sized by VRAM instead of by host RAM |
+
+Checked on 11 November 2026 on the RTX PRO 6000 with the Q4_K file (518.6 GB) and a 3,869-expert VRAM cache: three
+300-token chat prompts and one 1,556-token prompt at temperature 0 gave the same text from the build that had been
+serving, from this tree with the same switches, from this tree without the side stream, and from this tree with no
+switches. Decode on the three short prompts:
+
+| build | decode |
+|---|---|
+| the build that had been serving (upstream of 14 September plus these changes) | 10.98 / 10.71 / 10.23 tok/s |
+| this tree, the same switches | 11.99 / 11.68 / 10.60 tok/s |
+| this tree, without `DS4_CUDA_SHARED_ASYNC` | 11.29 / 10.99 / 10.34 tok/s |
+| this tree, no switches (the engine fits the VRAM cache to host RAM: 1,330 experts) | 3.18 / 2.94 / 2.47 tok/s |
+
+The 1,556-token prompt took 25.5 to 25.7 s to process with the switches and 47.8 s without. The Kimi K3.1 path gave
+the logits of its published references on the same binary (840 positions).
+
+## What was measured and left out
+
+- An eviction rule that ages use counts continuously: 3 to 8 % fewer loads than the engine's rule on three recorded
+  runs, more loads with a long half-life on English prose. The engine's rule stays. Evicting with knowledge of the
+  future (Belady's bound) would load about 40 % fewer experts, so the gap is foresight, not the rule.
+- Reading a layer's experts one layer early: guessing them from co-occurrence statistics named 1 % of the experts
+  that were missing; applying the next layer's router to this layer's input named 41 % of them, and 77 % of the
+  experts it would have fetched went unused.
+- More staging lanes than 8, more decode reader threads than the default 9, and decode splits other than the prompt
+  pass's: no gain.

@@ -108,6 +108,23 @@ read 1.93 tok/s, 1.47 at 8.4 tok/s prefill, and 2.04.
 The Metal path computes with fp32 activations throughout, and the drafter's runs gave the same logits as plain decoding
 (9,940 positions compared on 11 November). Setup, drive layout and knobs: [Apple silicon](tools/kimi-k3/README.md#apple-silicon-metal).
 
+### DeepSeek V4.1 Flash on the same MacBook Pro (macOS, Metal)
+
+The engine also runs DeepSeek V4.1 Flash (the October checkpoint, MXFP4 experts, 501.6 GB) on the M5 Max by streaming
+its routed experts from disk. Measured on 12 November with `ds4-bench`, 200 generated tokens, fresh processes with the
+file cache dropped, other applications open but idle; decode is the steady rate after the first token:
+
+| setup | 512-token prompt | 2,048-token prompt |
+|---|---|---|
+| no switches, model on the internal SSD | 17.6 tok/s prefill, 13.0 decode | 70.1 prefill, 11.9 decode |
+| streaming switches, internal SSD | 41.8 prefill, 16.4 decode | 118.4 prefill, 14.8 decode |
+| streaming switches, internal SSD and a copy on one Thunderbolt 5 NVMe drive | **55.7 prefill, 18.3 decode** | **160.7 prefill, 16.7 decode** |
+
+The switches change how expert bytes are read, staged and cached, never the arithmetic: each row produced the same text,
+and a three-turn chat through the server gave the same three answers with and without them (21.5, 23.0 and 17.4 s per
+turn against 49.8, 51.6 and 41.7 s). Switches, the two-drive setup, memory sizing and the CUDA counterparts:
+[DeepSeek V4.1 Flash](tools/deepseek-v41/README.md).
+
 ### Architecture and validation
 
 [Argonaut Labs](https://argonautlabs.ai) built this Kimi K3 / K3.1 Pro port on top of Salvatore Sanfilippo's [ds4](https://github.com/antirez/ds4) at commit c97964b.
@@ -158,6 +175,7 @@ The default branch is **`main`**. It contains the Kimi K3.1 Pro port and earlier
 |---|---|
 | [Installation guide](https://argonautlabs.ai/guides/install-kimi-k31.html) | Build, weight download and preparation, first run, troubleshooting |
 | [Kimi configuration and tools](tools/kimi-k3/README.md) | Weight layout, reader settings, optional drafter, sparse attention and validation |
+| [DeepSeek V4.1 Flash](tools/deepseek-v41/README.md) | Streaming switches for a Mac with one or two drives and for one CUDA GPU, measured speeds, ranking and cache tools |
 | [Measured results](https://argonautlabs.ai/research/kimi-k31-single-gpu.html) | Hardware, dates, workloads, timing definitions and raw JSON |
 | [Upstream documentation](UPSTREAM_README.md) | The original ds4 engine and other-model instructions |
 
