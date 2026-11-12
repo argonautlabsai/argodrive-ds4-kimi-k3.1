@@ -34951,7 +34951,12 @@ static uint32_t metal_graph_streaming_decode_prefill_max_tokens(
         DS4_MODEL_VARIANT != DS4_VARIANT_FLASH) {
         return 0u;
     }
-    return metal_graph_streaming_decode_prefill_wide_default(weights) ? 64u : 18u;
+    {
+        static int logged = 0;
+        const uint32_t v = metal_graph_streaming_decode_prefill_wide_default(weights) ? 64u : 18u;
+        if (!logged) { logged = 1; fprintf(stderr, "ds4: streaming decode-style prefill threshold: tails of <= %u tokens take the single-token path\n", v); }
+        return v;
+    }
 }
 
 static bool metal_graph_use_streaming_decode_prefill(
@@ -43027,6 +43032,61 @@ static ds4_gpu_tensor *ds41_router_bf16(const ds4_model *m, const ds4_layer_weig
 #endif
 }
 
+
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+/* ---- V4.1 decode read-ahead (CUDA) ----------------------------------------------
+ * Port of the fork's Metal DS4_ARGODRIVE_DECODE_AHEAD: predict layer il+1's routed
+ * experts by running il+1's router on this layer's normalised MoE input, and hand
+ * the prediction to the CUDA streaming cache, which reads it back in the drain the
+ * demand load already performs and fetches the misses while this layer's MoE runs.
+ * Nothing here changes what the model computes; a wrong guess costs one cold slot.
+ * Gated by DS4_CUDA_DECODE_AHEAD=1 or DS4_CUDA_LOOKAHEAD_PROBE=1 (stats only). */
+static ds4_gpu_tensor *g_la_logits, *g_la_probs, *g_la_selected, *g_la_weights;
+static const ds4_weights *g_la_weights_ptr;
+static int la_active(void) {
+    static int checked, on;
+    if (!checked) {
+        const char *a = getenv("DS4_CUDA_DECODE_AHEAD"), *p = getenv("DS4_CUDA_LOOKAHEAD_PROBE");
+        on = (a && strcmp(a, "0") != 0) || (p && strcmp(p, "0") != 0);
+        checked = 1;
+    }
+    return on;
+}
+/* Encode il+1's router on g->norm and arm the cache. Silent on failure by design. */
+static void la_encode_and_arm(ds41_gpu_graph *g, const ds4_model *m, uint32_t il, uint32_t token) {
+    const ds4_weights *w = g_la_weights_ptr;
+    if (!w || il + 1u >= DS4_N_LAYER) return;
+    const ds4_layer_weights *ln = &w->layer[il + 1u];
+    const ds4_tensor *nbias = ds41_image_at(g, g->pos) ? ln->ffn_exp_probs_vl : ln->ffn_exp_probs_b;
+    if (!ln->ffn_gate_inp || !nbias || !ln->ffn_gate_exps || !ln->ffn_up_exps || !ln->ffn_down_exps) return;
+    if (!g_la_logits) {
+        g_la_logits   = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+        g_la_probs    = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+        g_la_selected = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+        g_la_weights  = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(float));
+        if (!g_la_logits || !g_la_probs || !g_la_selected || !g_la_weights) return;
+    }
+    if (!ds41_matmul(g_la_logits, m, ln->ffn_gate_inp, g->norm, false)) return;
+    if (!ds4_gpu_router_select_tensor(g_la_selected, g_la_weights, g_la_probs,
+            m->map, m->size, nbias->abs_offset, 0, 0, token,
+            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
+            g_la_logits)) return;
+    uint64_t gate_row = 0, down_row = 0;
+    if (!tensor_nbytes(ln->ffn_gate_exps->type, DS4_N_EMBD, &gate_row) ||
+        !tensor_nbytes(ln->ffn_down_exps->type, DS4_N_FF_EXP, &down_row)) return;
+    const ds4_gpu_stream_expert_table nt = {
+        .model_map = m->map, .model_size = m->size, .layer = il + 1u,
+        .n_total_expert = DS4_N_EXPERT,
+        .gate_offset = ln->ffn_gate_exps->abs_offset,
+        .up_offset   = ln->ffn_up_exps->abs_offset,
+        .down_offset = ln->ffn_down_exps->abs_offset,
+        .gate_expert_bytes = gate_row * DS4_N_FF_EXP,
+        .down_expert_bytes = down_row * DS4_N_EMBD,
+    };
+    ds4_gpu_stream_expert_lookahead_arm(&nt, g_la_selected, g_la_weights, DS4_N_EXPERT_USED);
+}
+#endif
+
 /* Without shared_down the shared expert's down projection waits for
  * ds41_graph_after_moe, which folds it into the expand. */
 static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
@@ -43080,6 +43140,10 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
                 &table, g->selected, DS4_N_EXPERT_USED)) return false;
     }
 #endif
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    if (g->streaming && g->tp_world == 1 && !g->quality && !g->imatrix && la_active())
+        la_encode_and_arm(g, m, il, token);
+#endif
     const bool shared_split = shared_owner && shared_down && ds41_tp_shared_split() &&
         l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 && l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
         l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 && (DS4_N_FF_EXP % 64u) == 0u;
@@ -43089,7 +43153,13 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     bool shared_queued = false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     const bool balance_shared = shared_owner && ds41_balance_shared(g, l, 1);
-    if (shared_owner && (shared_here || balance_shared) &&
+    /* DS4_CUDA_SHARED_ASYNC=1: a single discrete GPU that streams its experts runs
+     * the shared expert on the side stream while the host loads the routed ones.
+     * That path includes the down projection, so shared_done is set below. */
+    static int shared_async_env = -1;
+    if (shared_async_env < 0) { const char *e = getenv("DS4_CUDA_SHARED_ASYNC"); shared_async_env = e && strcmp(e, "0") != 0; }
+    const bool shared_async = shared_async_env && g->tp_world == 1 && g->streaming;
+    if ((shared_owner || shared_async) && (shared_here || balance_shared) &&
         l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
         l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
         l->ffn_down_shexp->type == DS4_TENSOR_Q8_0) {
@@ -43187,6 +43257,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
 #endif
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (shared_queued && !ds4_gpu_dsv41_shared_join()) return false;
+    if (shared_queued && !shared_owner) g->shared_done = routed_ok;   /* DS4_CUDA_SHARED_ASYNC */
 #elif defined(__APPLE__)
     if (concurrent) {
         if (!routed_ok) ds4_gpu_parallel_ffn_abort();
@@ -44112,6 +44183,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         !getenv("DS4_V41_DISABLE_CANDIDATE_SCORING") &&
         !getenv("DS4_METAL_DISABLE_V41_SCORE_ROWS4");
 #endif
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    g_la_weights_ptr = w;
+#endif
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (layer_resident)
@@ -44510,6 +44584,22 @@ static bool ds41_engram_prefetch_start(ds41_engram_prefetch *p, ds41_gpu_graph *
 }
 
 static uint32_t ds41_encoder_chunk_cap(const ds41_gpu_graph *g, uint32_t count) {
+    /* DS4_CUDA_PREFILL_CHUNK_TOKENS=N: prefill in chunks of up to N tokens (capped at
+     * prefill_cap). The sweep is layer-major per chunk and the VRAM expert cache holds far fewer
+     * experts than one chunk touches across all layers, so every extra chunk re-reads each layer's
+     * missing experts from disk; fewer, larger chunks mean fewer reads. */
+    static long env_chunk = -1;
+    if (env_chunk < 0) {
+        const char *e = getenv("DS4_CUDA_PREFILL_CHUNK_TOKENS");
+        env_chunk = (e && e[0]) ? strtol(e, NULL, 10) : 0;
+        if (env_chunk < 0) env_chunk = 0;
+    }
+    if (env_chunk > 0) {
+        uint32_t c = (uint32_t)env_chunk;
+        if (c > g->prefill_cap) c = g->prefill_cap;
+        if (c < 64u) c = 64u;
+        return c;
+    }
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     /* Wider encoder tiles amortize weight reads near the next power of two.
      * Keep two tiles so decoder suffix pruning retains its own partitions.
@@ -78182,18 +78272,24 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
         fprintf(stderr, "ds4: cannot determine a safe V4.1 memory budget\n");
         return false;
     }
+    /* SSD-streaming experts live in VRAM, not host RAM; when the GPU has
+     * spare VRAM the host-RAM budget must not shrink the expert cache.
+     * DS4_STREAMING_CACHE_IGNORE_HOST_BUDGET lets it bind on the VRAM /
+     * cacheable-count clamps instead (default off = original behavior). */
+    const bool ignore_host_cache = e->ssd_streaming &&
+        getenv("DS4_STREAMING_CACHE_IGNORE_HOST_BUDGET") != NULL;
     uint64_t weights = g_tp_shard_model_bytes ? g_tp_shard_model_bytes : e->model.size;
     if (e->ssd_streaming && !weights_streaming_non_routed_bytes(&e->weights, &weights)) return false;
     const uint64_t fixed = ds41_fixed_memory(e, weights, graph_bytes);
     uint64_t expert = 0;
     if (e->ssd_streaming && !ds4_streaming_routed_expert_bytes(&e->weights, &expert)) return false;
-    if (fixed >= budget || (expert && budget - fixed < expert)) {
+    if (fixed >= budget || (!ignore_host_cache && expert && budget - fixed < expert)) {
         fprintf(stderr, "ds4: V4.1 needs %.2f GiB before the expert cache; safe budget %.2f GiB. "
                         "Use --ssd-streaming or a smaller context.\n",
                 ds4_bytes_to_gib(fixed), ds4_bytes_to_gib(budget));
         return false;
     }
-    if (expert && e->ssd_streaming_cache_experts > (budget - fixed) / expert) {
+    if (!ignore_host_cache && expert && e->ssd_streaming_cache_experts > (budget - fixed) / expert) {
         if (!fit_cache) {
             fprintf(stderr, "ds4: no room for another V4.1 session; reduce context or the SSD expert cache\n");
             return false;
