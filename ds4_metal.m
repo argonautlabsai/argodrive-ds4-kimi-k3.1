@@ -54,6 +54,34 @@ static ar_prefill_view ar_prefill_views[3];
 static id<MTLBuffer> ar_prefill_pool[2][3];
 static uint64_t ar_prefill_pool_bytes[2][3];
 static unsigned ar_prefill_published_set=1;
+/* DS4_ARGODRIVE_CACHE_SHARE=1: the staging pool and the expert cache share one
+ * memory budget. The pool stays allocated for the life of the process; between
+ * prompt passes its expert-sized positions are lent to the expert cache as extra
+ * slots, and a staged prompt pass takes them back by dropping the entries that
+ * sit there. Nothing is freed or allocated at the hand-over, so the resident
+ * size is the same in the prompt pass and in decode. */
+static uint32_t ar_share_slots;            /* positions the pool lends (two sets), 0 = off */
+static uint32_t ar_share_experts;          /* experts per set */
+static uint64_t ar_share_gate, ar_share_down, ar_share_set_bytes[3];
+static int ar_share_lent;
+static uint8_t *ar_share_used;
+static int ar_share_wired;
+static uint32_t ar_share_in_use, ar_share_cursor;
+static int ar_share_owns(id<MTLBuffer> gate_buffer) {
+    return ar_share_slots && gate_buffer &&
+        (gate_buffer == ar_prefill_pool[0][0] || gate_buffer == ar_prefill_pool[1][0]);
+}
+static void ar_share_release(id<MTLBuffer> gate_buffer, NSUInteger gate_inner) {
+    if (!ar_share_owns(gate_buffer) || !ar_share_gate) return;
+    const uint32_t set = gate_buffer == ar_prefill_pool[1][0] ? 1u : 0u;
+    const uint64_t idx = (uint64_t)gate_inner / ar_share_gate;
+    if (idx >= ar_share_experts) return;
+    const uint32_t pos = set * ar_share_experts + (uint32_t)idx;
+    if (ar_share_used[pos]) { ar_share_used[pos] = 0; if (ar_share_in_use) ar_share_in_use--; }
+}
+static int ar_share_take(uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                         __strong id<MTLBuffer> *gate_buf, __strong id<MTLBuffer> *up_buf, __strong id<MTLBuffer> *down_buf,
+                         NSUInteger *gate_inner, NSUInteger *up_inner, NSUInteger *down_inner);
 /* Chunks in flight per staged tensor; each one issues a read to every source, so
  * this is also the per-drive queue depth. DS4_ARGODRIVE_PREFILL_LANES=1 restores
  * the serial loop. */
@@ -13375,6 +13403,11 @@ int ds4_gpu_set_model_map_spans(
     }
 }
 
+extern void *objc_autoreleasePoolPush(void);
+extern void objc_autoreleasePoolPop(void *pool);
+void *ds4_gpu_autorelease_push(void) { return objc_autoreleasePoolPush(); }
+void ds4_gpu_autorelease_pop(void *pool) { if (pool) objc_autoreleasePoolPop(pool); }
+
 /* Staging reads go through the reader: it must be open on at least the primary
  * (DS4_ARGODRIVE_PRIMARY_NOCACHE=1) or on replicas. */
 int ar_prefill_reader_ready(void) {
@@ -13390,6 +13423,7 @@ int ar_prefill_clear(void) {
 static int ar_prestage_collect(unsigned set, const uint64_t offsets[3], const uint64_t sizes[3],
                                uint32_t *landed, uint64_t *bytes, double *wait_ms);
 static void ar_rd_stop(void);
+static int ar_cache_share_lend(void);
 int ar_prefill_release(void) {
     /* End of the sweep: hand the staging reserve back before decode grows the
      * expert cache into it. */
@@ -13397,11 +13431,12 @@ int ar_prefill_release(void) {
     (void)ar_prestage_collect(0, NULL, NULL, NULL, NULL, NULL);
     ar_rd_stop();
     if (!ar_prefill_clear()) return 0;
-    /* Argodrive 2026-09-26 (ARGODRIVE_PREFILL_RELEASE): DS4_ARGODRIVE_PREFILL_RELEASE=async
+    /* DS4_ARGODRIVE_PREFILL_RELEASE=async
      * releases the two 3-buffer staging sets (about 14 GiB of wired pages) on a
      * background queue instead of on the decode thread; =keep leaves them
      * allocated for the process lifetime. The first decode step measured 535 ms
      * against 49 ms steady with the kernels themselves at normal speed. */
+    if (ar_share_slots) return ar_cache_share_lend() || 1;   /* cache share: kept and lent, never freed */
     const char *policy = getenv("DS4_ARGODRIVE_PREFILL_RELEASE");
     if (policy && strcmp(policy, "keep") == 0) {
         fprintf(stderr, "ds4: Argodrive prefill staging pool kept resident (DS4_ARGODRIVE_PREFILL_RELEASE=keep)\n");
@@ -13499,7 +13534,7 @@ static int ar_prefill_fill_pieces(unsigned set, unsigned i,
     return !failed;
 }
 
-/* Argodrive 2026-09-30 (ARGODRIVE_PREFILL_HOT): read-ahead staging for the selective
+/* Read-ahead staging for the selective
  * path. Selective staging cannot start a layer's reads before that layer's router has
  * run, so the drives idle while the GPU computes the previous layer (measured
  * 2026-09-28: 147 ms of staging and 142 ms of compute per layer, strictly alternating).
@@ -13509,6 +13544,27 @@ static int ar_prefill_fill_pieces(unsigned set, unsigned i,
  * reads only the rest. Every byte still comes from the verified replicas through the
  * same reader; a wrong guess costs bandwidth the drives were not using. Experts that
  * were not selected keep stale slot content that no kernel indexes, as before. */
+/* DS4_ARGODRIVE_PREFILL_CACHE_COPY=1: a routed expert that the expert cache already holds is
+ * copied into the staging set from memory instead of being read from the drives again, and the
+ * read-ahead leaves it alone. A chat server re-reads the whole conversation on every turn, so
+ * from the second turn on a large part of the prompt pass's experts are in the cache. The cache
+ * holds the file's bytes, so the staged bytes are the same either way. The sweep names the layer
+ * before each call; without that the copy is off. */
+static uint32_t ar_stage_layer = UINT32_MAX, ar_prestage_layer = UINT32_MAX;
+void ar_prefill_stage_layer(uint32_t il) { ar_stage_layer = il; }
+void ar_prefill_prestage_layer(uint32_t il) { ar_prestage_layer = il; }
+static int ar_cache_copy_enabled(void) {
+    static int checked, on;
+    if (!checked) {
+        const char *e = getenv("DS4_ARGODRIVE_PREFILL_CACHE_COPY");
+        on = e && *e && strcmp(e, "0") != 0;
+        checked = 1;
+    }
+    return on;
+}
+static int ar_cache_holds(uint32_t layer, int32_t id, const uint64_t offsets[3],
+                          uint64_t gate_expert_bytes, uint64_t down_expert_bytes);
+static uint8_t *ar_prestage_skip;   /* per expert: in the cache when the read-ahead started */
 static pthread_t ar_prestage_thread;
 static int ar_prestage_running;
 static int ar_prestage_stop;
@@ -13539,6 +13595,7 @@ static void *ar_prestage_main(void *arg) {
             if (k >= ar_prestage_n) return;
             const int32_t id = ar_prestage_ids[k];
             if (id < 0 || (uint32_t)id >= ar_prestage_done_cap) continue;
+            if (ar_prestage_skip && ar_prestage_skip[id]) continue;   /* the stage copies it from the cache */
             int ok = 1; uint64_t expert_bytes = 0;
             for (unsigned i = 0; i < 3 && ok; i++) {
                 const uint64_t per = (i == 2) ? ar_prestage_down : ar_prestage_gate;
@@ -13600,13 +13657,23 @@ int ar_prefill_prestage_start(const void *map, uint64_t size, const uint64_t off
     if (ar_rd_enabled())
         return ar_rd_install_job(set, offsets, sizes, gate_expert_bytes, down_expert_bytes, ranked_ids, n_ranked);
     if (ar_prestage_done_cap < n_expert) {
-        free(ar_prestage_done);
+        free(ar_prestage_done); free(ar_prestage_skip);
         ar_prestage_done = calloc((size_t)n_expert, 1);
-        if (!ar_prestage_done) { ar_prestage_done_cap = 0; return 0; }
+        ar_prestage_skip = calloc((size_t)n_expert, 1);
+        if (!ar_prestage_done || !ar_prestage_skip) {
+            free(ar_prestage_done); free(ar_prestage_skip);
+            ar_prestage_done = ar_prestage_skip = NULL; ar_prestage_done_cap = 0; return 0;
+        }
         ar_prestage_done_cap = (uint32_t)n_expert;
     } else {
         memset(ar_prestage_done, 0, ar_prestage_done_cap);
+        memset(ar_prestage_skip, 0, ar_prestage_done_cap);
     }
+    if (ar_cache_copy_enabled() && ar_prestage_layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER)
+        for (uint32_t id = 0; id < (uint32_t)n_expert; id++)
+            ar_prestage_skip[id] = (uint8_t)ar_cache_holds(ar_prestage_layer, (int32_t)id, offsets,
+                                                           gate_expert_bytes, down_expert_bytes);
+    ar_prestage_layer = UINT32_MAX;
     ar_prestage_set = set;
     memcpy(ar_prestage_off, offsets, sizeof ar_prestage_off);
     memcpy(ar_prestage_len, sizes, sizeof ar_prestage_len);
@@ -13619,7 +13686,7 @@ int ar_prefill_prestage_start(const void *map, uint64_t size, const uint64_t off
     return 1;
 }
 
-/* Argodrive 2026-10-04 (ARGODRIVE_PREFILL_READER): one continuous prefill reader instead of a
+/* One continuous prefill reader instead of a
  * read-ahead thread that is stopped at every router and restarted after every top-up. The
  * lanes run for the whole sweep over a job (layer offsets, destination set, ranked ids). When
  * the router ids arrive the main thread installs the top-up as priority work; lanes finish
@@ -13752,7 +13819,7 @@ static int ar_rd_install_job(unsigned set, const uint64_t offsets[3], const uint
     __atomic_store_n(&ar_rd.gen, next, __ATOMIC_RELEASE);
     return ar_rd_start_lanes();
 }
-/* Two-phase selective staging (Argodrive 2026-09-30, two-wave routed MoE): begin()
+/* Two-phase selective staging (two-wave routed MoE): begin()
  * collects the read-ahead, decides the top-up and publishes the views, so kernels can
  * already address the experts that landed while finish() reads the rest. Kernels
  * encoded between the two calls must only touch experts reported as landed.
@@ -13760,10 +13827,11 @@ static int ar_rd_install_job(unsigned set, const uint64_t offsets[3], const uint
 static struct {
     int active; unsigned set; uint64_t off[3], len[3], gate, down;
     uint32_t n_topup, n_hit, pre_landed; uint64_t pre_bytes; double pre_wait, t0; uint64_t before[3]; int pre_valid; int reader;
+    uint32_t n_cached;   /* experts copied from the expert cache instead of read */
 } ar_stage2;
 static int32_t ar_stage2_topup[65536];
 static int32_t ar_stage2_hint[65536];
-/* Argodrive 2026-10-04 (ARGODRIVE_PREFILL_SPLIT_ROUTER): the first half of the prompt's router ids are
+/* The first half of the prompt's router ids are
  * known ~half an attention earlier than the whole layer's. Hand them to the running lanes as priority
  * work, so the drives read experts this layer certainly needs instead of ranked guesses while the GPU
  * runs the second half. begin() later installs the real top-up list over this one; ids already landed
@@ -13844,6 +13912,46 @@ int ar_prefill_stage_ids_begin(const void *map, uint64_t size, const uint64_t of
             ar_prefill_pool[set][i] = fresh; ar_prefill_pool_bytes[set][i] = sizes[i];
         }
     }
+    uint32_t n_cached = 0;
+    if (!reader && n_topup && ar_cache_copy_enabled() && ar_stage_layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) {
+        /* This thread owns the cache and nothing else writes the set being filled (the read-ahead
+         * was joined above), so the entries cannot move while the lanes copy them. */
+        static struct { int32_t id; const uint8_t *gate, *up, *down; } src[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+        static uint8_t copied[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+        memset(copied, 0, sizeof(copied));
+        uint32_t keep = 0;
+        for (uint32_t k = 0; k < n_topup; k++) {
+            const int32_t id = ar_stage2_topup[k];
+            if (n_cached < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT &&
+                ar_cache_holds(ar_stage_layer, id, offsets, gate_expert_bytes, down_expert_bytes)) {
+                const ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[ar_stage_layer][id];
+                const uint8_t *g = [e->gate_buffer contents], *u = [e->up_buffer contents], *d = [e->down_buffer contents];
+                if (g && u && d) {
+                    src[n_cached].id = id; src[n_cached].gate = g + e->gate_inner;
+                    src[n_cached].up = u + e->up_inner; src[n_cached].down = d + e->down_inner;
+                    n_cached++; copied[id] = 1;
+                    continue;
+                }
+            }
+            ar_stage2_topup[keep++] = id;
+        }
+        if (n_cached) {
+            uint8_t *dst_gate = [ar_prefill_pool[set][0] contents], *dst_up = [ar_prefill_pool[set][1] contents],
+                    *dst_down = [ar_prefill_pool[set][2] contents];
+            if (!dst_gate || !dst_up || !dst_down) return 0;
+            const uint64_t gate = gate_expert_bytes, down = down_expert_bytes;
+            dispatch_apply((size_t)n_cached, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t i) {
+                const uint64_t id = (uint64_t)src[i].id;
+                memcpy(dst_gate + id * gate, src[i].gate, (size_t)gate);
+                memcpy(dst_up + id * gate, src[i].up, (size_t)gate);
+                memcpy(dst_down + id * down, src[i].down, (size_t)down);
+            });
+            if (landed) for (uint32_t k = 0; k < n_ids; k++) if (ids[k] >= 0 && copied[ids[k]]) landed[k] = 1;
+            n_topup = keep;
+        }
+    }
+    ar_stage_layer = UINT32_MAX;
+    ar_stage2.n_cached = n_cached;
     /* Publish now: the landed slots are complete, the rest are written by finish() while
      * only landed slots may be read. */
     for (unsigned i = 0; i < 3; i++)
@@ -13934,13 +14042,14 @@ int ar_prefill_stage_ids_finish_part(uint32_t part, uint32_t parts) {
     uint64_t after[3]; ar_expert_bytes_snapshot(after);
     fprintf(stderr, "ds4: Argodrive prefill staged(selected) experts=%u bytes=%llu of %llu (%.0f%%)"
             " source_bytes=%llu,%llu,%llu ms=%.3f",
-            ar_stage2.n_topup + ar_stage2.n_hit, (unsigned long long)ar_stage2_requested, (unsigned long long)total,
+            ar_stage2.n_topup + ar_stage2.n_hit + ar_stage2.n_cached, (unsigned long long)ar_stage2_requested, (unsigned long long)total,
             100.0 * (double)ar_stage2_requested / (double)total,
             (unsigned long long)(after[0]-ar_stage2.before[0]), (unsigned long long)(after[1]-ar_stage2.before[1]),
             (unsigned long long)(after[2]-ar_stage2.before[2]), ds4_gpu_now_ms() - ar_stage2.t0);
     if (ar_stage2.pre_valid)
         fprintf(stderr, " ahead: hit=%u landed=%u bytes=%llu topup=%u wait_ms=%.1f parts=%u",
                 ar_stage2.n_hit, ar_stage2.pre_landed, (unsigned long long)ar_stage2.pre_bytes, ar_stage2.n_topup, ar_stage2.pre_wait, parts);
+    if (ar_stage2.n_cached) fprintf(stderr, " cache=%u", ar_stage2.n_cached);
     fputc('\n', stderr);
     return 1;
 }
@@ -14052,7 +14161,7 @@ int ar_prefill_stage_ahead(const void *map, uint64_t size, const uint64_t offset
     return 1;
 }
 
-/* Argodrive 2026-10-04 (ARGODRIVE_PREFILL_PREWARM): allocate both prefill staging sets at model
+/* Allocate both prefill staging sets at model
  * load and touch every page from the GPU, so the first layers of the first prompt do not pay
  * the buffers' first-use cost inside the timed prefill. Load-time work only; the sets are the
  * same ones the sweep would allocate on demand. */
@@ -14365,12 +14474,24 @@ static uint32_t ds4_gpu_stream_expert_cache_requested_budget(void) {
     return 0;
 }
 
+/* Cache share: the slots the staging pool holds back while it is not lent
+ * (before the first prompt pass and during every staged one). */
+static uint32_t g_ar_cache_reserve_slots;
+
 static uint32_t ds4_gpu_stream_expert_cache_configured_budget(void) {
     uint32_t budget = ds4_gpu_stream_expert_cache_requested_budget();
     if (budget != 0 &&
         g_stream_expert_cache_mlock_budget_cap != 0 &&
         budget > g_stream_expert_cache_mlock_budget_cap) {
         budget = g_stream_expert_cache_mlock_budget_cap;
+    }
+    const uint32_t reserve = g_ar_cache_reserve_slots;
+    if (budget != 0 && reserve != 0) {
+        /* Never below one layer's worth of experts: the seed and the decode
+         * path both assume a cache that can hold what one layer routes to. */
+        const uint32_t floor_slots = 512u;
+        budget = budget > reserve + floor_slots ? budget - reserve :
+            (budget < floor_slots ? budget : floor_slots);
     }
     return budget;
 }
@@ -14530,6 +14651,11 @@ static void ds4_gpu_stream_expert_timing_note_cache_class(
 }
 
 static int ds4_gpu_stream_expert_readahead_enabled(void) {
+    /* The advice warms the page cache of the model's own descriptor. With
+     * DS4_ARGODRIVE_PRIMARY_NOCACHE the expert bytes are read uncached through
+     * the reader's descriptor instead, so the advice read every missing expert
+     * a second time (21 ms of a 74 ms decode step on an M5 Max internal SSD). */
+    if (g_argodrive_reader.count && !g_argodrive_reader.invalid && g_argodrive_reader.owns_primary) return 0;
     return g_ssd_streaming_mode &&
            getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD") == NULL;
 }
@@ -15453,7 +15579,9 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
             DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS) {
             return 0;
         }
-        const uint32_t budget = ds4_gpu_stream_expert_cache_configured_budget();
+        uint32_t budget = ds4_gpu_stream_expert_cache_configured_budget();
+        /* Cache share: the slots above the base live in the staging pool. */
+        if (ar_share_lent && budget > ar_share_slots) budget -= ar_share_slots;
         if (budget != 0 && g_stream_expert_cache_slab_total_slots >= budget) {
             return 0;
         }
@@ -16432,6 +16560,8 @@ static void ds4_gpu_stream_expert_cache_clear_entry_internal(
         reuse->down_inner = e->down_inner;
     } else if (e->slab_backed && recycle_slab_slot) {
         ds4_gpu_stream_expert_slab_push_free_slot(e->slab_slot);
+    } else if (!e->slab_backed && ar_share_owns(e->gate_buffer)) {
+        ar_share_release(e->gate_buffer, e->gate_inner);   /* a lent staging position */
     } else if (!e->slab_backed) {
         ds4_gpu_stream_expert_unlock_explicit_buffer(e->gate_buffer);
         if (e->up_buffer != e->gate_buffer) {
@@ -17335,6 +17465,11 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
                                                   down_inner)) {
             return 1;
         }
+        if (ar_share_take(gate_expert_bytes, down_expert_bytes,
+                          gate_buf, up_buf, down_buf,
+                          gate_inner, up_inner, down_inner)) {
+            return 1;
+        }
         if (g_stream_expert_cache_mlock_budget_cap != 0) {
             return ds4_gpu_stream_expert_cache_take_capped_reusable(
                     protect_layer, protect_ids, n_protect,
@@ -17431,6 +17566,161 @@ static void ds4_gpu_stream_expert_cache_prune_global(
         if (victim_layer == UINT32_MAX || victim_expert == UINT32_MAX) break;
         ds4_gpu_stream_expert_cache_clear_entry(victim_layer, victim_expert, 1);
     }
+}
+
+/* True when the cache holds exactly this expert of this layer and no command buffer is loading it. */
+static int ar_cache_holds(uint32_t layer, int32_t id, const uint64_t offsets[3],
+                          uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
+    if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER || id < 0 ||
+        (uint32_t)id >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) return 0;
+    const ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][id];
+    return e->valid && e->gate_buffer && e->up_buffer && e->down_buffer &&
+        !ds4_gpu_stream_expert_cache_entry_inflight(e) &&
+        e->gate_expert_bytes == gate_expert_bytes && e->down_expert_bytes == down_expert_bytes &&
+        e->gate_abs_offset == offsets[0] + (uint64_t)id * gate_expert_bytes &&
+        e->up_abs_offset == offsets[1] + (uint64_t)id * gate_expert_bytes &&
+        e->down_abs_offset == offsets[2] + (uint64_t)id * down_expert_bytes;
+}
+
+static int ar_cache_share_enabled(void) {
+    static int checked, on;
+    if (!checked) {
+        const char *e = getenv("DS4_ARGODRIVE_CACHE_SHARE");
+        on = e && *e && strcmp(e, "0") != 0;
+        checked = 1;
+    }
+    return on;
+}
+
+/* Called once when a streaming model that uses the staged prompt pass opens:
+ * the sizes of one layer's three routed tensors and of one expert in them.
+ * From here on the cache holds `budget - 2 * experts` entries unless the pool
+ * is lent. */
+int ar_cache_share_configure(uint64_t gate_layer_bytes, uint64_t up_layer_bytes, uint64_t down_layer_bytes,
+                             uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
+    if (!ar_cache_share_enabled() || !g_ssd_streaming_mode || ar_share_slots) return 1;
+    {   /* Only the staged prompt pass has a pool to share: it needs DS4_ARGODRIVE_PREFILL_SPLIT and the reader. */
+        const char *split = getenv("DS4_ARGODRIVE_PREFILL_SPLIT");
+        const char *nocache = getenv("DS4_ARGODRIVE_PRIMARY_NOCACHE");
+        const char *replicas = getenv("DS4_ARGODRIVE_REPLICAS");
+        if (!split || !strcmp(split, "0") ||
+            !((nocache && strcmp(nocache, "0")) || (replicas && *replicas))) {
+            fprintf(stderr, "ds4: Argodrive cache share off: it needs the staged prompt pass "
+                            "(DS4_ARGODRIVE_PREFILL_SPLIT=1 with DS4_ARGODRIVE_PRIMARY_NOCACHE=1 or DS4_ARGODRIVE_REPLICAS)\n");
+            return 1;
+        }
+    }
+    if (!gate_expert_bytes || !down_expert_bytes || gate_layer_bytes != up_layer_bytes ||
+        gate_layer_bytes % gate_expert_bytes || down_layer_bytes % down_expert_bytes) return 1;
+    const uint64_t n = gate_layer_bytes / gate_expert_bytes;
+    if (!n || n > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT || down_layer_bytes / down_expert_bytes != n) return 1;
+    const uint32_t requested = ds4_gpu_stream_expert_cache_requested_budget();
+    if (requested < 4u * (uint32_t)n) {
+        fprintf(stderr, "ds4: Argodrive cache share off: a cache of %u experts is too small to give %u to the staging pool\n",
+                requested, 2u * (uint32_t)n);
+        return 1;
+    }
+    ar_share_used = calloc((size_t)(2u * n), 1);
+    if (!ar_share_used) return 1;
+    ar_share_experts = (uint32_t)n;
+    ar_share_gate = gate_expert_bytes; ar_share_down = down_expert_bytes;
+    ar_share_set_bytes[0] = gate_layer_bytes; ar_share_set_bytes[1] = up_layer_bytes; ar_share_set_bytes[2] = down_layer_bytes;
+    ar_share_slots = 2u * (uint32_t)n;
+    ar_share_lent = 0;
+    g_ar_cache_reserve_slots = ar_share_slots;
+    fprintf(stderr,
+            "ds4: Argodrive cache share: of %u cached experts %u live in the staging pool (%.2f GiB) between prompt passes; "
+            "a staged prompt pass runs with %u\n",
+            requested, ar_share_slots,
+            ds4_gpu_gib(2u * (gate_layer_bytes + up_layer_bytes + down_layer_bytes)),
+            ds4_gpu_stream_expert_cache_configured_budget());
+    return 1;
+}
+
+/* One free staging position for a cache entry: its three tensors sit at the
+ * expert's index in the set's gate, up and down buffers. */
+static int ar_share_take(uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                         __strong id<MTLBuffer> *gate_buf, __strong id<MTLBuffer> *up_buf, __strong id<MTLBuffer> *down_buf,
+                         NSUInteger *gate_inner, NSUInteger *up_inner, NSUInteger *down_inner) {
+    if (!ar_share_lent || !ar_share_slots || ar_share_in_use >= ar_share_slots ||
+        gate_expert_bytes != ar_share_gate || down_expert_bytes != ar_share_down) return 0;
+    for (uint32_t k = 0; k < ar_share_slots; k++) {
+        const uint32_t pos = (ar_share_cursor + k) % ar_share_slots;
+        if (ar_share_used[pos]) continue;
+        const uint32_t set = pos / ar_share_experts, idx = pos % ar_share_experts;
+        id<MTLBuffer> g = ar_prefill_pool[set][0], u = ar_prefill_pool[set][1], d = ar_prefill_pool[set][2];
+        if (!g || !u || !d) return 0;
+        const uint64_t g_off = (uint64_t)idx * gate_expert_bytes, d_off = (uint64_t)idx * down_expert_bytes;
+        ar_share_used[pos] = 1; ar_share_in_use++; ar_share_cursor = pos + 1u;
+        *gate_buf = g; *up_buf = u; *down_buf = d;
+        *gate_inner = (NSUInteger)g_off; *up_inner = (NSUInteger)g_off; *down_inner = (NSUInteger)d_off;
+        return 1;
+    }
+    return 0;
+}
+
+/* Start of a staged prompt pass: the pool needs its positions back. */
+int ar_cache_share_reclaim(void) {
+    if (!ar_share_slots || !ar_share_lent) return 1;
+    uint32_t dropped = 0;
+    if (ar_share_in_use) {
+        /* No command buffer may still read a position the staging is about to overwrite. */
+        ds4_gpu_stream_expert_pending_load_clear();
+        if (ds4_gpu_commands_active() || !ds4_gpu_synchronize()) return 0;
+        uint32_t held = 0;
+        for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
+            for (uint32_t expert = 0; expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; expert++) {
+                const ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][expert];
+                if (!e->valid || e->slab_backed || !ar_share_owns(e->gate_buffer)) continue;
+                ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 1);
+                if (g_stream_expert_cache[layer][expert].valid) held++; else dropped++;
+            }
+        }
+        if (held) {
+            /* An entry a command buffer still reads cannot be dropped; the staging must not overwrite it. */
+            fprintf(stderr, "ds4: Argodrive cache share: %u cache entries in the staging pool are still in use\n", held);
+            return 0;
+        }
+        /* No entry points into the pool now, whatever the bookkeeping says. */
+        memset(ar_share_used, 0, ar_share_slots);
+        ar_share_in_use = 0;
+    }
+    ar_share_lent = 0;
+    g_ar_cache_reserve_slots = ar_share_slots;
+    fprintf(stderr, "ds4: Argodrive cache share: prompt pass took the staging pool back (%u cached experts dropped, %u kept)\n",
+            dropped, g_stream_expert_cache_entry_count);
+    return 1;
+}
+
+/* End of a staged prompt pass: the pool stays allocated and its positions go to the cache. */
+static int ar_cache_share_lend(void) {
+    if (!ar_share_slots || ar_share_lent) return 0;
+    for (unsigned set = 0; set < 2; set++) {
+        for (unsigned i = 0; i < 3; i++) {
+            if (ar_prefill_pool[set][i] && ar_prefill_pool_bytes[set][i] == ar_share_set_bytes[i]) continue;
+            /* A short pass may have used one set only. */
+            id<MTLBuffer> fresh = [g_device newBufferWithLength:(NSUInteger)ar_share_set_bytes[i]
+                                                        options:MTLResourceStorageModeShared];
+            if (!fresh) return 0;
+            ar_prefill_pool[set][i] = fresh; ar_prefill_pool_bytes[set][i] = ar_share_set_bytes[i];
+        }
+    }
+    memset(ar_share_used, 0, ar_share_slots);
+    ar_share_in_use = 0; ar_share_cursor = 0;
+    ar_share_lent = 1;
+    g_ar_cache_reserve_slots = 0;
+    if (!ar_share_wired) {
+        /* Wired like the cache's slab slots, so a busy machine does not page cached weights out.
+         * Once, off the decode thread: wiring a position when a miss first took it cost 1.5 ms per
+         * token while the cache grew. A refusal only leaves the pool pageable. */
+        ar_share_wired = 1;
+        NSArray<id<MTLBuffer>> *pool = @[ ar_prefill_pool[0][0], ar_prefill_pool[0][1], ar_prefill_pool[0][2],
+                                          ar_prefill_pool[1][0], ar_prefill_pool[1][1], ar_prefill_pool[1][2] ];
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            for (id<MTLBuffer> b in pool) (void)mlock([b contents], (size_t)[b length]);
+        });
+    }
+    return 1;
 }
 
 static int ds4_gpu_stream_expert_cache_entry_matches(
@@ -18554,6 +18844,10 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
         [blit endEncoding];
         g_batch_has_work = YES;
     } else {
+        /* A selected-expert load outside the staged prompt pass: the V4.1
+         * decode step comes here without the early-load call that sets the
+         * phase, so DS4_ARGODRIVE_DECODE_WEIGHTS never applied to it. */
+        ar_set_decode_phase(1);
         ok = ds4_gpu_stream_expert_pread_tasks(tasks,
                                                n_tasks,
                                                &read_bytes,

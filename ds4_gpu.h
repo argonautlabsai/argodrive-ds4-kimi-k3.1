@@ -4033,6 +4033,14 @@ int ar_prefill_stage_ahead(const void *map, uint64_t size, const uint64_t offset
 int ar_prefill_clear(void);
 int ar_prefill_reader_ready(void);
 int ar_prefill_release(void);
+/* DS4_ARGODRIVE_CACHE_SHARE: the staging pool lends its expert positions to the expert cache
+ * between prompt passes. configure once at open; reclaim before a staged prompt pass. */
+int ar_cache_share_configure(uint64_t gate_layer_bytes, uint64_t up_layer_bytes, uint64_t down_layer_bytes,
+                             uint64_t gate_expert_bytes, uint64_t down_expert_bytes);
+int ar_cache_share_reclaim(void);
+/* An Objective-C autorelease pool for a C caller that runs many Metal calls (Metal builds only). */
+void *ds4_gpu_autorelease_push(void);
+void ds4_gpu_autorelease_pop(void *pool);
 int ar_prefill_stage_ids(const void *map, uint64_t size, const uint64_t offsets[3], const uint64_t sizes[3],
                          uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
                          const int32_t *ids, uint32_t n_ids);
@@ -4050,6 +4058,10 @@ int ar_prefill_stage_ids_begin(const void *map, uint64_t size, const uint64_t of
                                const int32_t *ids, uint32_t n_ids, uint8_t *landed);
 int ar_prefill_stage_ids_finish(void);
 int ar_prefill_stage_ids_finish_part(uint32_t part, uint32_t parts);
+/* DS4_ARGODRIVE_PREFILL_CACHE_COPY: name the layer of the next stage / read-ahead call so experts
+ * the expert cache holds are copied from memory instead of read. */
+void ar_prefill_stage_layer(uint32_t il);
+void ar_prefill_prestage_layer(uint32_t il);
 uint32_t ar_prefill_stage_ids_topup_count(void);
 uint32_t ar_prefill_stage_ids_hint(const int32_t *ids, uint32_t n_ids);
 int ds4_gpu_argodrive_prefill_prewarm(uint64_t gate_bytes, uint64_t up_bytes, uint64_t down_bytes);

@@ -17,7 +17,7 @@
 /* reads/lands_last/gap_ns: barrier attribution, see ar_read. Trailing fields
  * so the positional initialisers below keep zeroing them. */
 typedef struct { int fd; unsigned weight; uint64_t bytes; uint64_t reads, lands_last, gap_ns; unsigned decode_weight; uint64_t syscalls; } ar_source;
-/* Argodrive 2026-09-19: DS4_ARGODRIVE_DECODE_WEIGHTS="10,6,6" (primary first, then the
+/* DS4_ARGODRIVE_DECODE_WEIGHTS="10,6,6" (primary first, then the
  * replicas in DS4_ARGODRIVE_REPLICAS order) gives decode its own split; prefill keeps the
  * base weights. The engine flips ar_decode_phase at the first decode expert load and
  * clears it when a prefill stage begins. */
