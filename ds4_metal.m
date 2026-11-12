@@ -16830,6 +16830,12 @@ static int ds4_gpu_stream_expert_cache_entry_reusable(
            e->down_expert_bytes == down_expert_bytes;
 }
 
+/* DS4_ARGODRIVE_DECODE_PIPELINE=4: the victim a scan would choose now, from the list built while the
+ * host waited for the router (below, after the reuse plan). 0 = no list; scan. */
+static int ar_pipe_prescan_victim(uint32_t protect_layer, const int32_t *protect_ids, uint32_t n_protect,
+                                  uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                                  uint32_t *victim_layer, uint32_t *victim_expert);
+
 static int ds4_gpu_stream_expert_cache_take_reusable(
         int                                     force_reuse,
         uint32_t                                protect_layer,
@@ -16863,8 +16869,12 @@ retry:
     const int timing = ds4_gpu_stream_expert_timing_summary_enabled();
     const double scan_t0 = timing ? ds4_gpu_now_ms() : 0.0;
     uint64_t scan_entries = 0;
+    const int prescanned = !waited_inflight &&
+        ar_pipe_prescan_victim(protect_layer, protect_ids, n_protect,
+                               gate_expert_bytes, down_expert_bytes,
+                               &victim_layer, &victim_expert);
     for (uint32_t layer = 0;
-         layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
+         !prescanned && layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
          layer++) {
         for (uint32_t expert = 0;
              expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
@@ -17050,6 +17060,109 @@ static int ds4_gpu_stream_expert_cache_take_planned_reuse(
     g_stream_expert_cache_buffer_reuses += ds4_gpu_stream_expert_buffer_object_count(
         reuse->gate_buffer, reuse->up_buffer, reuse->down_buffer);
     return 1;
+}
+
+/* ---- DS4_ARGODRIVE_DECODE_PIPELINE=4: the eviction scan, while the host waits for the router -----
+ * A streamed step that misses an expert scans the whole cache table for the entry to give up, once
+ * per miss, while the GPU has nothing queued. With the router mailbox the host has that time while it
+ * waits for the ids: it walks the table a row per poll and keeps the first AR_PIPE_PRESCAN_KEEP
+ * entries in the scan's own order (lowest route hotness, then oldest, then table order). A miss then
+ * takes the first listed entry that is not one of the layer's own six and is unchanged since; an entry
+ * that changed, an exhausted list, or a moved in-flight horizon sends that miss back to the scan. The
+ * entry chosen is the one the scan would choose at that moment. */
+#define AR_PIPE_PRESCAN_KEEP 16u
+static struct {
+    ds4_gpu_stream_expert_reuse_plan plan;
+    uint32_t row;
+    uint64_t gate_bytes, down_bytes, done_seq;
+    int state;   /* 0 none, 1 walking, 2 ready */
+} g_ar_pipe_prescan;
+static uint64_t g_ar_pipe_prescan_lists, g_ar_pipe_prescan_victims, g_ar_pipe_prescan_scans;
+
+static void ar_pipe_prescan_begin(uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
+    g_ar_pipe_prescan.state = 0;
+    const uint32_t budget = ds4_gpu_stream_expert_cache_configured_budget();
+    /* below the budget a miss takes a fresh buffer and nothing is given up */
+    if (budget == 0 || g_stream_expert_cache_entry_count < budget ||
+        ds4_gpu_stream_expert_cache_on_service_thread()) return;
+    g_ar_pipe_prescan.plan.count = g_ar_pipe_prescan.plan.next = 0;
+    g_ar_pipe_prescan.row = 0;
+    g_ar_pipe_prescan.gate_bytes = gate_expert_bytes;
+    g_ar_pipe_prescan.down_bytes = down_expert_bytes;
+    g_ar_pipe_prescan.done_seq = g_stream_expert_cache_done_seq;
+    g_ar_pipe_prescan.state = 1;
+}
+
+/* One table row. Returns 1 while rows remain. */
+static int ar_pipe_prescan_step(void) {
+    if (g_ar_pipe_prescan.state != 1) return 0;
+    ds4_gpu_stream_expert_reuse_plan *p = &g_ar_pipe_prescan.plan;
+    const uint32_t layer = g_ar_pipe_prescan.row;
+    for (uint32_t expert = 0; expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; expert++) {
+        const ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][expert];
+        if (!ds4_gpu_stream_expert_cache_entry_reusable(e, g_ar_pipe_prescan.gate_bytes,
+                                                        g_ar_pipe_prescan.down_bytes) ||
+            ds4_gpu_stream_expert_cache_entry_inflight(e)) continue;
+        const ds4_gpu_stream_expert_reuse_candidate c = {
+            layer, expert, g_stream_expert_cache_route_hotness[layer][expert], e->last_used,
+        };
+        if (c.hotness == UINT32_MAX && c.last_used == UINT64_MAX) continue;   /* the scan's initial bounds */
+        if (p->count < AR_PIPE_PRESCAN_KEEP) {
+            uint32_t at = p->count++;
+            p->candidates[at] = c;
+            while (at && ds4_gpu_stream_expert_reuse_compare(
+                    &p->candidates[(at - 1u) / 2u], &p->candidates[at]) < 0) {
+                const uint32_t parent = (at - 1u) / 2u;
+                p->candidates[at] = p->candidates[parent]; p->candidates[parent] = c;
+                at = parent;
+            }
+        } else if (ds4_gpu_stream_expert_reuse_compare(&c, &p->candidates[0]) < 0) {
+            p->candidates[0] = c;
+            ds4_gpu_stream_expert_reuse_heap_down(p, 0);
+        }
+    }
+    if (++g_ar_pipe_prescan.row < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) return 1;
+    qsort(p->candidates, p->count, sizeof(p->candidates[0]), ds4_gpu_stream_expert_reuse_compare);
+    p->next = 0;
+    g_ar_pipe_prescan.state = 2;
+    g_ar_pipe_prescan_lists++;
+    return 0;
+}
+
+/* The ids arrived: a list that is not complete is dropped (its misses scan). */
+static void ar_pipe_prescan_end(void) {
+    if (g_ar_pipe_prescan.state == 1) g_ar_pipe_prescan.state = 0;
+}
+
+static int ar_pipe_prescan_victim(uint32_t protect_layer, const int32_t *protect_ids, uint32_t n_protect,
+                                  uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                                  uint32_t *victim_layer, uint32_t *victim_expert) {
+    if (g_ar_pipe_prescan.state != 2) return 0;
+    ds4_gpu_stream_expert_reuse_plan *p = &g_ar_pipe_prescan.plan;
+    if (g_ar_pipe_prescan.gate_bytes != gate_expert_bytes ||
+        g_ar_pipe_prescan.down_bytes != down_expert_bytes ||
+        g_ar_pipe_prescan.done_seq != g_stream_expert_cache_done_seq) {
+        g_ar_pipe_prescan.state = 0;
+        g_ar_pipe_prescan_scans++;
+        return 0;
+    }
+    while (p->next < p->count) {
+        const ds4_gpu_stream_expert_reuse_candidate *c = &p->candidates[p->next++];
+        const ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[c->layer][c->expert];
+        /* the scan passes over the layer's own selection and anything in flight as well */
+        if (ds4_gpu_stream_expert_cache_entry_protected(c->layer, c->expert,
+                                                        protect_layer, protect_ids, n_protect)) continue;
+        if (!ds4_gpu_stream_expert_cache_entry_reusable(e, gate_expert_bytes, down_expert_bytes) ||
+            e->last_used != c->last_used ||
+            g_stream_expert_cache_route_hotness[c->layer][c->expert] != c->hotness) break;
+        *victim_layer = c->layer;
+        *victim_expert = c->expert;
+        g_ar_pipe_prescan_victims++;
+        return 1;
+    }
+    g_ar_pipe_prescan.state = 0;
+    g_ar_pipe_prescan_scans++;
+    return 0;
 }
 
 static uint32_t ds4_gpu_stream_expert_cache_take_reusable_batch(
@@ -35124,6 +35237,287 @@ static int ds4_gpu_encode_mul_mv_slots6_pair_swiglu(
     return 1;
 }
 
+/* ---- V4.1 streaming decode pipeline (DS4_ARGODRIVE_DECODE_PIPELINE) --------------------------------
+ * A streamed decode step ends its command buffer at every layer's router to read the six expert ids.
+ * The GPU then waits three times a layer: for the host to wake, for the next buffer to be scheduled,
+ * and for the reads when an expert is not cached. The levels are cumulative:
+ *   1  a one-thread kernel right behind the router writes the ids to a mailbox; the host commits the
+ *      buffer without waiting and polls the mailbox, and the shared expert encoded behind the router
+ *      keeps the GPU working meanwhile;
+ *   2  the routed experts are committed as soon as they are encoded, so the GPU runs them while the
+ *      host encodes the next layer;
+ *   3  when some of the six experts must be read, the gate/up work of the cached ones is committed
+ *      before the reads start;
+ *   4  the cache's eviction scan runs while the host waits for the mailbox (see the reuse plan).
+ * No weight, id, kernel or order of operations changes. The ids the host acted on are compared with
+ * the GPU's own record once the token's buffers have completed, and a difference fails the step.
+ * Cached experts stay protected the way the engine already protects them: an entry bound in a
+ * committed buffer is in flight until the pending buffers have been waited for. */
+#define AR_PIPE_IDS_MAX 8u
+static id<MTLBuffer> g_ar_pipe_box;      /* sequence, checksum, ids */
+static id<MTLBuffer> g_ar_pipe_record;   /* per layer, the ids the router kernel produced */
+static uint32_t g_ar_pipe_seq;
+static struct {
+    const ds4_gpu_tensor *selected;
+    uint32_t n, layer, seq;
+    int armed;
+} g_ar_pipe_pub;
+static int32_t g_ar_pipe_used[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][AR_PIPE_IDS_MAX];
+static uint8_t g_ar_pipe_used_n[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+static uint64_t g_ar_pipe_polls, g_ar_pipe_fallbacks, g_ar_pipe_spin_ns, g_ar_pipe_checked,
+                g_ar_pipe_early_layers, g_ar_pipe_early_slots, g_ar_pipe_routed_commits;
+
+static int ar_pipe_level(void) {
+    static int level = -1;
+    if (level < 0) {
+        const char *e = getenv("DS4_ARGODRIVE_DECODE_PIPELINE");
+        const long v = e && *e ? strtol(e, NULL, 10) : 0;
+        level = v < 0 ? 0 : (v > 4 ? 4 : (int)v);
+    }
+    return level;
+}
+
+int ds4_gpu_argodrive_decode_pipeline(void) {
+    return g_ssd_streaming_mode ? ar_pipe_level() : 0;
+}
+
+static void ar_pipe_report(void) {
+    fprintf(stderr,
+            "ds4: Argodrive decode pipeline level=%d router polls=%llu fallbacks=%llu spin=%.1f ms "
+            "ids checked=%llu early gate/up layers=%llu slots=%llu routed commits=%llu "
+            "eviction lists=%llu used=%llu scans instead=%llu\n",
+            ar_pipe_level(), (unsigned long long)g_ar_pipe_polls, (unsigned long long)g_ar_pipe_fallbacks,
+            (double)g_ar_pipe_spin_ns / 1e6, (unsigned long long)g_ar_pipe_checked,
+            (unsigned long long)g_ar_pipe_early_layers, (unsigned long long)g_ar_pipe_early_slots,
+            (unsigned long long)g_ar_pipe_routed_commits,
+            (unsigned long long)g_ar_pipe_prescan_lists, (unsigned long long)g_ar_pipe_prescan_victims,
+            (unsigned long long)g_ar_pipe_prescan_scans);
+}
+
+/* Encodes the mailbox kernel behind the router that wrote `selected`, in the open batch. Returns 0
+ * when it does not apply; the routed step then reads the ids the stock way. */
+int ds4_gpu_argodrive_ids_publish(const ds4_gpu_tensor *selected, uint32_t n_selected, uint32_t layer) {
+    g_ar_pipe_pub.armed = 0;
+    if (!ar_pipe_level() || !g_ssd_streaming_mode || !g_batch_cb || !selected ||
+        n_selected == 0 || n_selected > AR_PIPE_IDS_MAX ||
+        layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
+        ds4_gpu_tensor_bytes(selected) < (uint64_t)n_selected * sizeof(int32_t)) return 0;
+    @autoreleasepool {
+        if (!g_ar_pipe_box) {
+            id<MTLBuffer> box = [g_device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+            id<MTLBuffer> record =
+                [g_device newBufferWithLength:(NSUInteger)DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER *
+                                              AR_PIPE_IDS_MAX * sizeof(int32_t)
+                                      options:MTLResourceStorageModeShared];
+            if (!box || !record) return 0;
+            memset(box.contents, 0, box.length);
+            memset(record.contents, 0xff, record.length);
+            g_ar_pipe_box = box;
+            g_ar_pipe_record = record;
+            atexit(ar_pipe_report);
+        }
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_argodrive_ids_publish");
+        id<MTLBuffer> selectedbuf = ds4_gpu_tensor_buffer(selected);
+        if (!pipeline || !selectedbuf) return 0;
+        if (++g_ar_pipe_seq == 0) g_ar_pipe_seq = 1;   /* the box starts at zero */
+        const uint32_t seq = g_ar_pipe_seq;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:0];
+        [enc setBuffer:g_ar_pipe_box offset:0 atIndex:1];
+        [enc setBuffer:g_ar_pipe_record
+                offset:(NSUInteger)layer * AR_PIPE_IDS_MAX * sizeof(int32_t)
+               atIndex:2];
+        [enc setBytes:&seq length:sizeof(seq) atIndex:3];
+        [enc setBytes:&n_selected length:sizeof(n_selected) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        ds4_gpu_end_compute_encoder(g_batch_cb, enc);
+        g_batch_has_work = YES;
+        g_ar_pipe_pub.selected = selected;
+        g_ar_pipe_pub.n = n_selected;
+        g_ar_pipe_pub.layer = layer;
+        g_ar_pipe_pub.seq = seq;
+        g_ar_pipe_pub.armed = 1;
+    }
+    return 1;
+}
+
+/* The ids published for `selected`: commit the open batch without waiting for it and poll the
+ * mailbox. 1 = ids delivered, 0 = nothing was published for this call (nothing was committed),
+ * -1 = failure. A mailbox that stays empty falls back to waiting for the GPU. */
+static int ar_pipe_take_ids(const ds4_gpu_tensor *selected, uint32_t n_selected, uint32_t layer,
+                            uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                            int32_t *ids, double *wait_ms) {
+    g_ar_pipe_prescan.state = 0;   /* a list never outlives its layer */
+    if (!g_ar_pipe_pub.armed) return 0;
+    g_ar_pipe_pub.armed = 0;
+    if (g_ar_pipe_pub.selected != selected || g_ar_pipe_pub.n != n_selected ||
+        g_ar_pipe_pub.layer != layer || !g_batch_cb || !g_ar_pipe_box) return 0;
+    const uint32_t seq = g_ar_pipe_pub.seq;
+    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (!ds4_gpu_flush_commands()) return -1;
+    if (ar_pipe_level() >= 4) ar_pipe_prescan_begin(gate_expert_bytes, down_expert_bytes);
+    volatile uint32_t *box = (volatile uint32_t *)g_ar_pipe_box.contents;
+    int got = 0;
+    for (;;) {
+        if (box[0] == seq) {
+            uint32_t sum = 0x9e3779b9u ^ seq, v[AR_PIPE_IDS_MAX];
+            for (uint32_t i = 0; i < n_selected; i++) {
+                v[i] = box[2u + i];
+                sum = (sum ^ v[i]) * 0x01000193u;
+            }
+            if (box[1] == sum && box[0] == seq) {
+                for (uint32_t i = 0; i < n_selected; i++) ids[i] = (int32_t)v[i];
+                got = 1;
+                break;
+            }
+        }
+        if (ar_pipe_prescan_step()) continue;   /* a table row, then the box again */
+        if (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0 > 50000000ull) break;
+#if defined(__arm64__) || defined(__aarch64__)
+        __asm__ __volatile__("yield");
+#endif
+    }
+    ar_pipe_prescan_end();
+    g_ar_pipe_polls++;
+    if (!got) {
+        g_ar_pipe_fallbacks++;
+        g_ar_pipe_prescan.state = 0;   /* the wait below moves the in-flight horizon */
+        if (!ds4_gpu_wait_pending_command_buffers("router mailbox") ||
+            !ds4_gpu_tensor_read(selected, 0, ids, (uint64_t)n_selected * sizeof(ids[0]))) return -1;
+    }
+    const uint64_t spent = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+    g_ar_pipe_spin_ns += spent;
+    if (wait_ms) *wait_ms += (double)spent / 1e6;
+    for (uint32_t i = 0; i < n_selected; i++) g_ar_pipe_used[layer][i] = ids[i];
+    g_ar_pipe_used_n[layer] = (uint8_t)n_selected;
+    return 1;
+}
+
+/* Call once the token's command buffers have completed. Every layer that took its ids from the
+ * mailbox must have acted on the ids the router kernel produced. */
+int ds4_gpu_argodrive_ids_verify(void) {
+    if (!g_ar_pipe_record) return 1;
+    const int32_t *record = (const int32_t *)g_ar_pipe_record.contents;
+    int ok = 1;
+    for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
+        const uint32_t n = g_ar_pipe_used_n[layer];
+        if (!n) continue;
+        g_ar_pipe_used_n[layer] = 0;
+        if (memcmp(record + (size_t)layer * AR_PIPE_IDS_MAX, g_ar_pipe_used[layer],
+                   (size_t)n * sizeof(int32_t)) != 0) {
+            fprintf(stderr,
+                    "ds4: layer %u ran with router ids that differ from the GPU's record; the step fails\n",
+                    layer);
+            ok = 0;
+        } else {
+            g_ar_pipe_checked++;
+        }
+    }
+    return ok;
+}
+
+/* The slots6 gate/up kernel over the slots [first, first + count) alone. The pipeline, its arguments
+ * and each slot's inputs are those of the six-slot dispatch; the bindings, the three outputs and the
+ * route weights are shifted to the run's first slot, so a slot computes exactly what it computes
+ * there. Slots are independent in this kernel (one grid plane each). */
+static int ar_pipe_encode_slots6_pair_run(
+        id<MTLCommandBuffer>        cb,
+        id<MTLComputePipelineState> pipeline,
+        const ds4_gpu_mul_mv_id_args *args,
+        const ds4_gpu_dsv4_moe_swiglu_weight_args *act,
+        __unsafe_unretained id<MTLBuffer> src0_a[6],
+        const NSUInteger            src0_a_off[6],
+        __unsafe_unretained id<MTLBuffer> src0_b[6],
+        const NSUInteger            src0_b_off[6],
+        id<MTLBuffer>               src1,
+        NSUInteger                  src1_off,
+        id<MTLBuffer>               dst_a,
+        NSUInteger                  dst_a_off,
+        id<MTLBuffer>               dst_b,
+        NSUInteger                  dst_b_off,
+        id<MTLBuffer>               dst_mid,
+        NSUInteger                  dst_mid_off,
+        id<MTLBuffer>               weights,
+        NSUInteger                  weights_off,
+        NSUInteger                  threadgroup_bytes,
+        NSUInteger                  nsg,
+        uint32_t                    first,
+        uint32_t                    count) {
+    if (!cb || !pipeline || !args || !act || !src1 || !dst_a || !dst_b || !dst_mid || !weights ||
+        count == 0 || first > 6u || count > 6u - first ||
+        args->ne00 <= 0 || args->ne01 <= 0 || args->nei0 != 6 || args->nei1 != 1 || args->ne11 != 1) {
+        return 0;
+    }
+    for (uint32_t i = first; i < first + count; i++) {
+        if (!src0_a[i] || !src0_b[i]) return 0;
+    }
+    const NSUInteger rows_per_group = (NSUInteger)args->nr0 * nsg;
+    const NSUInteger row_groups = ((NSUInteger)args->ne01 + rows_per_group - 1u) / rows_per_group;
+    const NSUInteger out_row = (NSUInteger)args->ne0 * sizeof(float);
+
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:args length:sizeof(*args) atIndex:0];
+    [enc setBytes:act  length:sizeof(*act)  atIndex:1];
+    for (uint32_t i = 0; i < 6; i++) {
+        const uint32_t slot = first + (i < count ? i : 0u);   /* planes past the run are not dispatched */
+        [enc setBuffer:src0_a[slot] offset:src0_a_off[slot] atIndex:2 + i];
+        [enc setBuffer:src0_b[slot] offset:src0_b_off[slot] atIndex:8 + i];
+    }
+    [enc setBuffer:src1    offset:src1_off atIndex:14];
+    [enc setBuffer:dst_a   offset:dst_a_off + (NSUInteger)first * out_row atIndex:15];
+    [enc setBuffer:dst_b   offset:dst_b_off + (NSUInteger)first * out_row atIndex:16];
+    [enc setBuffer:dst_mid offset:dst_mid_off + (NSUInteger)first * (NSUInteger)act->mid_row_stride atIndex:17];
+    [enc setBuffer:weights offset:weights_off + (NSUInteger)first * (NSUInteger)act->weight_stride atIndex:18];
+    if (threadgroup_bytes != 0) {
+        [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
+    }
+    [enc dispatchThreadgroups:MTLSizeMake(row_groups, 1, (NSUInteger)count)
+         threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
+/* Every run of consecutive slots in `mask`, through the kernel above. */
+static int ar_pipe_encode_slots6_pair_mask(
+        id<MTLCommandBuffer>        cb,
+        id<MTLComputePipelineState> pipeline,
+        const ds4_gpu_mul_mv_id_args *args,
+        const ds4_gpu_dsv4_moe_swiglu_weight_args *act,
+        __unsafe_unretained id<MTLBuffer> src0_a[6],
+        const NSUInteger            src0_a_off[6],
+        __unsafe_unretained id<MTLBuffer> src0_b[6],
+        const NSUInteger            src0_b_off[6],
+        id<MTLBuffer>               src1,
+        NSUInteger                  src1_off,
+        id<MTLBuffer>               dst_a,
+        NSUInteger                  dst_a_off,
+        id<MTLBuffer>               dst_b,
+        NSUInteger                  dst_b_off,
+        id<MTLBuffer>               dst_mid,
+        NSUInteger                  dst_mid_off,
+        id<MTLBuffer>               weights,
+        NSUInteger                  weights_off,
+        NSUInteger                  threadgroup_bytes,
+        NSUInteger                  nsg,
+        uint32_t                    mask) {
+    mask &= 0x3fu;
+    if (!mask) return 0;
+    for (uint32_t first = 0; first < 6u;) {
+        if ((mask & (1u << first)) == 0) { first++; continue; }
+        uint32_t count = 1;
+        while (first + count < 6u && (mask & (1u << (first + count))) != 0) count++;
+        if (!ar_pipe_encode_slots6_pair_run(cb, pipeline, args, act, src0_a, src0_a_off, src0_b, src0_b_off,
+                                            src1, src1_off, dst_a, dst_a_off, dst_b, dst_b_off,
+                                            dst_mid, dst_mid_off, weights, weights_off,
+                                            threadgroup_bytes, nsg, first, count)) return 0;
+        first += count;
+    }
+    return 1;
+}
+
 static int ds4_gpu_encode_mul_mv_slots6_sum6(
         id<MTLCommandBuffer>        cb,
         id<MTLComputePipelineState> pipeline,
@@ -43531,6 +43925,8 @@ int ds4_gpu_routed_moe_one_tensor(
         bool stream_expert_split_completed = false;
         uint32_t stream_expert_resident_mask = 0;
         uint32_t stream_expert_missing_mask = 0;
+        int ar_pipe_ids = 0;            /* DS4_ARGODRIVE_DECODE_PIPELINE: 1 = ids from the mailbox */
+        uint32_t ar_pipe_early_mask = 0;   /* slots whose gate/up work is already committed */
         __unsafe_unretained id<MTLBuffer> gate_group6_bufs[6] = { nil, nil, nil, nil, nil, nil };
         __unsafe_unretained id<MTLBuffer> up_group6_bufs[6] = { nil, nil, nil, nil, nil, nil };
         __unsafe_unretained id<MTLBuffer> down_group6_bufs[6] = { nil, nil, nil, nil, nil, nil };
@@ -44471,6 +44867,7 @@ int ds4_gpu_routed_moe_one_tensor(
             const char *selected_id_source = "readback";
             bool selected_ids_available = true;
             bool selected_exec_ids_from_host = false;
+            ar_pipe_ids = 0;
             const int stream_expert_cache_size_known =
                 ds4_gpu_stream_expert_cache_note_expert_size(gate_expert_bytes,
                                                              down_expert_bytes);
@@ -44599,6 +44996,15 @@ int ds4_gpu_routed_moe_one_tensor(
                         validator_invalid_mask != 0 ? "validator-invalid" :
                         (validator_miss_mask != 0 ? "validator-miss" :
                         (validator_all_cached != 0 ? "validator-hit" : "validator-miss"));
+                } else if (use_mxfp4_selected_slots && use_stream_expert_cache &&
+                           (ar_pipe_ids = ar_pipe_take_ids(selected, n_expert, layer_index,
+                                                           gate_expert_bytes, down_expert_bytes, selected_ids,
+                                                           selected_timing ? &selected_sync_ms : NULL)) != 0) {
+                    /* DS4_ARGODRIVE_DECODE_PIPELINE: the ids came through the mailbox; the batch that
+                     * holds the router was committed and is still running. */
+                    g_routed_moe_selected_override_n = 0;
+                    if (ar_pipe_ids < 0) return 0;
+                    selected_id_source = "mailbox";
                 } else {
                     g_routed_moe_selected_override_n = 0;
                     if (g_batch_cb != nil) {
@@ -44843,6 +45249,55 @@ int ds4_gpu_routed_moe_one_tensor(
                         return 0;
                     }
                 }
+                if (ar_pipe_ids > 0 && ar_pipe_level() >= 3 &&
+                    use_mxfp4_selected_slots && n_expert == 6 &&
+                    stream_expert_missing_mask != 0 && stream_expert_resident_mask != 0 &&
+                    !use_stream_expert_split_deferred && g_batch_cb != nil &&
+                    gate_args.nei1 == 1 && gate_args.ne11 == 1 &&
+                    !selected_profile && getenv("DS4_METAL_MOE_ONE_STAGE_PROFILE") == NULL) {
+                    /* DS4_ARGODRIVE_DECODE_PIPELINE=3: the cached experts' gate/up work is committed
+                     * now and runs while the missing experts are read. Their entries are in flight
+                     * from here, so the reads below cannot reuse their buffers. */
+                    ds4_gpu_dsv4_moe_swiglu_weight_args early_act = {
+                        .width = expert_mid_dim,
+                        .rows = pair_rows,
+                        .gate_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+                        .up_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+                        .mid_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+                        .weight_stride = sizeof(float),
+                        .write_clamped = 0,
+                        .clamp_value = clamp,
+                    };
+                    if (!ds4_gpu_stream_expert_cache_mark_entries_inflight(
+                                stream_slot_entries, n_expert, stream_expert_resident_mask) ||
+                        !ar_pipe_encode_slots6_pair_mask(g_batch_cb,
+                                                         slots_pair_swiglu_pipeline,
+                                                         &gate_args,
+                                                         &early_act,
+                                                         gate_slot_bufs,
+                                                         gate_slot_offsets,
+                                                         up_slot_bufs,
+                                                         up_slot_offsets,
+                                                         xbuf,
+                                                         ds4_gpu_tensor_offset(x),
+                                                         gatebuf,
+                                                         ds4_gpu_tensor_offset(gate),
+                                                         upbuf,
+                                                         ds4_gpu_tensor_offset(up),
+                                                         midbuf,
+                                                         ds4_gpu_tensor_offset(mid),
+                                                         weightsbuf,
+                                                         ds4_gpu_tensor_offset(weights),
+                                                         gate_smem,
+                                                         2,
+                                                         stream_expert_resident_mask) ||
+                        !ds4_gpu_flush_commands()) {
+                        return 0;
+                    }
+                    ar_pipe_early_mask = stream_expert_resident_mask;
+                    g_ar_pipe_early_layers++;
+                    g_ar_pipe_early_slots += (uint64_t)__builtin_popcount(stream_expert_resident_mask);
+                }
                 if (stream_expert_missing_mask != 0 &&
                     !use_stream_expert_split_deferred) {
                     if (!ds4_gpu_stream_expert_cache_load_selected_missing(
@@ -44874,6 +45329,7 @@ int ds4_gpu_routed_moe_one_tensor(
                         down_slot_offsets[i] = entry->down_inner;
                     }
                 }
+                g_ar_pipe_prescan.state = 0;   /* the layer's reads are done; its eviction list goes with them */
                 if (use_iq2_stream_addr_table && use_stream_expert_addr_table) {
                     for (uint32_t i = 0; i < n_expert; i++) {
                         ds4_gpu_stream_expert_cache_entry *entry = stream_slot_entries[i];
@@ -45658,6 +46114,33 @@ int ds4_gpu_routed_moe_one_tensor(
                                                                     nil,
                                                                     nil);
                 }
+            } else if (ar_pipe_early_mask != 0) {
+                /* the cached slots' gate/up work was committed before the reads; the rest now */
+                ok = ds4_gpu_stream_expert_cache_mark_entries_inflight(
+                             stream_slot_entries,
+                             n_expert,
+                             0) &&
+                     ar_pipe_encode_slots6_pair_mask(cb,
+                                                     slots_pair_swiglu_pipeline,
+                                                     &gate_args,
+                                                     &act_args,
+                                                     gate_slot_bufs,
+                                                     gate_slot_offsets,
+                                                     up_slot_bufs,
+                                                     up_slot_offsets,
+                                                     xbuf,
+                                                     ds4_gpu_tensor_offset(x),
+                                                     gatebuf,
+                                                     ds4_gpu_tensor_offset(gate),
+                                                     upbuf,
+                                                     ds4_gpu_tensor_offset(up),
+                                                     midbuf,
+                                                     ds4_gpu_tensor_offset(mid),
+                                                     weightsbuf,
+                                                     ds4_gpu_tensor_offset(weights),
+                                                     gate_smem,
+                                                     2,
+                                                     0x3fu & ~ar_pipe_early_mask);
             } else {
                 ok = (!use_stream_expert_cache ||
                       ds4_gpu_stream_expert_cache_mark_entries_inflight(
@@ -46073,6 +46556,12 @@ int ds4_gpu_routed_moe_one_tensor(
             }
         }
 #undef DS4_METAL_PROFILE_MOE_ONE_STAGE
+        /* DS4_ARGODRIVE_DECODE_PIPELINE=2: the routed experts go to the GPU now; the host encodes
+         * the rest of the layer and the next one meanwhile. */
+        if (ar_pipe_ids > 0 && ar_pipe_level() >= 2 && !owned && g_batch_cb != nil && g_batch_has_work) {
+            g_ar_pipe_routed_commits++;
+            if (!ds4_gpu_flush_commands()) return 0;
+        }
     }
 
     parallel_ffn_scope = NO;

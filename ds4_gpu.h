@@ -4067,6 +4067,13 @@ uint32_t ar_prefill_stage_ids_hint(const int32_t *ids, uint32_t n_ids);
 int ds4_gpu_argodrive_prefill_prewarm(uint64_t gate_bytes, uint64_t up_bytes, uint64_t down_bytes);
 /* Single-host keep-alive scope of one decode token (DS4_ARGODRIVE_GAP_KEEPALIVE=2). */
 void ds4_gpu_argodrive_keepalive_token(int active, uint32_t position);
+/* DS4_ARGODRIVE_DECODE_PIPELINE (streamed V4.1 decode): the level, 0 when off. publish() goes right
+ * behind the router that wrote `selected`, in the open batch; the routed step then takes the ids
+ * from a mailbox instead of ending the batch. verify() is called once the token's command buffers
+ * have completed and fails when a layer ran with ids other than the router's. */
+int ds4_gpu_argodrive_decode_pipeline(void);
+int ds4_gpu_argodrive_ids_publish(const ds4_gpu_tensor *selected, uint32_t n_selected, uint32_t layer);
+int ds4_gpu_argodrive_ids_verify(void);
 #endif
 
 #endif

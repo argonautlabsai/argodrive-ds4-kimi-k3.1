@@ -43127,6 +43127,15 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* DS4_ARGODRIVE_DECODE_PIPELINE: the ids also go to a mailbox, so the routed step below need not
+     * end the command buffer to read them and the shared expert runs meanwhile. Only the one-token
+     * step arms it (it checks the ids at the end of the token); where it does not apply the routed
+     * step reads the ids as before. */
+    if (g->streaming && g->scalar_decode && g->tp_world == 1 && !g->quality && !g->imatrix &&
+        ds4_gpu_argodrive_decode_pipeline())
+        (void)ds4_gpu_argodrive_ids_publish(g->selected, DS4_N_EXPERT_USED, il);
+#endif
 #ifdef DS4_ROCM_BUILD
     if (g->streaming) {
         const ds4_gpu_stream_expert_table table = {
@@ -44529,6 +44538,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     for (uint32_t i = 0; i < 2; i++)
         if (rows[i]) ds4_engram_read_batch_finish(rows[i]);   /* a failure before layer 1 */
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* every command buffer of the token has completed: the mailbox ids against the GPU's record */
+    if (!ds4_gpu_argodrive_ids_verify()) ok = false;
+#endif
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
     if (ok && logits) ok = queued_head ?

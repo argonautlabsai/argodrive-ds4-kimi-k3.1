@@ -90,6 +90,7 @@ Decode:
 |---|---|
 | `DS4_ARGODRIVE_CACHE_SHARE=1` | the staging sets stay allocated and lend their 768 expert positions to the cache between prompt passes |
 | `DS4_ARGODRIVE_GAP_KEEPALIVE=2`, `DS4_TP_KEEPALIVE_TGS=1`, `DS4_TP_KEEPALIVE_ITERS=300000` | a small kernel keeps the GPU out of its low-power states between the command buffers of a token |
+| `DS4_ARGODRIVE_DECODE_PIPELINE=4` | the decode step stops ending its command buffer at every layer's router, so the GPU is no longer left waiting for the host; see *The decode pipeline* |
 
 `m5max-two-drives.env.example` is the set used for the two-drive rows. For one drive, leave out the two lines that
 name the replica; for three, name both replicas in `DS4_ARGODRIVE_REPLICAS`, separated by a comma.
@@ -148,6 +149,55 @@ Measured on the 512-token benchmark with two drives:
 | 4,368 | 55.7 tok/s | 18.3 tok/s | the rows above |
 | 4,700 | 55.6 tok/s | 19.1 tok/s | 93.5 GiB planned; needs about 7 GiB more free memory than 4,368 |
 | 4,800 | 31.0 tok/s | 19.3 tok/s | past the bound: the resident weights become pageable and the prompt pass slows |
+
+## The decode pipeline
+
+A streamed decode step has to know which six experts a layer's router chose before it can bind them. The stock step
+therefore ends its command buffer at every router, waits for the GPU, reads the ids and opens a new buffer. Each of
+those 40 round trips a token leaves the GPU without work while the host wakes and the next buffer is scheduled, and
+when an expert is missing the GPU also waits for the read while the host searches the cache for an entry to give up.
+
+`DS4_ARGODRIVE_DECODE_PIPELINE=<level>` removes those waits. The levels are cumulative:
+
+| level | what changes |
+|---|---|
+| 1 | a one-thread kernel behind the router copies the six ids to a mailbox; the host commits the buffer without waiting for it and polls the mailbox, while the GPU goes on with the shared expert |
+| 2 | the routed experts are committed as soon as they are encoded, and the host encodes the next layer meanwhile |
+| 3 | when some of the six experts have to be read, the gate/up work of the cached ones is committed before the reads start and runs during them |
+| 4 | the cache's search for the entry to give up runs while the host waits for the mailbox; a miss then takes the entry the search would have chosen at that moment |
+
+No weight, id, kernel or order of operations changes. At level 3 the cached experts' gate/up work is the stock
+kernel dispatched over fewer of its six slots, which are independent of each other in that kernel. The ids the host
+acted on are compared with a per-layer record the GPU wrote, once all of a token's command buffers have completed,
+and a difference fails the step. If the mailbox has not filled after 50 ms the step waits for the GPU and reads the
+ids the stock way. Cached experts stay protected the way the engine already protects them: an entry bound in a
+committed buffer cannot be evicted until that buffer has been waited for.
+
+Checked on 12 November: the hash of every decode step's full logits (`DS4_BENCH_DECODE_LOGITS_HASH=1`) is the same
+with level 4 as from the build without this code, on the 512-token benchmark prompt (200 and 600 generated tokens),
+at 2,048 and 4,096 prompt tokens, on English prose and on C code, 1,500 steps in all, and at each of the levels 1 to
+3 on the benchmark prompt. The three-turn chat gave the same three answers. Over all runs of the day the mailbox
+was polled 364,000 times and fell back to the stock readback twice, in runs whose logits were among those compared;
+every layer's ids matched the GPU's record.
+
+Measured the same day with a 2,400-expert cache, because the laptop had about 64 GiB free at the time, off and on
+alternating from one binary; 512-token prompt, 200 generated tokens, steady decode:
+
+| drives | switch off | `DS4_ARGODRIVE_DECODE_PIPELINE=4` |
+|---|---|---|
+| internal SSD | 10.9 tok/s | 11.9 tok/s |
+| internal SSD + one Thunderbolt 5 drive | 12.6 tok/s (12.5 / 12.6 / 12.6) | 14.4 tok/s (14.4 / 14.4 / 14.4) |
+| internal SSD + two Thunderbolt 5 drives | 13.8 tok/s (13.7 / 13.8 / 13.9) | 16.3 tok/s (16.1 / 16.3 / 16.4) |
+| the same, 2,048-token prompt | 13.5 tok/s | 15.2 tok/s |
+
+By level, on two drives: 12.5 off, 13.1 at level 1, 13.2 at level 2, 13.7 at level 3, 14.3 at level 4. The time spent
+waiting for the router's answer fell from 33 to 26 ms a token and the eviction search from 2 ms to nothing; the
+expert reads (40 ms a token at this cache size, 34 loads) are untouched, which is why the gain grows with the number
+of drives. The prompt pass does not change. The three-turn chat went from 25.2, 28.7 and 20.0 s a turn to 23.6, 26.6
+and 19.1 s. The rows of the first table of this page have not been measured again with the switch.
+
+Two things to know. While a token is computed one CPU core polls the mailbox instead of sleeping. And the keep-alive
+kernel is still needed: with the pipeline on and the keep-alive off the same run fell from 13.7 to 10.7 tok/s.
 
 ## The ranking file
 
@@ -221,6 +271,14 @@ The 1,556-token prompt took 25.5 to 25.7 s to process with the switches and 47.8
 the logits of its published references on the same binary (840 positions).
 
 ## What was measured and left out
+
+- Committing the rest of a reading layer's routed work before the reads return, behind a kernel that waits on the
+  GPU for the host's release (the engine's inline tensor-parallel gate, used for reads): 14.35 / 14.43 / 13.92 tok/s
+  against 14.22 / 14.05 / 14.23 without it, same text. Under 1 % and inside the spread of the runs, for a kernel
+  that reads memory the host is writing; left out.
+- Splitting the down projection so that the cached experts' share runs during the reads: the six experts are summed
+  lane by lane inside one kernel, so a split needs two new kernels whose rounding order would have to be shown equal
+  to the fused one's, for about 1 %. Not built.
 
 - An eviction rule that ages use counts continuously: 3 to 8 % fewer loads than the engine's rule on three recorded
   runs, more loads with a long half-life on English prose. The engine's rule stays. Evicting with knowledge of the

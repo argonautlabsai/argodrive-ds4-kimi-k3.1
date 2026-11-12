@@ -109,6 +109,31 @@ kernel void kernel_dsv41_router_one(
     }
 }
 
+// The router's expert ids for the host, from inside the running command buffer
+// (DS4_ARGODRIVE_DECODE_PIPELINE): the ids, then a checksum, then the sequence
+// word, so a host that polls the box takes a record only when it is whole. The
+// same ids go to a per-layer record the host compares at the end of the token.
+// Copies integers only; no weight or activation passes through here.
+kernel void kernel_argodrive_ids_publish(
+        device const int32_t *ids,
+        device atomic_uint *box,
+        device int32_t *record,
+        constant uint &seq,
+        constant uint &n,
+        uint tid [[thread_position_in_grid]]) {
+    if (tid != 0) return;
+    uint sum = 0x9e3779b9u ^ seq;
+    for (uint i = 0; i < n && i < 8u; i++) {
+        const uint v = (uint)ids[i];
+        record[i] = (int32_t)v;
+        atomic_store_explicit(&box[2u + i], v, memory_order_relaxed);
+        sum = (sum ^ v) * 0x01000193u;
+    }
+    atomic_store_explicit(&box[1], sum, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_device);
+    atomic_store_explicit(&box[0], seq, memory_order_relaxed);
+}
+
 struct ds4_metal_args_dsv41_rope {
     uint width, heads, rows, start, inverse, stride;
     float frequencies[32];
