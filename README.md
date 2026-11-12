@@ -124,8 +124,8 @@ file cache dropped, other applications open but idle; decode is the steady rate 
 The switches change how expert bytes are read, staged and cached, never the arithmetic: each row produced the same text,
 and a three-turn chat through the server gave the same three answers with and without them (21.5, 23.0 and 17.4 s per
 turn against 49.8, 51.6 and 41.7 s). A further switch added later that day keeps the GPU fed across each layer's
-router readback (`DS4_ARGODRIVE_DECODE_PIPELINE`): with a 2,400-expert cache, decode went from 12.6 to 14.4 tok/s on
-two drives and from 13.8 to 16.3 on three, every decode step's logits unchanged; the table above was measured without
+router readback (`DS4_ARGODRIVE_DECODE_PIPELINE`): in one session decode went from 17.2 to **20.2 tok/s** on two
+drives and from 19.3 to **21.5** on three, every decode step's logits unchanged; the table above was measured without
 it. Switches, the two-drive setup, memory sizing and the CUDA counterparts:
 [DeepSeek V4.1 Flash](tools/deepseek-v41/README.md).
 

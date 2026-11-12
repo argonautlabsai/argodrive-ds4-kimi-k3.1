@@ -180,8 +180,16 @@ at 2,048 and 4,096 prompt tokens, on English prose and on C code, 1,500 steps in
 was polled 364,000 times and fell back to the stock readback twice, in runs whose logits were among those compared;
 every layer's ids matched the GPU's record.
 
-Measured the same day with a 2,400-expert cache, because the laptop had about 64 GiB free at the time, off and on
-alternating from one binary; 512-token prompt, 200 generated tokens, steady decode:
+Measured the same day, off and on alternating from one binary, 512-token prompt, 200 generated tokens, steady
+decode. With the 4,368-expert cache of the tables above:
+
+| drives | switch off | `DS4_ARGODRIVE_DECODE_PIPELINE=4` |
+|---|---|---|
+| internal SSD + one Thunderbolt 5 drive | 17.1 / 17.2 tok/s | 20.1 / 20.2 tok/s |
+| internal SSD + two Thunderbolt 5 drives | 19.3 / 18.0 tok/s | 21.4 / 21.5 tok/s |
+
+(prefill 59.2 to 59.7 tok/s on two drives and 69.1 to 72.6 on three, the same with and without.) And with a
+2,400-expert cache, measured earlier when the laptop had about 64 GiB free:
 
 | drives | switch off | `DS4_ARGODRIVE_DECODE_PIPELINE=4` |
 |---|---|---|
@@ -194,7 +202,8 @@ By level, on two drives: 12.5 off, 13.1 at level 1, 13.2 at level 2, 13.7 at lev
 waiting for the router's answer fell from 33 to 26 ms a token and the eviction search from 2 ms to nothing; the
 expert reads (40 ms a token at this cache size, 34 loads) are untouched, which is why the gain grows with the number
 of drives. The prompt pass does not change. The three-turn chat went from 25.2, 28.7 and 20.0 s a turn to 23.6, 26.6
-and 19.1 s. The rows of the first table of this page have not been measured again with the switch.
+and 19.1 s (2,400-expert cache, two drives), and took 19.9, 21.9 and 15.4 s on three drives. The first table of
+this page was measured without the switch.
 
 Two things to know. While a token is computed one CPU core polls the mailbox instead of sleeping. And the keep-alive
 kernel is still needed: with the pipeline on and the keep-alive off the same run fell from 13.7 to 10.7 tok/s.
