@@ -203,3 +203,12 @@ the logits of its published references on the same binary (840 positions).
   experts it would have fetched went unused.
 - More staging lanes than 8, more decode reader threads than the default 9, and decode splits other than the prompt
   pass's: no gain.
+- DSpark, the draft-and-verify decode: with the MXFP4-experts file and SSD streaming on Metal its verify step stops
+  with "model range is not covered by mapped model views", in unmodified ds4 of 3 November as well as in this tree
+  (the batched verify reads cached experts only for the Q2 file). ds4 also states that DSpark's output can differ
+  from one-token decode, and `--dspark-strict` keeps target-only decode, so it lies outside the same-output rule
+  the switches here follow. The support file for the October checkpoint converts and verifies with
+  `gguf-tools/deepseek41_dspark.py` from shards 44 to 46 of `deepseek-ai/DeepSeek-V4.1-Flash-1017`.
+- The two-wave routed MoE of the earlier fork: with two drives the 512-token prompt pass reads 151 GB in 8.2 s on
+  drives that deliver about 18 GB/s together, so the drives are busy the whole time and there is nothing left for
+  it to overlap; on one drive it measured 19.2 against 19.1 tok/s.
