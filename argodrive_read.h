@@ -1,5 +1,5 @@
-/* Experimental expert-only replica reader. Callers must verify full replicas
- * before admission; size and inode checks are not content verification. */
+/* Experimental expert-only replica reader. Callers must verify replicas before
+ * admission; size and inode checks are not content verification. */
 #ifndef ARGODRIVE_READ_H
 #define ARGODRIVE_READ_H
 #include <dispatch/dispatch.h>
@@ -16,7 +16,7 @@
 
 /* reads/lands_last/gap_ns: barrier attribution, see ar_read. Trailing fields
  * so the positional initialisers below keep zeroing them. */
-typedef struct { int fd; unsigned weight; uint64_t bytes; uint64_t reads, lands_last, gap_ns; unsigned decode_weight; uint64_t syscalls; } ar_source;
+typedef struct { int fd; unsigned weight; uint64_t bytes; uint64_t reads, lands_last, gap_ns; unsigned decode_weight; uint64_t syscalls; int sparse; } ar_source;
 /* DS4_ARGODRIVE_DECODE_WEIGHTS="10,6,6" (primary first, then the
  * replicas in DS4_ARGODRIVE_REPLICAS order) gives decode its own split; prefill keeps the
  * base weights. The engine flips ar_decode_phase at the first decode expert load and
@@ -144,7 +144,15 @@ static int ar_open(ar_reader *r, int primary, const char *paths, const char *wei
 #ifdef F_NOCACHE
         if(fcntl(fd,F_NOCACHE,1)<0 || fcntl(fd,F_RDAHEAD,0)<0) {close(fd);ok=0;break;}
 #endif
-        r->source[r->count++]=(ar_source){.fd=fd,.weight=w}; cursor=next;
+        int sparse=0;
+#ifdef SEEK_HOLE
+        {   /* an experts-only replica: its slices are checked against its holes on every read */
+            const off_t hole=lseek(fd,0,SEEK_HOLE);
+            sparse=hole>=0 && (uint64_t)hole<r->size;
+            if(sparse) fprintf(stderr,"ds4: Argodrive replica %u is sparse; a read that touches a hole is refused\n",r->count);
+        }
+#endif
+        r->source[r->count++]=(ar_source){.fd=fd,.weight=w,.sparse=sparse}; cursor=next;
     }
     free(copy);
     if(!ok || r->count<2) {ar_close(r);r->invalid=1;return 0;}
@@ -177,6 +185,21 @@ static int ar_plan(const ar_reader *r, uint64_t offset, uint64_t length, ar_piec
         out[i]=(ar_piece){pos,n};pos+=n;
     }
     return pos-offset==length;
+}
+/* A replica may be a sparse file that holds only the routed expert tensors (see
+ * tools/deepseek-v41/make_replica.py). A hole reads as zeros without any error, so a
+ * replica slice that touches one is refused: the read fails closed instead of handing
+ * the model zeroed weights. A file system that cannot report holes (ENXIO at end of
+ * data, EINVAL, ENOTSUP) or a file without any says nothing and the read goes ahead. */
+static int ar_slice_has_hole(const ar_source *source,uint64_t offset,uint64_t length) {
+#ifdef SEEK_HOLE
+    if(!length || !source->sparse) return 0;   /* a file without holes is not asked again */
+    const off_t hole=lseek(source->fd,(off_t)offset,SEEK_HOLE);
+    return hole>=0 && (uint64_t)hole<offset+length;
+#else
+    (void)source;(void)offset;(void)length;
+    return 0;
+#endif
 }
 static uint64_t ar_exact(ar_source *source,uint64_t offset,uint64_t length,uint8_t *dst) {
     uint64_t n=0;
@@ -227,7 +250,9 @@ static int ar_read(ar_reader *r,uint64_t offset,uint64_t length,uint8_t *dst,uin
     ar_piece *pp=pieces; uint64_t *cc=counts, *dn=done_ns, *sn=start_ns;
     dispatch_apply(r->count,dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^(size_t i){
         if(trace) sn[i]=clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
-        cc[i]=ar_exact(&r->source[i],pp[i].offset,pp[i].length,dst+(pp[i].offset-offset));
+        /* i>0 are replicas; the primary is the model file itself. A refused slice counts as short. */
+        cc[i]=(i>0 && ar_slice_has_hole(&r->source[i],pp[i].offset,pp[i].length)) ? 0 :
+            ar_exact(&r->source[i],pp[i].offset,pp[i].length,dst+(pp[i].offset-offset));
         dn[i]=clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
         __atomic_fetch_add(&r->source[i].bytes,cc[i],__ATOMIC_RELAXED);
     });

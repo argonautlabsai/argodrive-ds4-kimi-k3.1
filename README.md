@@ -119,6 +119,7 @@ file cache dropped, other applications open but idle; decode is the steady rate 
 | no switches, model on the internal SSD | 17.6 tok/s prefill, 13.0 decode | 70.1 prefill, 11.9 decode |
 | streaming switches, internal SSD | 41.8 prefill, 16.4 decode | 118.4 prefill, 14.8 decode |
 | streaming switches, internal SSD and a copy on one Thunderbolt 5 NVMe drive | **55.7 prefill, 18.3 decode** | **160.7 prefill, 16.7 decode** |
+| streaming switches, internal SSD and two Thunderbolt 5 NVMe drives (later session, laptop in light use) | **72.3 prefill, 17.5 decode** | **186.4 prefill, 16.5 decode** |
 
 The switches change how expert bytes are read, staged and cached, never the arithmetic: each row produced the same text,
 and a three-turn chat through the server gave the same three answers with and without them (21.5, 23.0 and 17.4 s per

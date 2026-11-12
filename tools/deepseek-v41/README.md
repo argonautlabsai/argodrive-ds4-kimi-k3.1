@@ -1,4 +1,4 @@
-# DeepSeek V4.1 Flash on a Mac: streaming from one or two drives
+# DeepSeek V4.1 Flash on a Mac: streaming from one, two or three drives
 
 DeepSeek V4.1 Flash does not fit in the memory of a 128 GB Mac: the October checkpoint
 (`DeepSeek-V4.1-Flash-1017-MXFP4-experts.gguf`, 501.6 GB) keeps 9.4 GiB of weights resident and streams its
@@ -41,6 +41,20 @@ decode on 11 November: the drive under the model matters as much as the switches
 machine: while other applications were busy on the same laptop, the two-drive decode fell from 18.3 to between 14.8
 and 15.3 tok/s for a few minutes and came back.
 
+A third drive was added later the same day: an experts-only copy on a second Thunderbolt 5 NVMe drive (see *Two or
+three drives*), weights 14:6:7, with the conditional table described under *The ranking file*. The laptop was in
+light use by then, which cost every arm of that session about a tenth of its decode speed, so the comparison is
+within the session:
+
+| setup (same session, 4,368 cached experts) | 512-token prompt | 2,048-token prompt |
+|---|---|---|
+| switches, internal SSD + one Thunderbolt 5 drive | 59.1 tok/s prefill, 16.4 decode | 163.7 prefill, 15.5 decode |
+| switches, internal SSD + two Thunderbolt 5 drives | 72.3 tok/s prefill, 17.5 decode (71.9 / 72.9 / 72.3; 17.1 / 17.5 / 17.5) | 186.4 prefill, 16.5 decode |
+
+Prompt pass only, with a 2,400-expert cache: 45.5 tok/s from the internal SSD alone, 62.3 with one Thunderbolt 5
+drive, 78.2 to 78.6 with two; 129.6 at 1,024 tokens, 213.3 at 2,048 and 319.5 at 4,096 with two (102.7, 163 to 172
+and 229.0 with one). The larger cache costs the prompt pass about 8 %: more experts are copied into it per layer.
+
 A three-turn chat through `ds4-server` (831, 1,626 and 1,638 prompt tokens; 160, 160 and 80 generated; temperature 0)
 took 21.5, 23.0 and 17.4 s per turn with the switches on two drives and 49.8, 51.6 and 41.7 s without switches on the internal
 SSD. The three answers were identical in both runs. The server re-reads the whole conversation on every turn (the
@@ -78,15 +92,27 @@ Decode:
 | `DS4_ARGODRIVE_GAP_KEEPALIVE=2`, `DS4_TP_KEEPALIVE_TGS=1`, `DS4_TP_KEEPALIVE_ITERS=300000` | a small kernel keeps the GPU out of its low-power states between the command buffers of a token |
 
 `m5max-two-drives.env.example` is the set used for the two-drive rows. For one drive, leave out the two lines that
-name the replica.
+name the replica; for three, name both replicas in `DS4_ARGODRIVE_REPLICAS`, separated by a comma.
 
-## Two drives
+## Two or three drives
 
-A replica must be the same file byte for byte: the reader checks size and identity of the file, not content, and a
-read is assembled from blocks of every drive. Copy the file, then compare a checksum of the copy with the published
-one before using it. Weights should follow what the drives deliver together; 7 for an M5 Max internal SSD against 3
-for an 80 Gb/s Thunderbolt 5 NVMe enclosure was the best of the splits tried here, for the prompt pass and for decode
-alike.
+A replica must hold the same bytes as the model file: the reader checks size and identity of the file, not content,
+and a read is assembled from blocks of every drive. Copy the file, then compare a checksum of the copy with the
+published one before using it. Weights should follow what the drives deliver together; 7 for an M5 Max internal SSD
+against 3 for an 80 Gb/s Thunderbolt 5 NVMe enclosure was the best of the splits tried here, for the prompt pass and
+for decode alike, and 14:6:7 with a second, slightly faster enclosure.
+
+A replica does not need the whole file. The reader only ever asks a replica for bytes of the routed expert tensors,
+288.8 GB of the 501.6 GB here, so `make_replica.py` writes a sparse file of the model's size that holds exactly
+those tensors at their own offsets, reads every range back and compares it with the source:
+
+```
+python3 tools/deepseek-v41/make_replica.py /path/to/model.gguf /Volumes/ThirdDrive/model.gguf
+```
+
+A hole in a sparse file reads as zeros without an error, so the reader looks for holes when it opens a replica and,
+if it finds any, refuses every read that touches one: the run stops instead of computing with zeroed weights. A
+replica that is all holes fails at the first layer of the prompt pass.
 
 ## Memory
 
@@ -158,6 +184,7 @@ Never include a prompt you are going to measure.
 ## Tools
 
 - `make_corpus.py`, `make_hotlist.py`, `make_cooc.py`: the ranking and the conditional table, as above.
+- `make_replica.py`: an experts-only sparse replica for a second or third drive, verified against the source.
 - `route_cache_sim.py`: replays a recorded run (`DS4_ARGODRIVE_PREFILL_TOKENS_DUMP`, `DS4_MOE_RECORD_SELECTED_IDS`)
   through a model of the expert cache, to size a cache or compare eviction rules without running the engine. It
   reproduced the engine's loads per token within 1 % at three cache sizes.
