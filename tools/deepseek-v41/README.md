@@ -66,6 +66,7 @@ Prompt pass (staging the routed experts of each layer into two staging sets):
 | `DS4_ARGODRIVE_PREFILL_SELECTIVE_MAX=N` | selective up to N prompt tokens in one chunk (default 512; 2,048 measured here) |
 | `DS4_ARGODRIVE_PREFILL_AHEAD=1`, `DS4_ARGODRIVE_PREFILL_LANES=8` | read the next layer while this one computes; reads in flight per staged tensor |
 | `DS4_ARGODRIVE_PREFILL_HOT=384`, `DS4_ARGODRIVE_HOTLIST=<file>` | before the router's answer is known, read the next layer's likeliest experts in the order of a ranking file |
+| `DS4_ARGODRIVE_COOC=<file>` | order that read-ahead by what this prompt routed to in the layer before, from a table of layer-to-layer counts; the ranking file stays the fallback |
 | `DS4_ARGODRIVE_PREFILL_CACHE_COPY=1` | experts the cache already holds are copied from memory instead of read again |
 | `DS4_ARGODRIVE_ENGRAM_PREFETCH_MIN=1`, `DS4_ARGODRIVE_ENGRAM_BATCH_READERS=128` | start the Engram table reads early and keep more of them in flight |
 
@@ -131,19 +132,32 @@ overlaps a measured prompt (the benchmark reads the head of the book). It only d
 different list changes speed, never output. With it the read-ahead had 41 % of a layer's experts in place before the
 router answered on the benchmark prompt, 36 % on English prose and 34 % on C code.
 
+`hotlists/deepseek-v4.1-flash-1017-cooc.bin` is the conditional table for `DS4_ARGODRIVE_COOC`, built from the same
+22 prompts: for every pair of consecutive layers, how often a token that routed to an expert of one layer routed to
+each expert of the next. While a layer computes, the engine scores the next layer's experts with the counts of the
+experts this prompt has just routed to, so the read-ahead follows the prompt instead of an average over all text. On
+the three held-out prompts it had 37 %, 29 % and 34 % of the routed experts in place against 31 %, 25 % and 24 % for
+the ranking alone, and the prompt pass (two drives, measured on 12 November in a later session with a 2,400-expert
+cache, prompt pass only) went from 57.3 to 58.6 tok/s up to 62.2 to 62.4 on the benchmark prompt, from 51.3 to 56.4
+on C code, from 48.6 to 50.1 on English prose and from 97.3 to 102.7 at 1,024 tokens; at 2,048 tokens two pairs gave
+162.8 against 172.2 and 163.6 against 163.8. The text was the same in every pair. The table above was measured
+without it.
+
 To build one for another model or corpus:
 
 ```
 python3 tools/deepseek-v41/make_corpus.py . /tmp/corpus
 # for each file: one 512-token prompt pass with DS4_ARGODRIVE_PREFILL_IDS_DUMP=/tmp/dumps/<name>.txt
 python3 tools/deepseek-v41/make_hotlist.py my-ranking.txt /tmp/dumps/*.txt
+# the conditional table needs per-token dumps: DS4_ARGODRIVE_PREFILL_TOKENS_DUMP=/tmp/tokens/<name>.txt
+python3 tools/deepseek-v41/make_cooc.py my-table.bin 40 384 /tmp/tokens/*.txt     # needs NumPy
 ```
 
 Never include a prompt you are going to measure.
 
 ## Tools
 
-- `make_corpus.py`, `make_hotlist.py`: the ranking, as above.
+- `make_corpus.py`, `make_hotlist.py`, `make_cooc.py`: the ranking and the conditional table, as above.
 - `route_cache_sim.py`: replays a recorded run (`DS4_ARGODRIVE_PREFILL_TOKENS_DUMP`, `DS4_MOE_RECORD_SELECTED_IDS`)
   through a model of the expert cache, to size a cache or compare eviction rules without running the engine. It
   reproduced the engine's loads per token within 1 % at three cache sizes.
