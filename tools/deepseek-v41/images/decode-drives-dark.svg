@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 220" width="760" height="220" role="img" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" aria-label="DeepSeek V4.1 Flash, October checkpoint: steady decode in tokens per second: ds4 without the switches, internal SSD 13.0; this fork, internal SSD 18.4; + one Thunderbolt 5 NVMe drive 20.7; + two Thunderbolt 5 NVMe drives 22.5.">
+<title>DeepSeek V4.1 Flash, October checkpoint: steady decode in tokens per second</title>
+<text x="0" y="18" font-size="15" font-weight="600" fill="#f0efec">DeepSeek V4.1 Flash, October checkpoint: steady decode in tokens per second</text>
+<text x="0" y="38" font-size="12" fill="#c3c2b7">MacBook Pro M5 Max, 128 GB · 512-token prompt, 200 generated tokens · same logits in every row · × against the grey bar</text>
+<line x1="285.5" y1="56" x2="285.5" y2="202" stroke="#3a3a37" stroke-width="1"/>
+<text x="274" y="77" font-size="13" text-anchor="end" fill="#c3c2b7">ds4 without the switches, internal SSD</text>
+<path d="M286 62 h192.707 a4 4 0 0 1 4 4 v12 a4 4 0 0 1 -4 4 h-192.707 z" fill="#8f8e87"/>
+<text x="490.707" y="77" font-size="14" font-weight="700" fill="#f0efec">13.0</text>
+<text x="274" y="115" font-size="13" text-anchor="end" fill="#c3c2b7">this fork, internal SSD</text>
+<path d="M286 100 h274.113 a4 4 0 0 1 4 4 v12 a4 4 0 0 1 -4 4 h-274.113 z" fill="#3987e5"/>
+<text x="572.113" y="115" font-size="14" font-weight="700" fill="#f0efec">18.4</text>
+<text x="612.113" y="115" font-size="12" fill="#c3c2b7">1.41×</text>
+<text x="274" y="153" font-size="13" text-anchor="end" fill="#c3c2b7">+ one Thunderbolt 5 NVMe drive</text>
+<path d="M286 138 h309.066 a4 4 0 0 1 4 4 v12 a4 4 0 0 1 -4 4 h-309.066 z" fill="#3987e5"/>
+<text x="607.066" y="153" font-size="14" font-weight="700" fill="#f0efec">20.7</text>
+<text x="647.066" y="153" font-size="12" fill="#c3c2b7">1.59×</text>
+<text x="274" y="191" font-size="13" text-anchor="end" fill="#c3c2b7">+ two Thunderbolt 5 NVMe drives</text>
+<path d="M286 176 h336 a4 4 0 0 1 4 4 v12 a4 4 0 0 1 -4 4 h-336 z" fill="#3987e5"/>
+<text x="634" y="191" font-size="14" font-weight="700" fill="#f0efec">22.5</text>
+<text x="674" y="191" font-size="12" fill="#c3c2b7">1.73×</text>
+</svg>

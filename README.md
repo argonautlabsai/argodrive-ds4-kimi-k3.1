@@ -111,22 +111,30 @@ The Metal path computes with fp32 activations throughout, and the drafter's runs
 ### DeepSeek V4.1 Flash on the same MacBook Pro (macOS, Metal)
 
 The engine also runs DeepSeek V4.1 Flash (the October checkpoint, MXFP4 experts, 501.6 GB) on the M5 Max by streaming
-its routed experts from disk. Measured on 12 November with `ds4-bench`, 200 generated tokens, fresh processes with the
-file cache dropped, other applications open but idle; decode is the steady rate after the first token:
+its routed experts from disk, from the internal SSD alone or split across it and one or two Thunderbolt 5 NVMe drives.
 
-| setup | 512-token prompt | 2,048-token prompt |
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="tools/deepseek-v41/images/decode-drives-dark.svg">
+    <img src="tools/deepseek-v41/images/decode-drives-light.svg" width="760" alt="DeepSeek V4.1 Flash, steady decode in tokens per second on a MacBook Pro M5 Max: ds4 without the switches on the internal SSD 13.0; this fork on the internal SSD 18.4; with one Thunderbolt 5 NVMe drive 20.7; with two 22.5.">
+  </picture>
+</p>
+
+Measured with `ds4-bench`, a 512-token prompt and 200 generated tokens, fresh processes with the file cache dropped;
+decode is the steady rate after the first token. The rows of this fork are medians of three runs in one session on
+13 November; the first row is the engine without the switches, the day before:
+
+| setup | prefill | decode |
 |---|---|---|
-| no switches, model on the internal SSD | 17.6 tok/s prefill, 13.0 decode | 70.1 prefill, 11.9 decode |
-| streaming switches, internal SSD | 41.8 prefill, 16.4 decode | 118.4 prefill, 14.8 decode |
-| streaming switches, internal SSD and a copy on one Thunderbolt 5 NVMe drive | **55.7 prefill, 18.3 decode** | **160.7 prefill, 16.7 decode** |
-| streaming switches, internal SSD and two Thunderbolt 5 NVMe drives (later session, laptop in light use) | **72.3 prefill, 17.5 decode** | **186.4 prefill, 16.5 decode** |
+| no switches, model on the internal SSD | 17.6 tok/s | 13.0 tok/s |
+| streaming switches, internal SSD | 44.4 tok/s | 18.4 tok/s |
+| streaming switches, internal SSD and a copy on one Thunderbolt 5 NVMe drive | 59.5 tok/s | 20.7 tok/s |
+| streaming switches, internal SSD and two Thunderbolt 5 NVMe drives | **72.8 tok/s** | **22.5 tok/s** |
 
-The switches change how expert bytes are read, staged and cached, never the arithmetic: each row produced the same text,
-and a three-turn chat through the server gave the same three answers with and without them (21.5, 23.0 and 17.4 s per
-turn against 49.8, 51.6 and 41.7 s). A further switch added later that day keeps the GPU fed across each layer's
-router readback (`DS4_ARGODRIVE_DECODE_PIPELINE`): in one session decode went from 17.2 to **20.2 tok/s** on two
-drives and from 19.3 to **21.5** on three, every decode step's logits unchanged; the table above was measured without
-it. Switches, the two-drive setup, memory sizing and the CUDA counterparts:
+The switches change how expert bytes are read, staged and cached and when the GPU is given its work, never the
+arithmetic: every run produced the same text, every decode step's logits equal those of the engine without the
+switches (1,500 steps compared), and a three-turn chat through the server gave the same three answers. Switches, the
+two- and three-drive setup, memory sizing and the CUDA counterparts:
 [DeepSeek V4.1 Flash](tools/deepseek-v41/README.md).
 
 ### Architecture and validation

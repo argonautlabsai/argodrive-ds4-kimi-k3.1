@@ -9,6 +9,30 @@ they give on a MacBook Pro M5 Max, and the tools used to measure them.
 All of the switches are off unless set. None of them changes a kernel, a weight or the arithmetic: every run reported
 here produced the same text as the same binary without switches.
 
+## The current numbers: 13 November 2026
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="images/decode-drives-dark.svg">
+    <img src="images/decode-drives-light.svg" width="760" alt="DeepSeek V4.1 Flash, steady decode in tokens per second on a MacBook Pro M5 Max: ds4 without the switches on the internal SSD 13.0; this fork on the internal SSD 18.4; with one Thunderbolt 5 NVMe drive 20.7; with two 22.5.">
+  </picture>
+</p>
+
+MacBook Pro M5 Max (128 GB), every switch of this page on including `DS4_ARGODRIVE_DECODE_PIPELINE=4`, 4,368 cached
+experts, 512-token prompt, 200 generated tokens. One session with the other applications closed: one, two and three
+drives in turn, three times, every run a fresh process with the page cache of the model files dropped. All nine runs
+produced the same text.
+
+| setup | prefill (three runs) | steady decode (three runs) |
+|---|---|---|
+| internal SSD | 44.4 tok/s (44.0 / 44.4 / 44.5) | 18.4 tok/s (17.9 / 18.4 / 18.4) |
+| internal SSD + one Thunderbolt 5 NVMe drive | 59.5 tok/s (59.6 / 59.4 / 59.5) | 20.7 tok/s (20.7 / 20.8 / 20.7) |
+| internal SSD + two Thunderbolt 5 NVMe drives | 72.8 tok/s (72.8 / 73.2 / 72.7) | 22.5 tok/s (22.4 / 22.5 / 22.6) |
+
+The same engine without any switch, on the internal SSD with its 3,600-expert cache: 17.6 tok/s prefill and 13.0
+decode (12 November). `make_decode_chart.py` draws the chart. The sections below are the measurements of 12 November
+that led here; they were taken without the decode pipeline unless they say otherwise.
+
 ## Measured on a MacBook Pro M5 Max (128 GB), 12 November 2026
 
 `ds4-bench`, prompt `speed-bench/promessi_sposi.txt`, 200 generated tokens, every arm a fresh process with the page
@@ -244,6 +268,7 @@ Never include a prompt you are going to measure.
 
 - `make_corpus.py`, `make_hotlist.py`, `make_cooc.py`: the ranking and the conditional table, as above.
 - `make_replica.py`: an experts-only sparse replica for a second or third drive, verified against the source.
+- `make_decode_chart.py`: the decode chart at the top of this page, as one SVG for light and one for dark pages.
 - `route_cache_sim.py`: replays a recorded run (`DS4_ARGODRIVE_PREFILL_TOKENS_DUMP`, `DS4_MOE_RECORD_SELECTED_IDS`)
   through a model of the expert cache, to size a cache or compare eviction rules without running the engine. It
   reproduced the engine's loads per token within 1 % at three cache sizes.
