@@ -1,14 +1,21 @@
 <p align="center"><a href="https://argonautlabs.ai/"><img src="tools/kimi-k3/images/argodrive-mark.svg" width="112" alt="Argonaut Labs"></a></p>
 
-# Argodrive DS4 Kimi K3.1
+# Argodrive DS4 — Kimi K3.1 Pro and DeepSeek V4.1 Flash 1017
 
-## Run Kimi K3.1 Pro locally on one NVIDIA GPU or on a Mac
+## Run locally on one NVIDIA GPU or on a Mac
 
-**This repository is the inference engine.** It already includes the ds4-based runtime, the Kimi K3/K3.1 CUDA port and its Metal port for Apple silicon, NVMe expert streaming, expert caches and weight-preparation tools. Clone and build this repository; **no separate upstream ds4 installation or Argodrive Mac app is needed**.
+**This repository is the inference engine for Kimi K3.1 Pro and DeepSeek V4.1 Flash 1017.** It includes the ds4-based runtime, the Kimi K3/K3.1 CUDA and Metal ports, DeepSeek inference with NVMe streaming optimisations, expert caches and weight-preparation tools. Clone and build this repository; **no separate upstream ds4 installation or Argodrive Mac app is needed**.
 
 This is a **source release**. Model weights, NVIDIA drivers, CUDA build tools (on a Mac, the Xcode command-line tools) and Python dependencies are separate; there is currently no prebuilt installer.
 
+**Choose your model:**
+
+- **Kimi K3.1 Pro:** [installation guide](https://argonautlabs.ai/guides/install-kimi-k31.html) · [CUDA and Metal configuration](tools/kimi-k3/README.md)
+- **DeepSeek V4.1 Flash 1017:** [setup, model file and streaming settings](tools/deepseek-v41/README.md) · [one-, two- and three-drive M5 Max results](#deepseek-v41-flash-on-the-same-macbook-pro-macos-metal)
+
 ### Measured results at a glance
+
+The following tables and footprint describe **Kimi K3.1 Pro**. DeepSeek V4.1 Flash 1017 has its own model layout, memory requirements and [benchmark section below](#deepseek-v41-flash-on-the-same-macbook-pro-macos-metal).
 
 | Hardware | Workload | Measured speed | Version and scope |
 |---|---|---:|---|
@@ -110,7 +117,7 @@ The Metal path computes with fp32 activations throughout, and the drafter's runs
 
 ### DeepSeek V4.1 Flash on the same MacBook Pro (macOS, Metal)
 
-The engine also runs DeepSeek V4.1 Flash (the October checkpoint, MXFP4 experts, 501.6 GB) on the M5 Max by streaming
+The engine also runs **DeepSeek V4.1 Flash 1017** (the October checkpoint, MXFP4 experts, 501.6 GB) on the M5 Max by streaming
 its routed experts from disk, from the internal SSD alone or split across it and one or two Thunderbolt 5 NVMe drives.
 
 <p align="center">
