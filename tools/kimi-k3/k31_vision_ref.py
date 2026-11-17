@@ -10,10 +10,12 @@ Details that matter for matching the BF16 serving stacks:
   - 2D rotary embedding on interleaved pairs (not neox), x and y frequencies alternating, theta 10000, per 128-dim head;
   - position table [64, 64, 1024] resized bilinearly (align_corners False) to the patch grid;
   - preprocessing: navit resize (in_patch_limit 65536, 512 patches a side), PIL bicubic, transparent pixels filled
-    with Moonshot's chessboard after the resize, zero padding to a multiple of 28, (x / 255 - 0.5) * 2, 14x14 patches.
+    with Moonshot's chessboard after the resize (float32 blend, truncated), zero padding to a multiple of 28,
+    (x / 255 - 0.5) * 2, 14x14 patches; no EXIF rotation (PIL's Image.open does not apply it).
 
 usage: k31_vision_ref.py --shards DIR IMAGE --out PREFIX
-writes PREFIX.npz: embeds [tokens x 7168] f32, pixel patches, grid (t, h, w), original size, a few stage checkpoints.
+writes PREFIX.npz: embeds [tokens x 7168] f32, pixel patches, grid (t, h, w), original size, a few stage checkpoints;
+and PREFIX.patches.f32 / PREFIX.embeds.f32 raw, for k31_vision_gpu_test.
 """
 import argparse
 import json
@@ -66,30 +68,35 @@ def navit_resize(width, height):
 
 
 def chessboard_fill(img):
-    """Moonshot's transparent_bg_config: chessboard, squares of 8, white 255 / gray 180, white top-left"""
-    if img.mode not in ("RGBA", "LA", "PA") and not (img.mode == "P" and "transparency" in img.info):
+    """media_utils.fill_transparent_bg_with with Moonshot's chessboard config: squares of 8, white 255 at the top
+    left, gray 180; alpha blend in float32, then truncation to uint8 (numpy astype), as their code does"""
+    if img.mode == "RGB":
+        return img
+    if not ("A" in img.getbands() or "transparency" in img.info):
         return img.convert("RGB")
-    img = img.convert("RGBA")
-    w, h = img.size
-    yy, xx = np.mgrid[0:h, 0:w]
-    white = ((yy // 8 + xx // 8) % 2) == 0
-    bg = np.where(white[..., None], 255, 180).astype(np.uint8).repeat(3, axis=2)
-    bg_img = Image.fromarray(bg, "RGB").convert("RGBA")
-    return Image.alpha_composite(bg_img, img).convert("RGB")
+    a = np.array(img.convert("RGBA"))
+    h, w = a.shape[:2]
+    bg = np.ones((h, w, 3), dtype=np.uint8) * 255
+    for y in range(0, h, 8):
+        for x in range(0, w, 8):
+            if (y // 8 + x // 8) % 2 == 1:
+                bg[y:y + 8, x:x + 8] = 180
+    alpha = a[:, :, 3].astype(np.float32) / 255.0
+    alpha_3d = np.stack([alpha] * 3, axis=2)
+    out = alpha_3d * a[:, :, :3] + (1 - alpha_3d) * bg
+    return Image.fromarray(out.astype(np.uint8))
 
 
 def preprocess(path):
+    """KimiK3VisionProcessor.preprocess for one image: the image as opened (no EXIF rotation), resized in its own
+    mode by PIL bicubic, the transparent background filled after the resize, zero padding, normalisation, patches"""
     img = Image.open(path)
     img.load()
     w, h = img.size
     new_w, new_h, pad_w, pad_h = navit_resize(w, h)
-    if img.mode not in ("RGB", "RGBA", "LA", "PA", "P", "L"):
-        img = img.convert("RGB")
-    rgba = img.mode in ("RGBA", "LA", "PA") or (img.mode == "P" and "transparency" in img.info)
-    src = img.convert("RGBA") if rgba else img.convert("RGB")
-    src = src.resize((new_w, new_h), resample=Image.Resampling.BICUBIC)
-    src = chessboard_fill(src) if rgba else src
-    x = np.asarray(src, dtype=np.uint8)
+    img = img.resize((new_w, new_h), resample=Image.Resampling.BICUBIC)
+    img = chessboard_fill(img)
+    x = np.asarray(img)
     x = np.pad(x, ((0, pad_h), (0, pad_w), (0, 0)), mode="constant", constant_values=0)
     x = (x / 255.0).astype(np.float32)
     x -= np.array([0.5, 0.5, 0.5])
@@ -174,6 +181,8 @@ def main():
     emb, ck = forward(W, patches, grid)
     np.savez(args.out + ".npz", embeds=emb.numpy(), patches=patches, grid=np.array(grid), size=np.array(size),
              **{k: v.numpy() for k, v in ck.items()})
+    patches.astype(np.float32).tofile(args.out + ".patches.f32")   # for k31_vision_gpu_test
+    emb.numpy().astype(np.float32).tofile(args.out + ".embeds.f32")
     print(f"{args.image}: {size[0]}x{size[1]} -> grid {grid}, {emb.shape[0]} image tokens of {emb.shape[1]}; "
           f"embeds mean |x| {emb.abs().mean():.4f}, rms {emb.pow(2).mean().sqrt():.4f} -> {args.out}.npz")
 
