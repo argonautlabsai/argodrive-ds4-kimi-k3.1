@@ -8,6 +8,10 @@ every request the prompt ids it wrote are compared with Moonshot's encoder (k31_
      must see the other image and start over, and the answer must be about B
   4. text only
   5. image A at twice the size (about 2,500 image tokens): timing
+  6-8. three new conversations on image A with different questions: the second saves the state after the image (the
+     prefix it shares with the first), the third restores it and prefills only its question
+  9. the same question on image B (same size, same ids up to the question): the saved prefix holds image A, so it must
+     not be restored, and the answer must be about B
 
 usage: k31_vision_e2e.py --url URL --images DIR --tokenizer DIR --dump DUMP --out DIR
 """
@@ -85,6 +89,10 @@ def main():
         ask(args, "t3-image-b-same-ids", conv_b, max_tokens=40)
     ask(args, "t4-text-only", [{"role": "user", "content": "In one sentence: what is the capital of France?"}], max_tokens=30)
     ask(args, "t5-image-a-big", [user(big, QUESTION)])
+    ask(args, "t6-new-chat-a", [user(a, QUESTION)])
+    ask(args, "t7-new-chat-a-triangle", [user(a, "What colour is the triangle?")], max_tokens=30)
+    ask(args, "t8-new-chat-a-count", [user(a, "How many shapes are there, and what does the text say?")], max_tokens=40)
+    ask(args, "t9-new-chat-b-count", [user(b, "How many shapes are there, and what does the text say?")], max_tokens=40)
     return 0
 
 

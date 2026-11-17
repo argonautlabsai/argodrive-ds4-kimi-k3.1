@@ -48976,11 +48976,7 @@ int ds4_k31_vision_encode(const char *dir, const float *patches, uint32_t gh, ui
     return 0;
 #endif
 }
-static uint32_t k3_images_first(void) {   /* the first image position of this request (UINT32_MAX: none) */
-    uint32_t f = UINT32_MAX;
-    for (int i = 0; i < g_k3_img_n; i++) if (g_k3_img[i].pos < f) f = g_k3_img[i].pos;
-    return f;
-}
+
 int ds4_k3_chat_prompt(ds4_engine *e, const char *const *roles, const char *const *contents, int n, int thinking,
                        ds4_tokens *out) {
     if (!e || !out || !ds4_model_is_kimi_k3()) return 0;
@@ -67079,24 +67075,37 @@ static void k3_session_reset(void) {
     g_k3_sess_img = NULL;
     g_k3_sess_img_n = 0;
 }
-/* the stored session's first n tokens may be reused only if the images among them are this request's, in the same places */
-static bool k3_session_images_match(uint32_t n) {
-    for (int i = 0; i < g_k3_sess_img_n; i++) {
-        const ds4_k3_image_span *s0 = &g_k3_sess_img[i];
-        if (s0->pos >= n) continue;
+/* state that covers the first n prompt positions (a stored session, a saved prefix) may be reused only if the images
+   among them are this request's, in the same places: the token ids of two images of one size are the same */
+static bool k3_images_match(const ds4_k3_image_span *had, int n_had, uint32_t n) {
+    for (int i = 0; i < n_had; i++) {
+        if (had[i].pos >= n) continue;
         bool found = false;
         for (int j = 0; j < g_k3_img_n && !found; j++)
-            found = g_k3_img[j].pos == s0->pos && g_k3_img[j].n == s0->n && g_k3_img[j].hash == s0->hash;
+            found = g_k3_img[j].pos == had[i].pos && g_k3_img[j].n == had[i].n && g_k3_img[j].hash == had[i].hash;
         if (!found) return false;
     }
     for (int j = 0; j < g_k3_img_n; j++) {
         if (g_k3_img[j].pos >= n) continue;
         bool found = false;
-        for (int i = 0; i < g_k3_sess_img_n && !found; i++)
-            found = g_k3_sess_img[i].pos == g_k3_img[j].pos && g_k3_sess_img[i].n == g_k3_img[j].n && g_k3_sess_img[i].hash == g_k3_img[j].hash;
+        for (int i = 0; i < n_had && !found; i++)
+            found = had[i].pos == g_k3_img[j].pos && had[i].n == g_k3_img[j].n && had[i].hash == g_k3_img[j].hash;
         if (!found) return false;
     }
     return true;
+}
+/* this request's images that start before position n, without their rows */
+static ds4_k3_image_span *k3_images_copy(uint32_t n, int *n_out) {
+    *n_out = 0;
+    ds4_k3_image_span *v = NULL;
+    for (int j = 0; j < g_k3_img_n; j++) {
+        if (g_k3_img[j].pos >= n) continue;
+        v = xrealloc(v, sizeof(*v) * (size_t)(*n_out + 1));
+        v[*n_out] = g_k3_img[j];
+        v[*n_out].embeds = NULL;
+        (*n_out)++;
+    }
+    return v;
 }
 
 static void k3_session_push(int token) {
@@ -67122,6 +67131,7 @@ typedef struct {
     float **idx;                  /* step 95: per MLA layer, n rows of 128 index-key floats; NULL when DSA was off */
     uint64_t *conv_b, *state_b, *key_row_b, *val_row_b;
     uint64_t bytes, last_use;
+    ds4_k3_image_span *img; int n_img;   /* K3.1: the images among the first n positions (no rows) */
 } k3_ckpt;
 static k3_ckpt *g_k3_ckpt = NULL;
 static int g_k3_ckpt_cap = -1;
@@ -67159,6 +67169,7 @@ static void k3_ckpt_free(k3_ckpt *c) {
     free(c->lch);
     free(c->conv_b); free(c->state_b); free(c->key_row_b); free(c->val_row_b);
     free(c->tokens);
+    free(c->img);
     g_k3_ckpt_bytes -= c->bytes;
     memset(c, 0, sizeof(*c));
 }
@@ -67169,7 +67180,7 @@ static const k3_ckpt *k3_ckpt_find(const int *ids, int n_ids, uint32_t cache_cap
         const k3_ckpt *c = &g_k3_ckpt[i];
         if (!c->tokens || c->cache_cap != cache_cap || c->n >= n_ids) continue;
         if (best && c->n <= best->n) continue;
-        if (memcmp(c->tokens, ids, sizeof(int) * (size_t)c->n) == 0) best = c;
+        if (memcmp(c->tokens, ids, sizeof(int) * (size_t)c->n) == 0 && k3_images_match(c->img, c->n_img, (uint32_t)c->n)) best = c;
     }
     return best;
 }
@@ -67205,6 +67216,7 @@ static bool k3_ckpt_save(const k3_gpu_buffers *b, const int *ids, int n) {
         else return false;
         k3_ckpt *c = &g_k3_ckpt[victim];
         c->n_layer = L; c->n = n; c->cache_cap = b->cache_cap;
+        c->img = k3_images_copy((uint32_t)n, &c->n_img);
         c->conv = xcalloc(L, sizeof(float *)); c->state = xcalloc(L, sizeof(float *));
         c->key = xcalloc(L, sizeof(float *)); c->value = xcalloc(L, sizeof(float *));
         c->conv_b = xcalloc(L, sizeof(uint64_t)); c->state_b = xcalloc(L, sizeof(uint64_t));
@@ -68363,7 +68375,7 @@ static int generate_k3_cuda_argmax(
     if (g_k3_sess.valid && g_k3_sess.cache_cap == cache_cap && !getenv("DS4_K3_NO_SESSION")) {
         int lcp = 0;
         while (lcp < g_k3_sess.n_tokens && lcp < n_ids && g_k3_sess.tokens[lcp] == ids[lcp]) lcp++;
-        if (lcp == g_k3_sess.n_tokens && lcp < n_ids && !k3_session_images_match((uint32_t)lcp)) {
+        if (lcp == g_k3_sess.n_tokens && lcp < n_ids && !k3_images_match(g_k3_sess_img, g_k3_sess_img_n, (uint32_t)lcp)) {
             fprintf(stderr, "ds4: K3 session: the stored prompt held other images, starting over\n");
             k3_session_reset();
         } else if (lcp == g_k3_sess.n_tokens && lcp < n_ids) {
@@ -68477,7 +68489,6 @@ static int generate_k3_cuda_argmax(
     int ckpt_split = 0;
     if (k3_ckpt_max() > 0 && pos0 == 0 && !getenv("DS4_K3_NO_SESSION")) {
         const k3_ckpt *c = k3_ckpt_find(ids, n_ids, cache_cap);
-        if (c && (uint32_t)c->n > k3_images_first()) c = NULL;   /* K3.1: a saved prefix never covers an image */
         if (c) {
             if (k3_ckpt_restore(&b, c)) {
                 for (int i = 0; i < c->n; i++) k3_session_push(c->tokens[i]);
@@ -68500,10 +68511,6 @@ static int generate_k3_cuda_argmax(
             /* step 39b: at least the system message(s) of this prompt, even on the first request of a session */
             if (lcp < g_k3_sys_boundary && g_k3_sys_boundary < n_ids) lcp = g_k3_sys_boundary;
             if (lcp >= k3_ckpt_min() && lcp < n_ids) ckpt_split = lcp;
-        }
-        if (ckpt_split > 0 && (uint32_t)ckpt_split > k3_images_first()) {   /* K3.1: save only the part before the first image */
-            const uint32_t f = k3_images_first();
-            ckpt_split = f > pos0 && f >= (uint32_t)k3_ckpt_min() ? (int)f : 0;
         }
     }
     free(g_k3_prev_tokens);
@@ -68806,13 +68813,7 @@ static int generate_k3_cuda_argmax(
         g_k3_sess.cache_cap = cache_cap;
         g_k3_sess.valid = true;
         free(g_k3_sess_img);
-        g_k3_sess_img = NULL;
-        g_k3_sess_img_n = 0;
-        if (g_k3_img_n) {
-            g_k3_sess_img = xmalloc(sizeof(*g_k3_img) * (size_t)g_k3_img_n);
-            for (int i = 0; i < g_k3_img_n; i++) { g_k3_sess_img[i] = g_k3_img[i]; g_k3_sess_img[i].embeds = NULL; }
-            g_k3_sess_img_n = g_k3_img_n;
-        }
+        g_k3_sess_img = k3_images_copy(UINT32_MAX, &g_k3_sess_img_n);
     }
     return 0;
 }
