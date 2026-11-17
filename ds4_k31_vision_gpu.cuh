@@ -13,6 +13,8 @@
  * against the reference on its own; ds4_cuda.cu includes it for the K3 server. */
 #ifndef DS4_K31_VISION_GPU_CUH
 #define DS4_K31_VISION_GPU_CUH
+#include <dirent.h>
+#include <algorithm>
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -111,14 +113,18 @@ static bool k31v_upload_f32(const std::vector<std::string> &files, const char *n
 static int k31v_load(const char *dir) {
     k31v_model &m = g_k31v;
     if (m.ready) return 1;
+    /* every .safetensors file of the directory: the checkpoint's shards that hold the tower (95 and 96 of K3.1 Pro), or
+       one file with just the vision_tower.* and mm_projector.* tensors */
     std::vector<std::string> files;
-    for (int i = 1; i <= 96; i++) {
-        char p[4200];
-        snprintf(p, sizeof(p), "%s/model-%05d-of-000096.safetensors", dir, i);
-        FILE *f = fopen(p, "rb");
-        if (f) { fclose(f); files.push_back(p); }
+    if (DIR *d = opendir(dir)) {
+        while (struct dirent *de = readdir(d)) {
+            const size_t n = strlen(de->d_name);
+            if (n > 12 && !strcmp(de->d_name + n - 12, ".safetensors")) files.push_back(std::string(dir) + "/" + de->d_name);
+        }
+        closedir(d);
     }
-    if (files.empty()) { fprintf(stderr, "ds4: K3.1 vision: no checkpoint shards in %s\n", dir); return 0; }
+    std::sort(files.begin(), files.end());
+    if (files.empty()) { fprintf(stderr, "ds4: K3.1 vision: no .safetensors files in %s\n", dir); return 0; }
     bool ok = k31v_upload_bf16(files, "vision_tower.patch_embed.proj.weight", (size_t)K31V_HID * K31V_PIN, &m.patch_w) &&
               k31v_upload_bf16(files, "mm_projector.proj.0.weight", (size_t)K31V_MERGED * K31V_MERGED, &m.proj0) &&
               k31v_upload_bf16(files, "mm_projector.proj.2.weight", (size_t)K31V_OUT * K31V_MERGED, &m.proj2) &&

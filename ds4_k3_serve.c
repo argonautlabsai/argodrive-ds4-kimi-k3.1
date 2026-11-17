@@ -403,7 +403,7 @@ static void k3p_tool_declare(k3p *p, const jv *tools, bool dynamic) {
    An image part ({"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}, or "image" with the same value)
    becomes what Moonshot's encoder and the serving stacks give the model: <|media_begin|>image WxH<|media_content|>, one
    <|media_pad|> per image token, <|media_end|> (W x H as decoded). The pads' input rows are the vision tower's output
-   (ds4_k3_set_image_spans); the tower's weights come from the checkpoint shards in DS4_K31_VISION. URLs are not fetched. */
+   (ds4_k3_set_image_spans); the tower's weights come from the safetensors in DS4_K31_VISION. URLs are not fetched. */
 static uint8_t *b64_decode(const char *s, size_t *out_len) {
     static int8_t t[256];
     static bool init;
@@ -939,7 +939,7 @@ static int k3_images_encode(k3_images *images, int *status, char *err, size_t er
     const char *dir = getenv("DS4_K31_VISION");
     if (!dir || !dir[0]) {
         *status = 501;
-        snprintf(err, err_cap, "this server has no vision tower: start it with DS4_K31_VISION set to the directory of the checkpoint shards that hold it");
+        snprintf(err, err_cap, "this server has no vision tower: start it with DS4_K31_VISION set to a directory with its safetensors (the checkpoint shards that hold it, or tools/kimi-k3/k31_vision_extract.py's file)");
         return 0;
     }
     for (int i = 0; i < images->n; i++) {
