@@ -212,7 +212,11 @@ int ds4_k31_image_preprocess(ds4_k31_image_patches *out, const ds4_k31_image *im
     const uint32_t W = (uint32_t)(nw + pw), H = (uint32_t)(nh + ph);
     /* Image.resize in the image's own mode: RGBA through premultiplied RGBa (Convert.c rgbA2rgba / rgba2rgbA) */
     uint8_t *px;
-    if (image->has_alpha) {
+    if (image->has_alpha && (uint32_t)nw == w && (uint32_t)nh == h) {   /* Image.resize to the same size returns a copy */
+        px = malloc((size_t)w * h * 4);
+        if (!px) return k31i_error(error, error_cap, "out of memory");
+        memcpy(px, image->rgba, (size_t)w * h * 4);
+    } else if (image->has_alpha) {
         uint8_t *pre = malloc((size_t)w * h * 4);
         if (!pre) return k31i_error(error, error_cap, "out of memory");
         for (size_t i = 0; i < (size_t)w * h; i++) {
@@ -237,6 +241,11 @@ int ds4_k31_image_preprocess(ds4_k31_image_patches *out, const ds4_k31_image *im
                     d[ch] = (uint8_t)(v <= 0 ? 0 : v < 256 ? v : 255);
                 }
         }
+    } else {
+        px = k31i_resize(image->rgba, (int)w, (int)h, (int)nw, (int)nh, 3);
+        if (!px) return k31i_error(error, error_cap, "out of memory");
+    }
+    if (image->has_alpha) {
         /* fill_transparent_bg_with, chessboard after the resize: float32 blend, truncated as numpy's astype(uint8) */
         for (long y = 0; y < nh; y++)
             for (long x = 0; x < nw; x++) {
@@ -250,9 +259,6 @@ int ds4_k31_image_preprocess(ds4_k31_image_patches *out, const ds4_k31_image *im
                     d[ch] = (uint8_t)(fg + back);
                 }
             }
-    } else {
-        px = k31i_resize(image->rgba, (int)w, (int)h, (int)nw, (int)nh, 3);
-        if (!px) return k31i_error(error, error_cap, "out of memory");
     }
     /* zero padding, (v / 255 - 0.5) * 2 rounded as numpy does it, 14x14 patches (channel, row, column) */
     const uint32_t gw = W / K31I_PATCH, gh = H / K31I_PATCH;
