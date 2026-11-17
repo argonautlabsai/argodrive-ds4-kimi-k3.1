@@ -28,6 +28,7 @@ static void sb_reserve(sbuf *b, size_t extra) {
     b->p = realloc(b->p, cap);
     if (!b->p) { fprintf(stderr, "ds4: K3 serve: out of memory\n"); exit(1); }
     b->cap = cap;
+    b->p[b->len] = 0;   /* a reserved buffer is a string before anything is written: jp_string returns it for "" */
 }
 static void sb_putn(sbuf *b, const char *s, size_t n) { sb_reserve(b, n); memcpy(b->p + b->len, s, n); b->len += n; b->p[b->len] = 0; }
 static void sb_puts(sbuf *b, const char *s) { sb_putn(b, s, strlen(s)); }
