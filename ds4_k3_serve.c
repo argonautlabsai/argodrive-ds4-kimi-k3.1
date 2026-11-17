@@ -43,6 +43,26 @@ static void sb_put_utf8(sbuf *b, unsigned cp) {
     else { u[n++] = (char)(0xF0 | (cp >> 18)); u[n++] = (char)(0x80 | ((cp >> 12) & 0x3F)); u[n++] = (char)(0x80 | ((cp >> 6) & 0x3F)); u[n++] = (char)(0x80 | (cp & 0x3F)); }
     sb_putn(b, u, (size_t)n);
 }
+/* the well-formed UTF-8 sequence at s (n bytes left): its length, or minus the length of the maximal subpart that one
+   U+FFFD replaces (Unicode's recommended practice, as Python's errors="replace" decodes) */
+static int utf8_seq(const unsigned char *s, size_t n) {
+    const unsigned char c = s[0];
+    int len;
+    unsigned char lo = 0x80, hi = 0xBF;   /* the second byte's range */
+    if (c < 0x80) return 1;
+    if (c >= 0xC2 && c <= 0xDF) len = 2;
+    else if (c >= 0xE0 && c <= 0xEF) { len = 3; if (c == 0xE0) lo = 0xA0; else if (c == 0xED) hi = 0x9F; }
+    else if (c >= 0xF0 && c <= 0xF4) { len = 4; if (c == 0xF0) lo = 0x90; else if (c == 0xF4) hi = 0x8F; }
+    else return -1;
+    int i = 1;
+    for (; i < len && (size_t)i < n; i++) {
+        const unsigned char d = s[i];
+        if (d < (i == 1 ? lo : 0x80) || d > (i == 1 ? hi : 0xBF)) break;
+    }
+    return i == len ? len : -i;
+}
+/* a JSON string; bytes that are not well-formed UTF-8 (a token cut inside a character, at the end of an answer) become
+   U+FFFD, as a UTF-8 decoder with errors="replace" gives them, so the response stays valid JSON */
 static void sb_put_json_string(sbuf *b, const char *s, size_t n) {
     sb_putc(b, '"');
     for (size_t i = 0; i < n; i++) {
@@ -55,7 +75,12 @@ static void sb_put_json_string(sbuf *b, const char *s, size_t n) {
         case '\t': sb_puts(b, "\\t"); break;
         default:
             if (c < 0x20) { char esc[8]; snprintf(esc, sizeof(esc), "\\u%04x", c); sb_puts(b, esc); }
-            else sb_putc(b, (char)c);
+            else if (c < 0x80) sb_putc(b, (char)c);
+            else {
+                const int len = utf8_seq((const unsigned char *)s + i, n - i);
+                if (len > 0) { sb_putn(b, s + i, (size_t)len); i += (size_t)len - 1; }
+                else { sb_puts(b, "\\ufffd"); i += (size_t)-len - 1; }
+            }
         }
     }
     sb_putc(b, '"');
