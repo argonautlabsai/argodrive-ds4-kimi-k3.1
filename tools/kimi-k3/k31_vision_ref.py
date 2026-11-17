@@ -172,12 +172,17 @@ def main():
     ap.add_argument("--shards", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--threads", type=int, default=8)
+    ap.add_argument("--preprocess-only", action="store_true", help="write PREFIX.patches.f32 and stop")
     ap.add_argument("image")
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
+    patches, grid, size, pixels = preprocess(args.image)
+    if args.preprocess_only:
+        patches.astype(np.float32).tofile(args.out + ".patches.f32")
+        print(f"{args.image}: {size[0]}x{size[1]} -> grid {grid}, {grid[1] * grid[2] // 4} image tokens -> {args.out}.patches.f32")
+        return
     W = load_tensors(args.shards)
     assert len(W) == 168, len(W)
-    patches, grid, size, pixels = preprocess(args.image)
     emb, ck = forward(W, patches, grid)
     np.savez(args.out + ".npz", embeds=emb.numpy(), patches=patches, grid=np.array(grid), size=np.array(size),
              **{k: v.numpy() for k, v in ck.items()})
