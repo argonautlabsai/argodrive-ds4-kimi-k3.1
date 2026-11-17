@@ -21,6 +21,21 @@ static int k31i_error(char *error, size_t cap, const char *msg) {
     return 0;
 }
 
+/* the PNG facts Pillow acts on that the decoder does not report: a palette image, a gray image's tRNS colour key */
+static void k31i_png_info(const uint8_t *p, size_t len, ds4_k31_image *out) {
+    int color_type = -1;
+    for (size_t at = 8; at + 12 <= len;) {
+        const uint32_t n = (uint32_t)p[at] << 24 | (uint32_t)p[at + 1] << 16 | (uint32_t)p[at + 2] << 8 | (uint32_t)p[at + 3];
+        if (n > len - at - 12) break;
+        const uint8_t *type = p + at + 4, *data = p + at + 8;
+        if (!memcmp(type, "IHDR", 4) && n >= 13) color_type = data[9];
+        else if (!memcmp(type, "tRNS", 4) && color_type == 0 && n == 2) { out->has_key = 1; out->key = (uint16_t)(data[0] << 8 | data[1]); }
+        else if (!memcmp(type, "IDAT", 4) || !memcmp(type, "IEND", 4)) break;   /* tRNS comes before the data */
+        at += 12 + (size_t)n;
+    }
+    out->palette = color_type == 3;
+}
+
 int ds4_k31_image_decode(ds4_k31_image *out, const uint8_t *encoded, size_t len, char *error, size_t error_cap) {
     if (!out) return 0;
     memset(out, 0, sizeof(*out));
@@ -53,6 +68,7 @@ int ds4_k31_image_decode(ds4_k31_image *out, const uint8_t *encoded, size_t len,
             else { q[0] = p[0]; q[1] = p[1]; q[2] = p[2]; q[3] = c == 4 ? p[3] : 255; }
         }
         out->width = (uint32_t)w; out->height = (uint32_t)h; out->has_alpha = c == 2 || c == 4;
+        if (png) k31i_png_info(encoded, len, out);
     }
     if (png) png_free(png);
     if (jpg) jpeg_free(jpg);
@@ -160,11 +176,12 @@ static void k31i_vertical(uint8_t *out, const uint8_t *in, int w, int oh, int nc
     }
 }
 
-/* Image.resize((ow, oh), BICUBIC) on [ih][iw][4]; nch 4 for RGBa (premultiplied), 3 for RGB. Pillow runs the
-   horizontal pass first unless the height shrinks by more than twice what the width does. */
-static uint8_t *k31i_resize(const uint8_t *in, int iw, int ih, int ow, int oh, int nch) {
+/* Image.resize((ow, oh), BICUBIC) on [ih][iw][4]; nch 4 for RGBa (premultiplied), 3 for RGB. Pillow 13 runs the
+   horizontal pass first unless the height shrinks by more than twice what the width does; Pillow 12 runs it first
+   unless the image is over 100 times taller than wide and its height shrinks (Image.resize's two-step path). */
+static uint8_t *k31i_resize(const uint8_t *in, int iw, int ih, int ow, int oh, int nch, int pillow12) {
     const int need_h = ow != iw, need_v = oh != ih;
-    const int horizontal_first = !((ih - oh) > 0 && (ih - oh) > (iw - ow) * 2);
+    const int horizontal_first = pillow12 ? !(ih > iw * 100 && oh < ih) : !((ih - oh) > 0 && (ih - oh) > (iw - ow) * 2);
     uint8_t *cur = malloc((size_t)iw * ih * 4);
     if (!cur) return NULL;
     memcpy(cur, in, (size_t)iw * ih * 4);
@@ -190,6 +207,26 @@ static uint8_t *k31i_resize(const uint8_t *in, int iw, int ih, int ow, int oh, i
     return cur;
 }
 
+/* Image.resize of a palette image: Pillow switches to NEAREST, an affine scale (Geometry.c ImagingScaleAffine) with the
+   source positions accumulated in double from a = box size / output size; [ih][iw][4] -> [oh][ow][4] */
+static uint8_t *k31i_nearest(const uint8_t *in, int iw, int ih, int ow, int oh) {
+    uint8_t *out = calloc((size_t)ow * oh, 4);
+    int *xin = malloc(sizeof(int) * (size_t)ow);
+    if (!out || !xin) { free(out); free(xin); return NULL; }
+    const double a0 = (double)((float)iw - 0.0f) / ow, a4 = (double)((float)ih - 0.0f) / oh;
+    double xo = 0.0 + a0 * 0.5, yo = 0.0 + a4 * 0.5;
+    for (int x = 0; x < ow; x++) { xin[x] = xo < 0.0 ? -1 : (int)xo; xo += a0; }
+    for (int y = 0; y < oh; y++) {
+        const int yi = yo < 0.0 ? -1 : (int)yo;
+        if (yi >= 0 && yi < ih)
+            for (int x = 0; x < ow; x++)
+                if (xin[x] >= 0 && xin[x] < iw) memcpy(out + ((size_t)y * ow + x) * 4, in + ((size_t)yi * iw + xin[x]) * 4, 4);
+        yo += a4;
+    }
+    free(xin);
+    return out;
+}
+
 /* ---- the preprocessing ---- */
 int ds4_k31_image_preprocess(ds4_k31_image_patches *out, const ds4_k31_image *image, char *error, size_t error_cap) {
     if (!out) return 0;
@@ -210,13 +247,21 @@ int ds4_k31_image_preprocess(ds4_k31_image_patches *out, const ds4_k31_image *im
     if (nh > K31I_ONE_SIDE * K31I_PATCH) nh = K31I_ONE_SIDE * K31I_PATCH;
     const long pw = (K31I_FACTOR - nw % K31I_FACTOR) % K31I_FACTOR, ph = (K31I_FACTOR - nh % K31I_FACTOR) % K31I_FACTOR;
     const uint32_t W = (uint32_t)(nw + pw), H = (uint32_t)(nh + ph);
-    /* Image.resize in the image's own mode: RGBA through premultiplied RGBa (Convert.c rgbA2rgba / rgba2rgbA) */
+    const char *pv = getenv("DS4_K31_PILLOW"), *cv = getenv("DS4_K31_IMAGE_COMPAT");
+    const int vllm = cv && !strcmp(cv, "vllm");                      /* RGB on load: no alpha, palette or key */
+    const int pillow12 = pv && !strcmp(pv, "12");
+    const int alpha = !vllm && image->has_alpha, palette = !vllm && image->palette, key = !vllm && image->has_key;
+    /* Image.resize in the image's own mode: RGBA and LA through premultiplied RGBa / La (Convert.c), palette images
+       nearest neighbour */
     uint8_t *px;
-    if (image->has_alpha && (uint32_t)nw == w && (uint32_t)nh == h) {   /* Image.resize to the same size returns a copy */
+    if ((uint32_t)nw == w && (uint32_t)nh == h) {   /* Image.resize to the same size returns a copy */
         px = malloc((size_t)w * h * 4);
         if (!px) return k31i_error(error, error_cap, "out of memory");
         memcpy(px, image->rgba, (size_t)w * h * 4);
-    } else if (image->has_alpha) {
+    } else if (palette) {
+        px = k31i_nearest(image->rgba, (int)w, (int)h, (int)nw, (int)nh);
+        if (!px) return k31i_error(error, error_cap, "out of memory");
+    } else if (alpha) {
         uint8_t *pre = malloc((size_t)w * h * 4);
         if (!pre) return k31i_error(error, error_cap, "out of memory");
         for (size_t i = 0; i < (size_t)w * h; i++) {
@@ -229,7 +274,7 @@ int ds4_k31_image_preprocess(ds4_k31_image_patches *out, const ds4_k31_image *im
             }
             d[3] = (uint8_t)a;
         }
-        px = k31i_resize(pre, (int)w, (int)h, (int)nw, (int)nh, 4);
+        px = k31i_resize(pre, (int)w, (int)h, (int)nw, (int)nh, 4, pillow12);
         free(pre);
         if (!px) return k31i_error(error, error_cap, "out of memory");
         for (size_t i = 0; i < (size_t)nw * nh; i++) {
@@ -242,10 +287,12 @@ int ds4_k31_image_preprocess(ds4_k31_image_patches *out, const ds4_k31_image *im
                 }
         }
     } else {
-        px = k31i_resize(image->rgba, (int)w, (int)h, (int)nw, (int)nh, 3);
+        px = k31i_resize(image->rgba, (int)w, (int)h, (int)nw, (int)nh, 3, pillow12);
         if (!px) return k31i_error(error, error_cap, "out of memory");
     }
-    if (image->has_alpha) {
+    if (key)   /* a gray image's colour key, applied by convert("RGBA") after the resize: that value is transparent */
+        for (size_t i = 0; i < (size_t)nw * nh; i++) px[i * 4 + 3] = px[i * 4] == image->key ? 0 : 255;
+    if (alpha || key) {
         /* fill_transparent_bg_with, chessboard after the resize: float32 blend, truncated as numpy's astype(uint8) */
         for (long y = 0; y < nh; y++)
             for (long x = 0; x < nw; x++) {

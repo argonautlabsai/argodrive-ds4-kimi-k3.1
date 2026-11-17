@@ -87,11 +87,15 @@ def chessboard_fill(img):
     return Image.fromarray(out.astype(np.uint8))
 
 
-def preprocess(path):
+def preprocess(path, compat="moonshot"):
     """KimiK3VisionProcessor.preprocess for one image: the image as opened (no EXIF rotation), resized in its own
-    mode by PIL bicubic, the transparent background filled after the resize, zero padding, normalisation, patches"""
+    mode by PIL bicubic (Pillow itself switches palette images to nearest), the transparent background filled after
+    the resize, zero padding, normalisation, patches. compat "vllm": vLLM's fused Kimi processor, which converts every
+    image to RGB on load (alpha dropped, no chessboard) before the same resize and normalisation."""
     img = Image.open(path)
     img.load()
+    if compat == "vllm":
+        img = img.convert("RGB")
     w, h = img.size
     new_w, new_h, pad_w, pad_h = navit_resize(w, h)
     img = img.resize((new_w, new_h), resample=Image.Resampling.BICUBIC)
@@ -173,10 +177,11 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--preprocess-only", action="store_true", help="write PREFIX.patches.f32 and stop")
+    ap.add_argument("--compat", choices=["moonshot", "vllm"], default="moonshot")
     ap.add_argument("image")
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
-    patches, grid, size, pixels = preprocess(args.image)
+    patches, grid, size, pixels = preprocess(args.image, args.compat)
     if args.preprocess_only:
         patches.astype(np.float32).tofile(args.out + ".patches.f32")
         print(f"{args.image}: {size[0]}x{size[1]} -> grid {grid}, {grid[1] * grid[2] // 4} image tokens -> {args.out}.patches.f32")
