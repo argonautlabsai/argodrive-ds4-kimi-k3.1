@@ -377,6 +377,14 @@ void ds4_k3_set_tools_mode(int on);   /* 1: generation runs past the response bl
 int ds4_k3_response_closed(void);     /* tools mode: 1 once the response block closed; later tokens are emitted raw */
 int ds4_k3_special_id(ds4_engine *e, const char *spelling);   /* vocabulary id of a K3 control spelling, -1 if absent */
 void ds4_k3_note_prefix_boundary(int n_tokens);   /* step 39b: the next K3 run may checkpoint after its first n prompt tokens (0: none) */
+/* K3.1 images: prompt positions [pos, pos + n) take these input rows (n x 7168 floats, the vision tower's output) instead
+   of their token embeddings; hash identifies the image, so a later request reuses state only with the same images.
+   Set by the server for one request (the engine copies the list, not the rows), cleared with (NULL, 0). */
+typedef struct { uint32_t pos, n; const float *embeds; uint64_t hash; } ds4_k3_image_span;
+void ds4_k3_set_image_spans(const ds4_k3_image_span *spans, int n);
+/* the K3.1 vision tower: patches from ds4_k31_image_preprocess [gh*gw][588] -> out [(gh/2)*(gw/2)][7168]; dir holds the
+   checkpoint shards with the vision_tower.* and mm_projector.* tensors. Returns 1 on success (CUDA builds only). */
+int ds4_k31_vision_encode(const char *dir, const float *patches, uint32_t gh, uint32_t gw, float *out);
 /* Minimal OpenAI-compatible endpoint for K3 (ds4_k3_serve.c): one request at a time, greedy. Returns on error. */
 int ds4_k3_serve(ds4_engine *e, const char *host, int port, int ctx_size, int default_max_tokens);
 void ds4_tokens_copy(ds4_tokens *dst, const ds4_tokens *src);

@@ -4066,6 +4066,8 @@ int ds4_gpu_k3_moe_raw_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, cons
 void ds4_gpu_k3_moe_raw_stats(double *wait_s, uint64_t *bytes);
 int ds4_gpu_k3_cache_grow(void);
 uint64_t ds4_gpu_k3_cache_lend(void);
+/* K3.1 vision tower (ds4_k31_vision.cu): patches [gh*gw][588] -> out [(gh/2)*(gw/2)][7168]; 1 on success */
+int ds4_gpu_k31_vision_encode(const char *dir, const float *patches, uint32_t gh, uint32_t gw, float *out);
 uint32_t ds4_gpu_k3_attn_max_pos(void);
 uint64_t ds4_gpu_k3_attn_scratch_need(uint32_t n_tok, uint32_t n_cols, uint32_t heads);   /* step 103: GEMM attention scratch growth */   /* step 99: positions the K3 attention kernels take (shared memory opt-in limit) */   /* step 97: frees the grown region for a prompt pass; returns the bytes freed */
 uint64_t ds4_gpu_k3_pass_scratch_need(uint32_t n_tok, uint32_t n_used, uint32_t ff, uint32_t latent);   /* step 97 */   /* sizes the device expert cache from free VRAM; call after the first full forward */

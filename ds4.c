@@ -48955,6 +48955,32 @@ int ds4_k3_special_id(ds4_engine *e, const char *spelling) {
    prompt pass can checkpoint there on the first request of a session; 0 when the prompt did not come through here */
 static int g_k3_sys_boundary = 0;
 void ds4_k3_note_prefix_boundary(int n_tokens) { g_k3_sys_boundary = n_tokens > 0 ? n_tokens : 0; }
+static ds4_k3_image_span *g_k3_img;   /* this request's image spans (17 Nov 2026) */
+static int g_k3_img_n;
+void ds4_k3_set_image_spans(const ds4_k3_image_span *spans, int n) {
+    free(g_k3_img);
+    g_k3_img = NULL;
+    g_k3_img_n = 0;
+    if (spans && n > 0) {
+        g_k3_img = xmalloc(sizeof(*spans) * (size_t)n);
+        memcpy(g_k3_img, spans, sizeof(*spans) * (size_t)n);
+        g_k3_img_n = n;
+    }
+}
+int ds4_k31_vision_encode(const char *dir, const float *patches, uint32_t gh, uint32_t gw, float *out) {
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    return ds4_gpu_k31_vision_encode(dir, patches, gh, gw, out);
+#else
+    (void)dir; (void)patches; (void)gh; (void)gw; (void)out;
+    fprintf(stderr, "ds4: the K3.1 vision tower needs the CUDA build\n");
+    return 0;
+#endif
+}
+static uint32_t k3_images_first(void) {   /* the first image position of this request (UINT32_MAX: none) */
+    uint32_t f = UINT32_MAX;
+    for (int i = 0; i < g_k3_img_n; i++) if (g_k3_img[i].pos < f) f = g_k3_img[i].pos;
+    return f;
+}
 int ds4_k3_chat_prompt(ds4_engine *e, const char *const *roles, const char *const *contents, int n, int thinking,
                        ds4_tokens *out) {
     if (!e || !out || !ds4_model_is_kimi_k3()) return 0;
@@ -66703,6 +66729,24 @@ static uint32_t g_k3_prefill_end = 0;   /* step 95: where the whole prompt pass 
 /* step 53: the batch buffers take ~2.1 MB per prompt token; a pass that would not fit the free VRAM (less a 1 GB margin)
    runs in chunks that do (DS4_K3_PREFILL_CHUNK forces a chunk size). Chunks re-read the layers' expert unions, so this is
    the fallback, not the normal path. */
+/* K3.1 images: the rows of positions [pos0, pos0 + T) that lie in an image span become the vision tower's embeddings */
+static bool k3_images_apply(ds4_gpu_tensor *cur, uint32_t pos0, uint32_t T) {
+    const uint32_t n = DS4_N_EMBD;
+    if (n != 7168u) { fprintf(stderr, "ds4: K3 image rows are 7168 wide, this model's are %u\n", n); return false; }
+    for (int i = 0; i < g_k3_img_n; i++) {
+        const ds4_k3_image_span *sp = &g_k3_img[i];
+        const uint32_t a = sp->pos > pos0 ? sp->pos : pos0;
+        const uint32_t b = sp->pos + sp->n < pos0 + T ? sp->pos + sp->n : pos0 + T;
+        if (a >= b) continue;
+        if (ds4_gpu_tensor_write(cur, (uint64_t)(a - pos0) * n * sizeof(float), sp->embeds + (size_t)(a - sp->pos) * n,
+                                 (uint64_t)(b - a) * n * sizeof(float)) == 0) {
+            fprintf(stderr, "ds4: K3 image rows %u-%u could not be written\n", a, b);
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool k3_gpu_prefill(k3_gpu_buffers *b, const ds4_model *model, const ds4_vocab *vocab, const ds4_weights *weights,
                            const int *ids, uint32_t T, uint32_t pos0, uint32_t *n_anchor_out, uint32_t ckpt_row, float **ck_conv, float **ck_state) {
     uint32_t chunk = T;
@@ -66770,6 +66814,7 @@ static int k3_gpu_prefill_one(k3_gpu_buffers *b, const ds4_model *model, const d
     if (ok) ok = ds4_gpu_embed_tokens_quant_tensor(bb.cur, bb.tokens, model->map, model->size, weights->token_embd->abs_offset,
                                                    weights->token_embd->type, DS4_N_VOCAB, T, n) != 0;
     if (!ok) fprintf(stderr, "ds4: K3 batched embedding failed\n");
+    if (ok && g_k3_img_n) ok = k3_images_apply(bb.cur, pos0, T);
     uint32_t n_anchor = 0;
     const bool trace = getenv("DS4_K3_TRACE_LAYERS") != NULL;
     k3_rows_begin(T, n);
@@ -67024,10 +67069,34 @@ static struct {
     int n_tokens, cap_tokens;
 } g_k3_sess;
 
+static ds4_k3_image_span *g_k3_sess_img;   /* the images the stored session ran with (positions, sizes, hashes) */
+static int g_k3_sess_img_n;
 static void k3_session_reset(void) {
     if (g_k3_sess.valid) k3_gpu_buffers_free(&g_k3_sess.b);
     free(g_k3_sess.tokens);
     memset(&g_k3_sess, 0, sizeof(g_k3_sess));
+    free(g_k3_sess_img);
+    g_k3_sess_img = NULL;
+    g_k3_sess_img_n = 0;
+}
+/* the stored session's first n tokens may be reused only if the images among them are this request's, in the same places */
+static bool k3_session_images_match(uint32_t n) {
+    for (int i = 0; i < g_k3_sess_img_n; i++) {
+        const ds4_k3_image_span *s0 = &g_k3_sess_img[i];
+        if (s0->pos >= n) continue;
+        bool found = false;
+        for (int j = 0; j < g_k3_img_n && !found; j++)
+            found = g_k3_img[j].pos == s0->pos && g_k3_img[j].n == s0->n && g_k3_img[j].hash == s0->hash;
+        if (!found) return false;
+    }
+    for (int j = 0; j < g_k3_img_n; j++) {
+        if (g_k3_img[j].pos >= n) continue;
+        bool found = false;
+        for (int i = 0; i < g_k3_sess_img_n && !found; i++)
+            found = g_k3_sess_img[i].pos == g_k3_img[j].pos && g_k3_sess_img[i].n == g_k3_img[j].n && g_k3_sess_img[i].hash == g_k3_img[j].hash;
+        if (!found) return false;
+    }
+    return true;
 }
 
 static void k3_session_push(int token) {
@@ -67789,6 +67858,7 @@ static void k3_qwen_push(int id) {
 static void k3_qwen_begin(const ds4_vocab *vocab, const int *ids, int n_ids) {
     g_k3_qwen.active = false;
     if (!k3_qwen_start()) return;
+    if (g_k3_img_n) { fprintf(stderr, "ds4: K3 Qwen: the prompt holds images; plain decode for this request\n"); return; }
     if (g_k3_sampling.temperature > 0.0f) { fprintf(stderr, "ds4: K3 Qwen: greedy decoding only; plain decode for this request\n"); return; }
     if (g_k3_blocks.enabled && !getenv("DS4_K3_QWEN_CHAT")) return;
     const int id_open = vocab_lookup_optional(vocab, "<|open|>");
@@ -68293,7 +68363,10 @@ static int generate_k3_cuda_argmax(
     if (g_k3_sess.valid && g_k3_sess.cache_cap == cache_cap && !getenv("DS4_K3_NO_SESSION")) {
         int lcp = 0;
         while (lcp < g_k3_sess.n_tokens && lcp < n_ids && g_k3_sess.tokens[lcp] == ids[lcp]) lcp++;
-        if (lcp == g_k3_sess.n_tokens && lcp < n_ids) {
+        if (lcp == g_k3_sess.n_tokens && lcp < n_ids && !k3_session_images_match((uint32_t)lcp)) {
+            fprintf(stderr, "ds4: K3 session: the stored prompt held other images, starting over\n");
+            k3_session_reset();
+        } else if (lcp == g_k3_sess.n_tokens && lcp < n_ids) {
             pos0 = (uint32_t)lcp;
             fprintf(stderr, "ds4: K3 session: %d of %d prompt tokens already processed, prefilling %d\n", lcp, n_ids,
                     n_ids - lcp);
@@ -68404,6 +68477,7 @@ static int generate_k3_cuda_argmax(
     int ckpt_split = 0;
     if (k3_ckpt_max() > 0 && pos0 == 0 && !getenv("DS4_K3_NO_SESSION")) {
         const k3_ckpt *c = k3_ckpt_find(ids, n_ids, cache_cap);
+        if (c && (uint32_t)c->n > k3_images_first()) c = NULL;   /* K3.1: a saved prefix never covers an image */
         if (c) {
             if (k3_ckpt_restore(&b, c)) {
                 for (int i = 0; i < c->n; i++) k3_session_push(c->tokens[i]);
@@ -68427,6 +68501,10 @@ static int generate_k3_cuda_argmax(
             if (lcp < g_k3_sys_boundary && g_k3_sys_boundary < n_ids) lcp = g_k3_sys_boundary;
             if (lcp >= k3_ckpt_min() && lcp < n_ids) ckpt_split = lcp;
         }
+        if (ckpt_split > 0 && (uint32_t)ckpt_split > k3_images_first()) {   /* K3.1: save only the part before the first image */
+            const uint32_t f = k3_images_first();
+            ckpt_split = f > pos0 && f >= (uint32_t)k3_ckpt_min() ? (int)f : 0;
+        }
     }
     free(g_k3_prev_tokens);
     g_k3_prev_tokens = xmalloc(sizeof(int) * (size_t)n_ids); memcpy(g_k3_prev_tokens, ids, sizeof(int) * (size_t)n_ids); g_k3_prev_n = n_ids;
@@ -68435,7 +68513,8 @@ static int generate_k3_cuda_argmax(
     g_k3_draft.active = false;
     g_k3_draft_cache_cap = cache_cap;
     if (g_k3_split_cut <= 0 && k3_draft_start()) {   /* step 146: the DSpark drafter stays a one-card option */
-        if (k3_draft_truncate(pos0) && g_k3_draft.len == pos0) g_k3_draft.active = true;
+        if (g_k3_img_n) fprintf(stderr, "ds4: K3 drafter: the prompt holds images: drafting off for this request\n");
+        else if (k3_draft_truncate(pos0) && g_k3_draft.len == pos0) g_k3_draft.active = true;
         else fprintf(stderr, "ds4: K3 drafter: sidecar holds %u rows, the request starts at %u: drafting off for this request\n", g_k3_draft.len, pos0);
     }
     k3_qwen_begin(vocab, ids, n_ids);   /* step 79 */
@@ -68502,6 +68581,7 @@ static int generate_k3_cuda_argmax(
             ok = ds4_gpu_tensor_write(b.tokens, 0, &tok32, sizeof(tok32)) != 0;
             if (ok) ok = ds4_gpu_embed_tokens_quant_tensor(b.cur, b.tokens, model->map, model->size,
                          weights->token_embd->abs_offset, weights->token_embd->type, DS4_N_VOCAB, 1, n) != 0;
+            if (ok && g_k3_img_n) ok = k3_images_apply(b.cur, pos, 1u);
             if (!ok) { fprintf(stderr, "ds4: K3 embedding failed\n"); break; }
             k3_rows_begin(1u, n);
             for (uint32_t il = 0; il < L && ok; il++) {
@@ -68725,6 +68805,14 @@ static int generate_k3_cuda_argmax(
         g_k3_sess.b = b;
         g_k3_sess.cache_cap = cache_cap;
         g_k3_sess.valid = true;
+        free(g_k3_sess_img);
+        g_k3_sess_img = NULL;
+        g_k3_sess_img_n = 0;
+        if (g_k3_img_n) {
+            g_k3_sess_img = xmalloc(sizeof(*g_k3_img) * (size_t)g_k3_img_n);
+            for (int i = 0; i < g_k3_img_n; i++) { g_k3_sess_img[i] = g_k3_img[i]; g_k3_sess_img[i].embeds = NULL; }
+            g_k3_sess_img_n = g_k3_img_n;
+        }
     }
     return 0;
 }

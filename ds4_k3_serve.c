@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "ds4.h"
+#include "ds4_k31_image.h"
 
 /* ------------------------------------------------------------------ growable string */
 typedef struct { char *p; size_t len, cap; } sbuf;
@@ -338,11 +339,22 @@ static bool jv_truthy(const jv *v) {
 /* ------------------------------------------------------------------ K3 prompt builder (deltafin chat.rs rules)
    Control tokens are pushed by id; every other fragment is tokenized on its own, as deltafin encodes its segments:
    the tag, then " key", "=\"", the escaped value and "\"" per attribute. */
-typedef struct { ds4_engine *e; ds4_tokens *out; int id_open, id_close, id_sep, id_eom; } k3p;
+typedef struct {
+    uint32_t pos, n, gh, gw;   /* prompt positions [pos, pos + n) are the image's pads; gh x gw patches */
+    uint64_t hash;
+    float *patches;            /* until encoded */
+    float *embeds;             /* n x 7168, the vision tower's output */
+} k3_image;
+typedef struct { k3_image *v; int n; } k3_images;
+typedef struct {
+    ds4_engine *e; ds4_tokens *out; int id_open, id_close, id_sep, id_eom;
+    k3_images *images; char err[256];
+} k3p;
 static void k3p_init(k3p *p, ds4_engine *e, ds4_tokens *out) {
     p->e = e; p->out = out;
     p->id_open = ds4_k3_special_id(e, "<|open|>"); p->id_close = ds4_k3_special_id(e, "<|close|>");
     p->id_sep = ds4_k3_special_id(e, "<|sep|>"); p->id_eom = ds4_k3_special_id(e, "<|end_of_msg|>");
+    p->images = NULL; p->err[0] = 0;
 }
 static void k3p_text(k3p *p, const char *s) { if (s && s[0]) ds4_tokenize_text(p->e, s, p->out); }
 static void k3p_control(k3p *p, int id, const char *spelling) { if (id >= 0) ds4_tokens_push(p->out, id); else k3p_text(p, spelling); }
@@ -387,22 +399,118 @@ static void k3p_tool_declare(k3p *p, const jv *tools, bool dynamic) {
     k3p_system(p, "tool-declare", body.p);
     sb_free(&body);
 }
-static char *content_text(const jv *content) {
-    /* a string, or OpenAI content parts [{"type":"text","text":...}]; other values are rendered as JSON */
-    sbuf b = {0};
-    sb_reserve(&b, 16);
-    if (!content || content->type == JV_NULL) return b.p;
-    if (content->type == JV_STR) { sb_puts(&b, content->str); return b.p; }
+/* ------------------------------------------------------------------ K3.1 images (17 Nov 2026)
+   An image part ({"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}, or "image" with the same value)
+   becomes what Moonshot's encoder and the serving stacks give the model: <|media_begin|>image WxH<|media_content|>, one
+   <|media_pad|> per image token, <|media_end|> (W x H as decoded). The pads' input rows are the vision tower's output
+   (ds4_k3_set_image_spans); the tower's weights come from the checkpoint shards in DS4_K31_VISION. URLs are not fetched. */
+static uint8_t *b64_decode(const char *s, size_t *out_len) {
+    static int8_t t[256];
+    static bool init;
+    if (!init) {
+        memset(t, -1, sizeof(t));
+        const char *a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (int i = 0; i < 64; i++) t[(unsigned char)a[i]] = (int8_t)i;
+        t['-'] = 62; t['_'] = 63;   /* the URL-safe alphabet too */
+        init = true;
+    }
+    const size_t n = strlen(s);
+    uint8_t *out = malloc(n / 4 * 3 + 4);
+    if (!out) return NULL;
+    uint32_t acc = 0;
+    int bits = 0;
+    size_t o = 0;
+    for (size_t i = 0; i < n; i++) {
+        const unsigned char c = (unsigned char)s[i];
+        if (c == '=') break;
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') continue;
+        if (t[c] < 0) { free(out); return NULL; }
+        acc = (acc << 6) | (uint32_t)t[c];
+        bits += 6;
+        if (bits >= 8) { bits -= 8; out[o++] = (uint8_t)(acc >> bits); }
+    }
+    *out_len = o;
+    return out;
+}
+/* identifies an image by its patches (what the tower sees), for the image cache and the engine's state reuse */
+static uint64_t k3_image_hash(const float *patches, size_t n_floats, uint32_t gh, uint32_t gw) {
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ ((uint64_t)gh << 32 | gw) ^ (uint64_t)n_floats * 0xC2B2AE3D27D4EB4Full;
+    size_t i = 0;
+    for (; i + 2 <= n_floats; i += 2) {
+        uint64_t w;
+        memcpy(&w, patches + i, 8);
+        h ^= w * 0x87C37B91114253D5ull;
+        h = (h << 31 | h >> 33) * 0x4CF5AD432745937Full;
+    }
+    if (i < n_floats) { uint32_t w; memcpy(&w, patches + i, 4); h ^= (uint64_t)w * 0x87C37B91114253D5ull; }
+    h ^= h >> 33; h *= 0xFF51AFD7ED558CCDull; h ^= h >> 33; h *= 0xC4CEB9FE1A85EC53ull; h ^= h >> 33;
+    return h;
+}
+static void k3p_image(k3p *p, const jv *part) {
+    if (p->err[0]) return;
+    if (!p->images) { snprintf(p->err, sizeof(p->err), "images are not accepted here"); return; }
+    const int id_begin = ds4_k3_special_id(p->e, "<|media_begin|>"), id_content = ds4_k3_special_id(p->e, "<|media_content|>");
+    const int id_pad = ds4_k3_special_id(p->e, "<|media_pad|>"), id_end = ds4_k3_special_id(p->e, "<|media_end|>");
+    if (id_begin < 0 || id_content < 0 || id_pad < 0 || id_end < 0) { snprintf(p->err, sizeof(p->err), "this vocabulary has no media tokens"); return; }
+    const jv *t = jv_get(part, "type");
+    const jv *v = jv_get(part, t && t->type == JV_STR && !strcmp(t->str, "image") ? "image" : "image_url");
+    if (v && v->type == JV_OBJ) v = jv_get(v, "url");
+    if (!v || v->type != JV_STR || !v->str[0]) { snprintf(p->err, sizeof(p->err), "an image part needs image_url.url, a data: URL"); return; }
+    const char *b64 = v->str;
+    if (!strncmp(b64, "data:", 5)) {
+        const char *c = strstr(b64, ";base64,");
+        if (!c) { snprintf(p->err, sizeof(p->err), "image data: URLs must be base64"); return; }
+        b64 = c + 8;
+    } else if (strstr(b64, "://")) {
+        snprintf(p->err, sizeof(p->err), "this server does not fetch image URLs: send the image as a data: URL");
+        return;
+    }
+    size_t len = 0;
+    uint8_t *bytes = b64_decode(b64, &len);
+    if (!bytes) { snprintf(p->err, sizeof(p->err), "image %d: the base64 data does not decode", p->images->n + 1); return; }
+    char msg[160] = "";
+    ds4_k31_image img;
+    ds4_k31_image_patches pt;
+    const int ok = ds4_k31_image_decode(&img, bytes, len, msg, sizeof(msg)) && ds4_k31_image_preprocess(&pt, &img, msg, sizeof(msg));
+    free(bytes);
+    ds4_k31_image_free(&img);
+    if (!ok) { snprintf(p->err, sizeof(p->err), "image %d: %s", p->images->n + 1, msg); return; }
+    char head[64];
+    snprintf(head, sizeof(head), "image %ux%u", pt.width, pt.height);
+    ds4_tokens_push(p->out, id_begin);
+    k3p_text(p, head);
+    ds4_tokens_push(p->out, id_content);
+    k3_image im = { .pos = (uint32_t)p->out->len, .n = pt.token_count, .gh = pt.grid_height, .gw = pt.grid_width,
+                    .hash = k3_image_hash(pt.patches, (size_t)pt.patch_count * 588u, pt.grid_height, pt.grid_width),
+                    .patches = pt.patches, .embeds = NULL };
+    pt.patches = NULL;
+    ds4_k31_image_patches_free(&pt);
+    for (uint32_t i = 0; i < im.n; i++) ds4_tokens_push(p->out, id_pad);
+    ds4_tokens_push(p->out, id_end);
+    k3_image *grown = realloc(p->images->v, sizeof(*grown) * (size_t)(p->images->n + 1));
+    if (!grown) { free(im.patches); snprintf(p->err, sizeof(p->err), "out of memory"); return; }
+    p->images->v = grown;
+    p->images->v[p->images->n++] = im;
+}
+/* a message's content as Moonshot's encoder renders it: a string as one segment, a list of parts one segment per text
+   part with the images in place; any other value as JSON */
+static void k3p_content(k3p *p, const jv *content) {
+    if (!content || content->type == JV_NULL) return;
+    if (content->type == JV_STR) { k3p_text(p, content->str); return; }
     if (content->type == JV_ARR) {
         for (int i = 0; i < content->n; i++) {
             const jv *part = content->items[i];
-            const jv *t = jv_get(part, "text");
-            if (t && t->type == JV_STR) sb_puts(&b, t->str);
+            const jv *t = jv_get(part, "type");
+            if (t && t->type == JV_STR && (!strcmp(t->str, "image_url") || !strcmp(t->str, "image"))) { k3p_image(p, part); continue; }
+            const jv *x = jv_get(part, "text");
+            if (x && x->type == JV_STR) k3p_text(p, x->str);
         }
-        return b.p;
+        return;
     }
+    sbuf b = {0};
     sb_put_jv(&b, content, false, false);
-    return b.p;
+    k3p_text(p, b.p);
+    sb_free(&b);
 }
 static const jv *call_function(const jv *call) {
     const jv *fn = jv_get(call, "function");
@@ -457,9 +565,7 @@ static void k3p_assistant(k3p *p, const jv *m, bool thinking) {
         k3p_close(p, "think");
     }
     k3p_open(p, "response"); k3p_sep(p);
-    char *text = content_text(jv_get(m, "content"));
-    k3p_text(p, text);
-    free(text);
+    k3p_content(p, jv_get(m, "content"));
     k3p_close(p, "response");
     const jv *calls = jv_get(m, "tool_calls");
     if (calls && calls->type == JV_ARR && calls->n > 0) k3p_tool_calls(p, calls);
@@ -495,9 +601,7 @@ static void k3p_tool_result(k3p *p, const jv *m, const jv *prev_calls, int run_i
     char idx[16];
     snprintf(idx, sizeof(idx), "%d", index);
     k3p_open(p, "message"); k3p_attr(p, "role", "tool"); k3p_attr(p, "tool", name ? name : "unknown"); k3p_attr(p, "index", idx); k3p_sep(p);
-    char *text = content_text(jv_get(m, "content"));
-    k3p_text(p, text);
-    free(text);
+    k3p_content(p, jv_get(m, "content"));
     k3p_close(p, "message"); k3p_eom(p);
 }
 static void k3p_effort(k3p *p, const char *effort) {
@@ -511,9 +615,10 @@ static void k3p_effort(k3p *p, const char *effort) {
 /* Renders the whole request into tokens. Order (deltafin): tool declaration, thinking-effort, the messages,
    tool-choice, response-format, the assistant prefix. */
 static void k3_build_prompt(ds4_engine *e, const jv *root, const jv *messages, bool thinking, const char *effort,
-                            bool *tools_declared, ds4_tokens *out) {
+                            bool *tools_declared, ds4_tokens *out, k3_images *images, char *err, size_t err_cap) {
     k3p p;
     k3p_init(&p, e, out);
+    p.images = images;
     const jv *tools = jv_get(root, "tools");
     *tools_declared = tools && tools->type == JV_ARR && tools->n > 0;
     if (*tools_declared) k3p_tool_declare(&p, tools, false);
@@ -542,9 +647,7 @@ static void k3_build_prompt(ds4_engine *e, const jv *root, const jv *messages, b
         } else {
             const char *rr = !strcmp(r, "system") ? "system" : "user";
             k3p_open(&p, "message"); k3p_attr(&p, "role", rr); k3p_name_attr(&p, m); k3p_sep(&p);
-            char *text = content_text(jv_get(m, "content"));
-            k3p_text(&p, text);
-            free(text);
+            k3p_content(&p, jv_get(m, "content"));
             k3p_close(&p, "message"); k3p_eom(&p);
         }
         if (leading_system) prefix_boundary = out->len;
@@ -572,6 +675,7 @@ static void k3_build_prompt(ds4_engine *e, const jv *root, const jv *messages, b
     }
     k3p_open(&p, "message"); k3p_attr(&p, "role", "assistant"); k3p_sep(&p);
     k3p_open(&p, thinking ? "think" : "response"); k3p_sep(&p);
+    snprintf(err, err_cap, "%s", p.err);
 }
 
 /* ------------------------------------------------------------------ generation plumbing */
@@ -788,6 +892,87 @@ static void put_tool_call_json(sbuf *b, const k3_request *r, const k3_call *c, i
     sb_puts(b, "}}");
 }
 
+/* recent images' rows (DS4_K31_IMAGE_CACHE_MB, default 512): a conversation that sends the same image again does not run the
+   vision tower again */
+#define K3_IMAGE_CACHE_SLOTS 16
+typedef struct { uint64_t hash, used; uint32_t gh, gw, n; float *embeds; } k3_image_cached;
+static k3_image_cached g_image_cache[K3_IMAGE_CACHE_SLOTS];
+static uint64_t g_image_tick;
+static bool k3_image_cache_get(const k3_image *im) {
+    for (int i = 0; i < K3_IMAGE_CACHE_SLOTS; i++) {
+        k3_image_cached *c = &g_image_cache[i];
+        if (c->embeds && c->hash == im->hash && c->gh == im->gh && c->gw == im->gw && c->n == im->n) {
+            memcpy(im->embeds, c->embeds, (size_t)c->n * 7168u * sizeof(float));
+            c->used = ++g_image_tick;
+            return true;
+        }
+    }
+    return false;
+}
+static void k3_image_cache_put(const k3_image *im) {
+    const char *env = getenv("DS4_K31_IMAGE_CACHE_MB");
+    const uint64_t budget = (uint64_t)(env ? strtoull(env, NULL, 10) : 512u) << 20;
+    const uint64_t bytes = (uint64_t)im->n * 7168u * sizeof(float);
+    if (bytes > budget) return;
+    for (;;) {   /* the least recently used entries go until the new one fits */
+        uint64_t held = 0;
+        int lru = -1, empty = -1;
+        for (int i = 0; i < K3_IMAGE_CACHE_SLOTS; i++) {
+            const k3_image_cached *c = &g_image_cache[i];
+            if (!c->embeds) { if (empty < 0) empty = i; continue; }
+            held += (uint64_t)c->n * 7168u * sizeof(float);
+            if (lru < 0 || c->used < g_image_cache[lru].used) lru = i;
+        }
+        if (empty >= 0 && held + bytes <= budget) {
+            float *copy = malloc(bytes);
+            if (!copy) return;
+            memcpy(copy, im->embeds, bytes);
+            g_image_cache[empty] = (k3_image_cached){ .hash = im->hash, .used = ++g_image_tick, .gh = im->gh, .gw = im->gw, .n = im->n, .embeds = copy };
+            return;
+        }
+        free(g_image_cache[lru].embeds);
+        memset(&g_image_cache[lru], 0, sizeof(g_image_cache[lru]));
+    }
+}
+/* every image's rows, from the cache or the vision tower; 0 with *status and err set when one fails */
+static int k3_images_encode(k3_images *images, int *status, char *err, size_t err_cap) {
+    const char *dir = getenv("DS4_K31_VISION");
+    if (!dir || !dir[0]) {
+        *status = 501;
+        snprintf(err, err_cap, "this server has no vision tower: start it with DS4_K31_VISION set to the directory of the checkpoint shards that hold it");
+        return 0;
+    }
+    for (int i = 0; i < images->n; i++) {
+        k3_image *im = &images->v[i];
+        im->embeds = malloc((size_t)im->n * 7168u * sizeof(float));
+        if (!im->embeds) { *status = 503; snprintf(err, err_cap, "out of memory for image %d", i + 1); return 0; }
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        const bool hit = k3_image_cache_get(im);
+        if (!hit) {
+            if (!ds4_k31_vision_encode(dir, im->patches, im->gh, im->gw, im->embeds)) {
+                *status = 503;
+                snprintf(err, err_cap, "image %d could not be run through the vision tower (see the server log)", i + 1);
+                return 0;
+            }
+            k3_image_cache_put(im);
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        free(im->patches);
+        im->patches = NULL;
+        fprintf(stderr, "ds4: K3 serve: image %d: %ux%u patches, %u tokens at prompt positions %u-%u, %s in %.2f s\n", i + 1, im->gw, im->gh,
+                im->n, im->pos, im->pos + im->n - 1, hit ? "rows from the image cache" : "vision tower",
+                (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) * 1e-9);
+    }
+    return 1;
+}
+static void k3_images_free(k3_images *images) {
+    for (int i = 0; i < images->n; i++) { free(images->v[i].patches); free(images->v[i].embeds); }
+    free(images->v);
+    images->v = NULL;
+    images->n = 0;
+}
+
 static void handle_chat(ds4_engine *e, int fd, const char *body, int ctx_size, int default_max_tokens) {
     const char *p = body;
     jv *root = jp_value(&p, 0);
@@ -827,14 +1012,43 @@ static void handle_chat(ds4_engine *e, int fd, const char *body, int ctx_size, i
 
     ds4_tokens prompt = {0};
     bool tools_declared = false;
-    k3_build_prompt(e, root, messages, thinking != 0, effort, &tools_declared, &prompt);
+    k3_images images = {0};
+    char perr[256] = "";
+    k3_build_prompt(e, root, messages, thinking != 0, effort, &tools_declared, &prompt, &images, perr, sizeof(perr));
     jv_free(root);
+    if (perr[0]) {
+        ds4_tokens_free(&prompt);
+        k3_images_free(&images);
+        send_error(fd, 400, "Bad Request", perr);
+        return;
+    }
     if (prompt.len == 0 || prompt.len >= ctx_size - 1) {
         char msg[128];
         snprintf(msg, sizeof(msg), "prompt is %d tokens; this K3 build holds %d positions", prompt.len, ctx_size);
         ds4_tokens_free(&prompt);
+        k3_images_free(&images);
         send_error(fd, 400, "Bad Request", msg);
         return;
+    }
+    {   /* DS4_K3_DUMP_PROMPT=<path>: the rendered prompt's token ids, one per line (checked against Moonshot's encoder) */
+        const char *dp = getenv("DS4_K3_DUMP_PROMPT");
+        FILE *f = dp && dp[0] ? fopen(dp, "w") : NULL;
+        if (f) { for (int i = 0; i < prompt.len; i++) fprintf(f, "%d\n", prompt.v[i]); fclose(f); }
+    }
+    if (images.n > 0) {
+        int status = 400;
+        if (!k3_images_encode(&images, &status, perr, sizeof(perr))) {
+            ds4_tokens_free(&prompt);
+            k3_images_free(&images);
+            send_error(fd, status, status == 501 ? "Not Implemented" : status == 503 ? "Service Unavailable" : "Bad Request", perr);
+            return;
+        }
+        ds4_k3_image_span *spans = calloc((size_t)images.n, sizeof(*spans));
+        if (!spans) { ds4_tokens_free(&prompt); k3_images_free(&images); send_error(fd, 503, "Service Unavailable", "out of memory"); return; }
+        for (int i = 0; i < images.n; i++)
+            spans[i] = (ds4_k3_image_span){ .pos = images.v[i].pos, .n = images.v[i].n, .embeds = images.v[i].embeds, .hash = images.v[i].hash };
+        ds4_k3_set_image_spans(spans, images.n);   /* the engine keeps a copy of the list; the rows stay ours until the end */
+        free(spans);
     }
     if (max_tokens > ctx_size - 1 - prompt.len) max_tokens = ctx_size - 1 - prompt.len;
 
@@ -846,6 +1060,7 @@ static void handle_chat(ds4_engine *e, int fd, const char *body, int ctx_size, i
     sb_reserve(&r.trailer, 64);
     if (stream) {
         if (write_str(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n") != 0) {
+            ds4_k3_set_image_spans(NULL, 0); k3_images_free(&images);
             ds4_tokens_free(&prompt); sb_free(&r.text); sb_free(&r.pending); sb_free(&r.reasoning); sb_free(&r.pending_reasoning); sb_free(&r.trailer); return;
         }
         stream_chunk_delta(&r, "\"role\":\"assistant\",\"content\":\"\"", NULL);
@@ -855,6 +1070,8 @@ static void handle_chat(ds4_engine *e, int fd, const char *body, int ctx_size, i
     ds4_k3_set_tools_mode(tools_declared);
     const int rc = ds4_engine_generate_argmax(e, &prompt, max_tokens, ctx_size, emit_token, generation_done, &r, NULL, NULL);
     ds4_k3_set_tools_mode(0);
+    ds4_k3_set_image_spans(NULL, 0);
+    k3_images_free(&images);
     clock_gettime(CLOCK_MONOTONIC, &ts1);
     const double secs = (double)(ts1.tv_sec - ts0.tv_sec) + (double)(ts1.tv_nsec - ts0.tv_nsec) * 1e-9;
     k3_call *calls = NULL;
