@@ -41364,6 +41364,12 @@ struct k3_lru {
        default 0.9; a token = 92 layer calls) found by sampling 64 unpinned slabs; the list order is then unused.
        Simulated on eight chat prompts at 1,584 slabs: LRU 30 %, decayed 35 % hits (Belady 55 %). */
     bool decay_mode = false;
+    /* step 144: the layer call in progress (the caller counts them) and, per slab, the call that last looked it up or
+       allocated it. Such a slab may be read by a kernel that is queued and not yet run; the list order keeps it at the
+       hot end, the decayed-count rule has to pass over it by this stamp. */
+    uint64_t call_id = 0;
+    std::vector<uint64_t> in_call;
+    uint64_t decay_victims = 0, decay_in_call = 0;  /* victims the decayed-count rule took; samples whose lowest score was in use */
     bool last_evicted_transient = false;            /* step 78: the slab alloc() just took was transient */
     /* step 140: while bar_n != 0, alloc() leaves the slabs bar_lo .. bar_lo + bar_n - 1 alone (the second card's, during a call
        whose experts are not computed there) */
@@ -41382,6 +41388,7 @@ struct k3_lru {
         chance.assign(n, 0);
         { const char *cc = getenv("DS4_K3_CACHE_COLD_CHANCE"); cold_chance = cc ? (uint8_t)(atoi(cc) < 0 ? 0 : atoi(cc) > 8 ? 8 : atoi(cc)) : 1; }
         score.assign(n, -1e30f);
+        in_call.assign(n, 0);
         const char *pol = getenv("DS4_K3_CACHE_POLICY");
         decay_mode = pol && !strcmp(pol, "decay");
         const char *dc = getenv("DS4_K3_CACHE_DECAY");
@@ -41397,12 +41404,14 @@ struct k3_lru {
         cap += n_new; key.resize(cap, K3_NOKEY); pinned.resize(cap, 0); filling.resize(cap, 0); transient.resize(cap, 1); warm.resize(cap, 0); pos.resize(cap);
         chance.resize(cap, 0);
         score.resize(cap, -1e30f);
+        in_call.resize(cap, 0);
         for (uint32_t s = n0; s < cap; s++) { order.push_back(s); pos[s] = std::prev(order.end()); }
     }
     int lookup(uint64_t k, bool touch) {
         auto it = map.find(k);
         if (it == map.end()) return -1;
         const uint32_t s = it->second;
+        in_call[s] = call_id;   /* step 144 */
         if (touch) { order.erase(pos[s]); order.push_front(s); pos[s] = order.begin(); transient[s] = 0; warm[s] = 0; if (decay_mode) use(s); }
         return (int)s;
     }
@@ -41413,14 +41422,18 @@ struct k3_lru {
         int victim = -1;
         if (decay_mode) {
             /* lowest score among 64 sampled unpinned slabs (transients carry -1e30, so they go first) */
-            float best = 3e38f;
+            float best = 3e38f, best_any = 3e38f;
+            bool any_in_call = false;   /* step 144: the lowest score of the sample belongs to a slab of this call */
             for (uint32_t i = 0; i < 64u && i < cap; i++) {
                 rng = rng * 1664525u + 1013904223u;
                 const uint32_t s = (rng >> 8) % cap;
                 if (pinned[s] || barred(s)) continue;
+                if (score[s] < best_any) { best_any = score[s]; any_in_call = in_call[s] == call_id; }
+                if (in_call[s] == call_id) continue;   /* step 144: not a slab of this call */
                 if (score[s] < best) { best = score[s]; victim = (int)s; }
             }
-            if (victim < 0) { for (uint32_t s = 0; s < cap; s++) if (!pinned[s] && !barred(s)) { victim = (int)s; break; } }
+            if (victim < 0) { for (uint32_t s = 0; s < cap; s++) if (!pinned[s] && !barred(s) && in_call[s] != call_id) { victim = (int)s; break; } }
+            decay_victims++; if (any_in_call) decay_in_call++;
         } else {
             if (hot && bias_window && twin_map) {   /* step 75: prefer a cold slab whose expert the host pool still holds */
                 uint32_t seen = 0;
@@ -41456,6 +41469,7 @@ struct k3_lru {
         if (evicted) { *evicted = key[s]; last_evicted_transient = transient[s] != 0 && !warm[s]; }   /* step 78, step 81 */
         warm[s] = 0;
         drop(s);
+        in_call[s] = call_id;   /* step 144 */
         key[s] = k; map[k] = s; transient[s] = hot ? 0 : 1;
         chance[s] = protect ? cold_chance : 0;
         score[s] = hot ? (float)(tick * lb) : -1e30f;
@@ -41483,6 +41497,7 @@ struct k3_lru {
         if (m != map.end() && m->second == s) map.erase(m);
         key[s] = K3_NOKEY;
         transient[s] = 1;
+        score[s] = -1e30f;   /* step 143: an empty slab carries no use count (the decay rule would otherwise pass it over) */
         order.erase(pos[s]); order.push_back(s); pos[s] = std::prev(order.end());
     }
     /* step 124: an entry that turned out not to be needed keeps its content but goes to the cold end as a transient, so the next
@@ -42028,6 +42043,9 @@ static bool k3_g1_init(k3_raw_pool &p, int dev, uint32_t ff, uint32_t latent, ui
 }
 extern "C" void ds4_gpu_k3_g1_report(void) {
     k3_raw_pool &p = k3_raw_get();
+    if (p.dc.decay_mode)
+        fprintf(stderr, "ds4: K3 decayed-count rule (step 144): %llu device victims; in %llu of them the lowest sampled score was a slab of the call in progress and was passed over\n",
+                (unsigned long long)p.dc.decay_victims, (unsigned long long)p.dc.decay_in_call);
     if (!p.g1_n) return;
     fprintf(stderr, "ds4: K3 second card: %u slabs; %llu decode calls used it, %llu experts computed there, %llu slabs copied over; uploads %.1f GB to the first card, %.1f GB to the second\n",
             p.g1_n, (unsigned long long)p.g1_calls, (unsigned long long)p.g1_uses, (unsigned long long)p.g1_fetches,
@@ -42105,6 +42123,14 @@ static bool k3_raw_pool_ensure(uint32_t ff, uint32_t latent) {
     }
     p.hc.init(cap_host);
     p.dc.init(cap_dev);
+    {   /* step 143: DS4_K3_CACHE_POLICY=decay-device: the decayed use count (DS4_K3_CACHE_DECAY per token) decides in the
+           device cache alone; the host pool, a victim cache whose slabs empty and refill all the time, keeps its recency order */
+        const char *pol = getenv("DS4_K3_CACHE_POLICY");
+        if (pol && !strcmp(pol, "decay-device")) {
+            p.dc.decay_mode = true; p.hc.decay_mode = false;
+            fprintf(stderr, "ds4: kimi-k3 device cache evicts by decayed use count (step 143, DS4_K3_CACHE_POLICY=decay-device); the host pool by recency\n");
+        }
+    }
     p.direct = getenv("DS4_K3_EXPERT_BUFFERED") ? 0 : 1;
     p.victim = getenv("DS4_K3_CACHE_VICTIM") ? (atoi(getenv("DS4_K3_CACHE_VICTIM")) != 0) : 1;
     p.wake_mode = (int)k3_env_u32("DS4_K3_WAKE", 1u);   /* step 114: default on (10 Nov 2026) */
@@ -42615,6 +42641,7 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
     if (out->bytes < (uint64_t)n_tok * latent * sizeof(float) || x->bytes < (uint64_t)n_tok * latent * sizeof(float)) return 0;
     if (!k3_raw_pool_ensure(ff, latent) || !k3_raw_pool_reserve_tokens(n_tok, n_used)) return 0;
     k3_raw_pool &p = k3_raw_get();
+    p.dc.call_id++; p.hc.call_id++;   /* step 144: the slabs this call looks up or allocates are its own until it returns */
     cudaStream_t stream = cuda_decode_stream();
     /* experts serving at least gemm_min tokens go through the bf16 GEMM path (0 disables it) */
     static int gemm_min = -1;
