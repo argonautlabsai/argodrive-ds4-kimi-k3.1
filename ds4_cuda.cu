@@ -41372,6 +41372,7 @@ struct k3_lru {
     std::vector<uint64_t> in_call;
     uint64_t decay_victims = 0, decay_in_call = 0;  /* victims the decayed-count rule took; samples whose lowest score was in use */
     bool last_evicted_transient = false;            /* step 78: the slab alloc() just took was transient */
+    float last_evicted_score = -1e30f;              /* step 152: and the score its entry had */
     /* step 140: while bar_n != 0, alloc() leaves the slabs bar_lo .. bar_lo + bar_n - 1 alone (the second card's, during a call
        whose experts are not computed there) */
     uint32_t bar_lo = 0, bar_n = 0;
@@ -41380,7 +41381,7 @@ struct k3_lru {
     std::vector<float> score;
     uint32_t rng = 12345u;
     static float lse(float a, float b) { const float m = a > b ? a : b; return m + log1pf(expf(-fabsf(a - b))); }
-    void use(uint32_t s) { score[s] = lse(score[s], (float)(tick * lb)); }
+    void use(uint32_t s, float w = 0.0f) { score[s] = lse(score[s], (float)(tick * lb) + w); }   /* step 148b: w = ln(uses this call) */
     std::list<uint32_t> order;                      /* front = hot ... back = cold */
     std::vector<std::list<uint32_t>::iterator> pos;
     std::unordered_map<uint64_t, uint32_t> map;
@@ -41408,16 +41409,16 @@ struct k3_lru {
         in_call.resize(cap, 0);
         for (uint32_t s = n0; s < cap; s++) { order.push_back(s); pos[s] = std::prev(order.end()); }
     }
-    int lookup(uint64_t k, bool touch) {
+    int lookup(uint64_t k, bool touch, float w = 0.0f) {
         auto it = map.find(k);
         if (it == map.end()) return -1;
         const uint32_t s = it->second;
         in_call[s] = call_id;   /* step 144 */
-        if (touch) { order.erase(pos[s]); order.push_front(s); pos[s] = order.begin(); transient[s] = 0; warm[s] = 0; if (decay_mode) use(s); }
+        if (touch) { order.erase(pos[s]); order.push_front(s); pos[s] = order.begin(); transient[s] = 0; warm[s] = 0; if (decay_mode) use(s, w); }
         return (int)s;
     }
     /* takes the coldest unpinned slab for key k (hot: front of the order, else back); -1 if every slab is pinned */
-    int alloc(uint64_t k, bool hot, uint64_t *evicted = nullptr, bool protect = false) {
+    int alloc(uint64_t k, bool hot, uint64_t *evicted = nullptr, bool protect = false, float w = 0.0f, const float *admit = nullptr) {
         /* a prompt pass (hot = false) recycles transient slabs first so that it never pushes out the decode working
            set beyond what it needs for its own in-flight fills; decode inserts take the coldest unpinned slab */
         int victim = -1;
@@ -41435,6 +41436,8 @@ struct k3_lru {
             }
             if (victim < 0) { for (uint32_t s = 0; s < cap; s++) if (!pinned[s] && !barred(s) && in_call[s] != call_id) { victim = (int)s; break; } }
             decay_victims++; if (any_in_call) decay_in_call++;
+            /* step 152: an entry that must beat what it replaces (a copy-down into the host pool) is refused otherwise */
+            if (admit && victim >= 0 && key[(uint32_t)victim] != K3_NOKEY && score[(uint32_t)victim] >= *admit) return -1;
         } else {
             if (hot && bias_window && twin_map) {   /* step 75: prefer a cold slab whose expert the host pool still holds */
                 uint32_t seen = 0;
@@ -41467,13 +41470,13 @@ struct k3_lru {
         }
         if (victim < 0) return -1;
         const uint32_t s = (uint32_t)victim;
-        if (evicted) { *evicted = key[s]; last_evicted_transient = transient[s] != 0 && !warm[s]; }   /* step 78, step 81 */
+        if (evicted) { *evicted = key[s]; last_evicted_transient = transient[s] != 0 && !warm[s]; last_evicted_score = score[s]; }   /* step 78, step 81, step 152 */
         warm[s] = 0;
         drop(s);
         in_call[s] = call_id;   /* step 144 */
         key[s] = k; map[k] = s; transient[s] = hot ? 0 : 1;
         chance[s] = protect ? cold_chance : 0;
-        score[s] = hot ? (float)(tick * lb) : -1e30f;
+        score[s] = hot ? (float)(tick * lb) + w : -1e30f;
         order.erase(pos[s]);
         if (hot) { order.push_front(s); pos[s] = order.begin(); }
         else { order.push_back(s); pos[s] = std::prev(order.end()); }
@@ -41908,7 +41911,9 @@ static void k3_hpf_drain(k3_raw_pool &p) {   /* pool mutex held */
    re-recorded behind the copy, so d's refill and the host slab's next read or upload wait for it. */
 static void k3_victim_copy(k3_raw_pool &p, uint32_t d, uint64_t old) {
     if (p.hc.lookup(old, false) >= 0) return;
-    if (p.admit_mode > 0) {   /* step 113: copy down only experts likely to be reused */
+    const bool by_score = p.dc.decay_mode && p.hc.decay_mode;   /* step 152 */
+    const float old_score = p.dc.last_evicted_score;
+    if (!by_score && p.admit_mode > 0) {   /* step 113: copy down only experts likely to be reused */
         const uint32_t fo_i = (uint32_t)(((old >> 20) << 10) | (old & 0x3ffu));
         const unsigned fo = fo_i < p.freq.size() ? p.freq[fo_i] : 0u;
         bool skip;
@@ -41922,8 +41927,9 @@ static void k3_victim_copy(k3_raw_pool &p, uint32_t d, uint64_t old) {
         if (skip) { p.cd_skip++; return; }
     }
     const bool cold = !ds4_k3_expert_source_is_primary((uint32_t)(old >> 20), (uint32_t)(old & 0xfffffu));
-    const int h = p.hc.alloc(old, true, nullptr, cold);
-    if (h < 0) return;
+    const int h = by_score ? p.hc.alloc(old, true, nullptr, cold, 0.0f, &old_score) : p.hc.alloc(old, true, nullptr, cold);
+    if (h < 0) { if (by_score) p.cd_skip++; return; }
+    if (by_score) p.hc.score[(uint32_t)h] = old_score;
     uint8_t *dst = p.host_region[(uint32_t)h / p.host_per_region] + (size_t)((uint32_t)h % p.host_per_region) * p.file_bytes;
     const bool on1 = p.g1_n != 0u && d - p.g1_base < p.g1_n;   /* step 140: a slab of the second card copies down on that card's stream */
     const cudaStream_t cs = on1 ? p.g1_cp : p.cp_streams[d % p.n_cp];   /* step 64 */
@@ -42876,6 +42882,33 @@ static int k3_moe_raw_batch_impl(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, c
         verify_admit = verify_auto ? 2 : atoi(va);   /* 0: every fill goes to the hot end, as a plain step's */
         if (verify_admit > 1) fprintf(stderr, "ds4: kimi-k3 verification block admission (step 78): fills used by fewer than %d rows stay transient\n", verify_admit);
     }
+    /* step 148: DS4_K3_VERIFY_RANK=1 (or <device slabs left for passing fills>,<host slabs likewise>; default 384,128): a
+       verification block ranks its experts by the rows that use them; per layer the first (device slabs - 384) / 92 stay
+       resident in the device cache, the next (host slabs - 128) / 92 stay in the host pool (their read's own slab is kept,
+       no copy-down), the rest pass through slabs that are recycled first. What the block finds in the device cache beyond
+       its ranks leaves the resident set when the call ends. 0 / off / unset: the row-count thresholds above. */
+    static int rank_on = -1; static uint32_t rank_td = 384u, rank_th = 128u;
+    if (rank_on < 0) {
+        const char *rk = getenv("DS4_K3_VERIFY_RANK");
+        rank_on = rk && rk[0] && strcmp(rk, "0") != 0 && strcmp(rk, "off") != 0 ? 1 : 0;
+        if (rank_on) {
+            unsigned a = 0, b = 0; const int nn = sscanf(rk, "%u,%u", &a, &b);
+            if (nn >= 1 && a >= 64u) rank_td = a;
+            if (nn >= 2 && b >= 32u) rank_th = b;
+            p.dc.decay_mode = true; p.hc.decay_mode = true;   /* step 148b: both caches give up the least used, each use weighted by its rows */
+            fprintf(stderr, "ds4: kimi-k3 verification block admission by rank (step 148): per layer the most used experts stay, as many as the caches hold less %u device and %u host slabs; eviction by weighted use count\n", rank_td, rank_th);
+        }
+    }
+    const bool rank = rank_on == 1 && verify && n_tok > 1u;
+    uint8_t rcls[1024];   /* 2 device resident, 1 host resident, 0 passing */
+    if (rank) {
+        const uint32_t n_moe = 92u;   /* routed layers */
+        const uint32_t kd = p.dc.cap > rank_td ? (p.dc.cap - rank_td) / n_moe : 0u, kh = p.hc.cap > rank_th ? (p.hc.cap - rank_th) / n_moe : 0u;
+        uint32_t ord[1024];
+        for (uint32_t i = 0; i < n_union; i++) ord[i] = ulist[i];
+        std::stable_sort(ord, ord + n_union, [&](uint32_t a, uint32_t b) { return count[a] > count[b]; });   /* ties: the lower expert id */
+        for (uint32_t i = 0; i < n_union; i++) rcls[ord[i]] = i < kd ? 2 : i < kd + kh ? 1 : 0;
+    }
     static uint32_t bulk_min = k3_env_u32("DS4_K3_BULK_MIN", 64u);   /* step 88, default 64 since step 93: a prompt this short reads like decode (split, least expected completion) */
     const bool bulk = n_tok > bulk_min && !verify;   /* step 35: a prompt pass's fills may use tier C and prefetch the next layer */
     const uint64_t layer_key = (uint64_t)layer << 20;
@@ -43118,7 +43151,7 @@ static int k3_moe_raw_batch_impl(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, c
             const uint32_t d = p.ready_q[i];
             if (p.wanted[d]) { i++; continue; }
             const int h = p.dev_host[d];
-            if (h >= 0) { if (p.hpf_n) p.hup[(uint32_t)h] = 0; if (!(p.hpf_n && p.hpf_busy[(uint32_t)h])) { p.hc.pinned[(uint32_t)h] = 0; if (p.victim && !host_all && !(p.pool_keep && p.hhit[d])) p.hc.drop((uint32_t)h); } }   /* step 75 */
+            if (h >= 0) { if (p.hpf_n) p.hup[(uint32_t)h] = 0; if (!(p.hpf_n && p.hpf_busy[(uint32_t)h])) { p.hc.pinned[(uint32_t)h] = 0; if (p.victim && !host_all && !(p.pool_keep && (p.hhit[d] & 1u)) && !(p.hhit[d] & 2u)) p.hc.drop((uint32_t)h); } }   /* step 75 */
             p.dc.pinned[d] = p.pf_slab[d] ? 1 : 0; p.dc.filling[d] = 0; p.dev_host[d] = -1; p.cold_job[d] = 0;
             if (p.pf_pending) p.pf_pending--;
             p.ready_q.erase(p.ready_q.begin() + (long)i);
@@ -43210,7 +43243,7 @@ static int k3_moe_raw_batch_impl(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, c
             p.hc.pinned[(uint32_t)h2] = 1; p.dc.pinned[(uint32_t)d2] = 1; p.dc.filling[(uint32_t)d2] = 1;
             if (p.hpf_n) { p.hup[(uint32_t)h2] = 1; if (!read2 && p.hpf_key[(uint32_t)h2] == k2) { if (p.hpf_hold[(uint32_t)h2]) { p.hpf_hold[(uint32_t)h2] = 0; p.bhpf_used++; } else p.hpf_used++; p.hpf_key[(uint32_t)h2] = K3_NOKEY; } }   /* steps 117, 126 */
             p.dev_host[(uint32_t)d2] = h2; p.wanted[(uint32_t)d2] = 0; p.cold_job[(uint32_t)d2] = cold2 ? 1 : 0; p.hhit[(uint32_t)d2] = read2 ? 0 : 1;   /* step 75 */
-            if (!hot) { p.pf_slab[(uint32_t)d2] = 1; p.pf_list.push_back((uint32_t)d2); }
+            if (!hot || p.dc.decay_mode) { p.pf_slab[(uint32_t)d2] = 1; p.pf_list.push_back((uint32_t)d2); }   /* step 152: by use count an unused read-ahead would go first */
             if (p.victim && hot && !host_all && ev2 != K3_NOKEY) k3_victim_copy(p, (uint32_t)d2, ev2);
             if (read2) p.misses++; else p.hits_host++;
             push_fill(nl, e2, (uint32_t)d2, h2, read2, true);
@@ -43294,12 +43327,13 @@ static int k3_moe_raw_batch_impl(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, c
             if (bulk) p.bulk_left = n_union - next;   /* step 60c */
             const uint32_t e = vis[next];   /* step 74 */
             const uint64_t k = layer_key | e;
-            int d = p.dc.lookup(k, hot);
+            const float uw = rank ? logf((float)count[e]) : 0.0f;   /* step 148b */
+            int d = p.dc.lookup(k, hot, uw);
             if (d >= 0 && !p.dc.filling[(uint32_t)d]) {
                 p.hits_dev++;
                 if (p.rs_cnt && hot && layer < 93u && e < 896u) p.rs_cnt[((size_t)layer * 896u + e) * 4u]++;   /* step 145 */
                 if (p.pf_slab[(uint32_t)d]) { p.pf_slab[(uint32_t)d] = 0; p.dc.pinned[(uint32_t)d] = 0; p.pf_hit++; }   /* a prefetch consumed */
-                if (hot) (void)p.hc.lookup(k, true);   /* keep the host copy's recency in step with the device hit */
+                if (hot) (void)p.hc.lookup(k, true, uw);   /* keep the host copy's recency in step with the device hit */
                 if (!launch((uint32_t)d, e)) return 0;
                 launched++; next++;
                 continue;
@@ -43315,14 +43349,14 @@ static int k3_moe_raw_batch_impl(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, c
                 next++;
                 continue;
             }
-            int h = p.hc.lookup(k, hot);
+            int h = p.hc.lookup(k, hot, uw);
             const bool read = h < 0;
             const bool cold_tier = !ds4_k3_expert_source_is_primary(layer, e);
             if (read) {
                 /* victim mode: the staging slab is transient and released once the fill is seen; otherwise cold-tier
                    reads stay in the host cache (DS4_K3_CACHE_HOST_ALL=1: every read) */
                 const bool keep_host = !p.victim && hot && cold_tier;
-                h = p.hc.alloc(k, keep_host || (hot && host_all));
+                h = p.hc.alloc(k, keep_host || (hot && host_all) || (rank && rcls[e] == 1), nullptr, false, uw);   /* step 148: a host-rank expert's read stays in its slab */
                 if (h < 0) break;
             }
             uint64_t evicted = K3_NOKEY;
@@ -43336,14 +43370,15 @@ static int k3_moe_raw_batch_impl(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, c
             const int wrm = verify_auto ? (adm > 2 ? 2 : 0) : verify_warm;
             bool fill_hot = hot && !(verify && n_tok > 1u && adm > 1 && count[e] < (uint32_t)adm);   /* step 78 */
             bool fill_warm = hot && !fill_hot && wrm > 0 && count[e] >= (uint32_t)wrm;   /* step 81 */
-            d = p.dc.alloc(k, fill_hot, &evicted);
+            if (rank) { fill_hot = rcls[e] == 2; fill_warm = false; }   /* step 148 */
+            d = p.dc.alloc(k, fill_hot, &evicted, false, uw);
             if (d >= 0 && fill_warm && !fill_hot) p.dc.warm[(uint32_t)d] = 1;   /* step 81 */
             /* no second chance in the device cache: its residency is ~1.7 tokens and the
                                                    same-layer-next-token reuse falls off a cliff below one token (p3: hits 551 -> 60) */
             if (d < 0) { if (read) p.hc.drop((uint32_t)h); break; }
             p.hc.pinned[(uint32_t)h] = 1; p.dc.pinned[(uint32_t)d] = 1; p.dc.filling[(uint32_t)d] = 1;
             if (p.hpf_n) { p.hup[(uint32_t)h] = 1; if (!read && p.hpf_key[(uint32_t)h] == k) { if (p.hpf_hold[(uint32_t)h]) { p.hpf_hold[(uint32_t)h] = 0; p.bhpf_used++; } else p.hpf_used++; p.hpf_key[(uint32_t)h] = K3_NOKEY; } }   /* steps 117, 126 */
-            p.dev_host[(uint32_t)d] = h; p.hhit[(uint32_t)d] = read ? 0 : 1;   /* step 75 */
+            p.dev_host[(uint32_t)d] = h; p.hhit[(uint32_t)d] = (uint8_t)((read ? 0 : 1) | (rank && rcls[e] == 1 ? 2 : 0));   /* step 75; step 148: bit 1 = the host copy stays */
             if (p.victim && hot && !host_all && evicted != K3_NOKEY && !(verify_admit > 1 && verify && p.dc.last_evicted_transient)) k3_victim_copy(p, (uint32_t)d, evicted);   /* step 78 */
             if (read) p.misses++; else p.hits_host++;
             if (p.rs_cnt && hot && layer < 93u && e < 896u) p.rs_cnt[((size_t)layer * 896u + e) * 4u + (read ? 2u : 1u)]++;   /* step 145 */
@@ -43376,7 +43411,7 @@ static int k3_moe_raw_batch_impl(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, c
             const uint32_t e = (uint32_t)(p.dc.key[d] & 0xfffffu);
             if (p.trace_fills) p.tf_rdy[d] = k3_now_sec();   /* step 68 */
             const int h = p.dev_host[d];
-            if (h >= 0) { if (p.hpf_n) p.hup[(uint32_t)h] = 0; if (!(p.hpf_n && p.hpf_busy[(uint32_t)h])) { p.hc.pinned[(uint32_t)h] = 0; if (p.victim && !host_all && !(p.pool_keep && p.hhit[d])) p.hc.drop((uint32_t)h); } }   /* exclusive unless step 75 keeps a host hit's copy */
+            if (h >= 0) { if (p.hpf_n) p.hup[(uint32_t)h] = 0; if (!(p.hpf_n && p.hpf_busy[(uint32_t)h])) { p.hc.pinned[(uint32_t)h] = 0; if (p.victim && !host_all && !(p.pool_keep && (p.hhit[d] & 1u)) && !(p.hhit[d] & 2u)) p.hc.drop((uint32_t)h); } }   /* exclusive unless step 75 keeps a host hit's copy */
             p.dc.pinned[d] = (p.pf_slab[d] && !p.wanted[d]) ? 1 : 0; p.dc.filling[d] = 0; p.dev_host[d] = -1;
             if (p.cold_job[d]) { p.cold_job[d] = 0; if (p.wanted[d] && cold_inflight) cold_inflight--; }
             if (!p.wanted[d]) { if (p.pf_pending) p.pf_pending--; continue; }   /* a prefetch for the next layer: done */
