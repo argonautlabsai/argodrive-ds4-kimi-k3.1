@@ -3772,7 +3772,7 @@ static __global__ void ds4_mmq_moe_down_sum6_q8_1_qwarp32_kernel(
     }
 }
 
-template <ggml_type type>
+template <ggml_type type, int PASSES = 4>
 static __global__ void ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel(
         const void       * __restrict__ W_gate,
         const void       * __restrict__ W_up,
@@ -3814,8 +3814,8 @@ static __global__ void ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel(
     const int kqs = vdr * (lane % lanes_per_k);
 
 #pragma unroll
-    for (uint32_t rr = 0; rr < 4u; ++rr) {
-        const uint32_t row = row_block * 64u + row_lane + rr * 16u;
+    for (uint32_t rr = 0; rr < (uint32_t)PASSES; ++rr) {
+        const uint32_t row = row_block * (16u * PASSES) + row_lane + rr * 16u;
         if (row >= nrows_x) continue;
         const int kbx_base = (int)(expert * stride_channel_x + row * stride_row_x);
         float gate = 0.0f;
@@ -4160,7 +4160,17 @@ int ds4_mmq_moe_down_sum6_vec_impl(
         ggml_cuda_info().devices[dev].cc == GGML_CUDA_CC_DGX_SPARK &&
         M == 4096 && (K == 1024 || K == 2048) && n_tokens <= 8;
 #endif
-    const uint32_t tile_rows = small_tiles ? 8u : 64u;
+    /* Short MXFP4 batches (up to 8 tokens) use blocks of 8 rows on any card: a token of V4.1 is then 640 blocks
+     * instead of 80, which a large card needs to be busy at all (one RTX PRO 6000: 35.5 -> 48.7 tok/s on a prompt
+     * with no expert loads, the same logits). The arithmetic of a row does not depend on the block that holds it.
+     * DS4_CUDA_MXFP4_DOWN_TILE_ROWS=16|32|64 selects larger blocks (64: the geometry before 18 Nov 2026). */
+    uint32_t tile_passes = small_tiles ? 1u : 8u;
+    if (type == GGML_TYPE_MXFP4 && !small_tiles && n_tokens <= 8) {
+        static int tile_env = -1;
+        if (tile_env < 0) { const char *e = getenv("DS4_CUDA_MXFP4_DOWN_TILE_ROWS"); tile_env = e && *e ? atoi(e) : 0; }
+        tile_passes = tile_env == 64 ? 8u : tile_env == 32 ? 4u : tile_env == 16 ? 2u : 1u;
+    }
+    const uint32_t tile_rows = tile_passes * 8u;
     const uint32_t row_blocks = ((uint32_t)M + tile_rows - 1u) / tile_rows;
     if (ds4_mmq_vec_assignment_major<type>::value && row_blocks > 65535u) {
         fprintf(stderr, "%s: M=%d exceeds the assignment-major grid\n", tag, M);
@@ -4177,7 +4187,9 @@ int ds4_mmq_moe_down_sum6_vec_impl(
         stride_row_x, stride_col_y, stride_channel_x)
 #ifndef GGML_USE_HIP
     if constexpr (type == GGML_TYPE_MXFP4) {
-        if (small_tiles) { DS4_LAUNCH_DOWN_ROWS(1); }
+        if (tile_passes == 1u) { DS4_LAUNCH_DOWN_ROWS(1); }
+        else if (tile_passes == 2u) { DS4_LAUNCH_DOWN_ROWS(2); }
+        else if (tile_passes == 4u) { DS4_LAUNCH_DOWN_ROWS(4); }
         else { DS4_LAUNCH_DOWN_ROWS(8); }
     } else
 #endif
@@ -4459,13 +4471,32 @@ int ds4_mmq_moe_gate_up_mid_vec_impl(
         }
     }
 #endif
+    /* Short MXFP4 batches (up to 8 tokens) use blocks of 16 rows: a token of V4.1 is 864 blocks instead of 216
+     * (with the down kernel's small blocks: 48.3 -> 51.3 tok/s, the same logits). Each row's arithmetic is the same
+     * whichever block holds it. DS4_CUDA_MXFP4_GATE_TILE_ROWS=32|64 selects larger blocks (64: as before). */
+    uint32_t gate_passes = 4u;
+    if (type == GGML_TYPE_MXFP4 && n_tokens <= 8) {
+        static int tile_env = -1;
+        if (tile_env < 0) { const char *e = getenv("DS4_CUDA_MXFP4_GATE_TILE_ROWS"); tile_env = e && *e ? atoi(e) : 0; }
+        gate_passes = tile_env == 64 ? 4u : tile_env == 32 ? 2u : 1u;
+    }
+    const uint32_t gate_row_blocks = gate_passes == 4u ? row_blocks : (uint32_t)((M + 16 * (int)gate_passes - 1) / (16 * (int)gate_passes));
+    if (ds4_mmq_vec_assignment_major<type>::value && gate_row_blocks > 65535u) {
+        fprintf(stderr, "%s: M=%d exceeds the assignment-major grid\n", tag, M);
+        return -1;
+    }
     const dim3 block_nums = ds4_mmq_vec_assignment_major<type>::value ?
-        dim3(assignments, row_blocks) : dim3(row_blocks, assignments);
+        dim3(assignments, gate_row_blocks) : dim3(gate_row_blocks, assignments);
     const dim3 block_dims(256);
-    ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel<type><<<block_nums, block_dims, 0, stream>>>(
-        W_gate, W_up, (const block_q8_1 *)src1_q8_1_ptr, ids, weights, mid_f32,
-        (uint32_t)K, (uint32_t)M, (uint32_t)n_tokens, (uint32_t)n_experts,
-        stride_row_x, stride_col_y, stride_channel_x, clamp);
+#define DS4_LAUNCH_GATE_UP(P) \
+    ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel<type, P><<<block_nums, block_dims, 0, stream>>>( \
+        W_gate, W_up, (const block_q8_1 *)src1_q8_1_ptr, ids, weights, mid_f32, \
+        (uint32_t)K, (uint32_t)M, (uint32_t)n_tokens, (uint32_t)n_experts, \
+        stride_row_x, stride_col_y, stride_channel_x, clamp)
+    if (gate_passes == 1u) { DS4_LAUNCH_GATE_UP(1); }
+    else if (gate_passes == 2u) { DS4_LAUNCH_GATE_UP(2); }
+    else { DS4_LAUNCH_GATE_UP(4); }
+#undef DS4_LAUNCH_GATE_UP
 
     err = cudaGetLastError();
     if (err != cudaSuccess) {
