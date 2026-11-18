@@ -64282,7 +64282,7 @@ static bool k3_gpu_matmul_n_impl(ds4_gpu_tensor *out, const ds4_model *model, co
         loop_max = e ? atoi(e) : 64;
         if (loop_max < 0) loop_max = 0;
     }
-    if (n_tok > 1u && n_tok <= (uint32_t)loop_max) {
+    if (n_tok > 1u && (n_tok <= (uint32_t)loop_max || g_k3_verify_on)) {   /* step 147: a verification block keeps the single-row arithmetic at any width */
         const uint64_t in_bytes = (uint64_t)w->dim[0] * sizeof(float), out_bytes = (uint64_t)w->dim[1] * sizeof(float);
         if (ds4_gpu_tensor_bytes(x) < in_bytes * n_tok || ds4_gpu_tensor_bytes(out) < out_bytes * n_tok) return false;
         if (w->type == DS4_TENSOR_Q8_0 && k3_rows_gemv_on()) {   /* step 91: the single-row GEMV's arithmetic, each weight read once per 8 rows */
@@ -65013,7 +65013,7 @@ static bool k3_gpu_layer_batch_tier(k3_gpu_buffers *b, k3_gpu_batch *bb, const d
         K3_GPU_CHECK(ds4_gpu_k3_copy_rows_tensor(bb->kv_latent, DS4_N_KV_LORA, bb->kv, DS4_N_KV_LORA + rot, DS4_N_KV_LORA, T) != 0,
                      "mla kv latent pack");
         K3_GPU_CHECK(k3_gpu_rms_norm_rows(bb->latent_norm, bb->kv_latent, model, l->attn_kv_a_norm, DS4_N_KV_LORA, T), "mla kv_a norm");
-        if (k3_lat_sel_on() && T > g_k3_lat.loop_max) {   /* step 107: one in-order FMA chain per row, whatever the batch */
+        if (k3_lat_sel_on() && T > g_k3_lat.loop_max && !g_k3_verify_on) {   /* step 107: one in-order FMA chain per row, whatever the batch (step 147: a verification block's rows are single rows) */
             const double tm0 = g_k3_trace_on ? k3_trace_mark(bb->latent_norm) : 0.0;
             K3_GPU_CHECK(ds4_gpu_k3_kvb_chain_tensor(bb->kvb, model->map, model->size, l->attn_kv_b->abs_offset, DS4_N_KV_LORA,
                          heads * (nope + vdim), bb->latent_norm, T) != 0, "mla kv_b (chain)");
@@ -65025,7 +65025,7 @@ static bool k3_gpu_layer_batch_tier(k3_gpu_buffers *b, k3_gpu_batch *bb, const d
         if (k3_lat_on()) {   /* step 96: a batch of more than loop_max rows is one matmul, kept whole for replay; smaller ones are rows */
             static int32_t chunk = -1;
             if (il == g_k3_lat.first_mla) {
-                chunk = T > g_k3_lat.loop_max ? (k3_lat_sel_on() ? 0 : k3_lat_new_chunk(pos0, T)) : -1;   /* step 107: no batch copies */
+                chunk = T > g_k3_lat.loop_max && !g_k3_verify_on ? (k3_lat_sel_on() ? 0 : k3_lat_new_chunk(pos0, T)) : -1;   /* step 107: no batch copies; step 147 */
                 k3_lat_claim(pos0, T, chunk);
             }
             K3_GPU_CHECK(k3_lat_record(il, pos0, T, bb->latent_norm, bb->kv, chunk), "latent record");
@@ -66433,7 +66433,7 @@ static void k3_hash_row(const char *what, uint32_t pos, uint32_t il, const ds4_g
     free(h);
 }
 extern char **environ;
-#define K3_QWEN_MAX_ROWS 64u   /* step 120: the widest verification block (anchor + drafts); step 128: 64, the rows kernels' limit (the default since 11 Nov 2026) */
+#define K3_QWEN_MAX_ROWS 256u   /* step 120: the widest verification block (anchor + drafts); step 128: 64, the default since 11 Nov 2026; step 147: up to 256 on request */
 static struct {
     bool tried, on, active;
     bool hs_wait; uint32_t b_wait;   /* step 94: 'H' sent and its answer not read yet; answers to 'B' read with it */
@@ -66901,7 +66901,7 @@ static void k3_qwen_end(void) {
                                       (unsigned long long)g_k3_qwen.n_wide, g_k3_qwen.kin_rows, g_k3_qwen.kin_host_pinned ? "page-locked" : "pageable", g_k3_qwen.t_spill);
     }
     if (g_k3_qwen.n_blocks && k3_qwen_rows() > 8u) {   /* step 92b: every width that occurred */
-        char line[400]; size_t o = 0;
+        char line[1600]; size_t o = 0;   /* step 147: up to 256 widths */
         for (uint32_t r = 2; r <= K3_QWEN_MAX_ROWS && o < sizeof(line) - 32u; r++)   /* step 120 */
             if (g_k3_qwen.by_rows[r]) o += (size_t)snprintf(line + o, sizeof(line) - o, " %u:%llu", r, (unsigned long long)g_k3_qwen.by_rows[r]);
         line[o] = 0;

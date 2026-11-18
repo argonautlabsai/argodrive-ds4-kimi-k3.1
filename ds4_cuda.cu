@@ -41986,7 +41986,7 @@ static uint32_t g_k3_split_g1_reserve_mb = 0;
 extern "C" void ds4_gpu_k3_split_second_card(int cuda_device, uint32_t reserve_mb) {
     g_k3_split_g1_dev = cuda_device; g_k3_split_g1_reserve_mb = reserve_mb;
 }
-#define K3_G1_ROWS 64u
+#define K3_G1_ROWS 256u   /* step 147: the widest verification block */
 static bool k3_g1_init(k3_raw_pool &p, int dev, uint32_t ff, uint32_t latent, uint32_t cap_host) {
     int n_dev = 0;
     if (cudaGetDeviceCount(&n_dev) != cudaSuccess || dev < 0 || dev >= n_dev) {
@@ -42029,7 +42029,8 @@ static bool k3_g1_init(k3_raw_pool &p, int dev, uint32_t ff, uint32_t latent, ui
                  cudaEventCreateWithFlags(&p.dev_ready[s], cudaEventDisableTiming) == cudaSuccess;
         }
     }
-    p.g1_rows = K3_G1_ROWS; p.g1_list_cap = (size_t)K3_G1_ROWS * 64u; p.g1_part_cap = (size_t)4u << 20;   /* floats: 16 MB of partial rows */
+    p.g1_rows = K3_G1_ROWS; p.g1_list_cap = (size_t)K3_G1_ROWS * 16u;   /* 4,096 (row, slot) pairs, as before */
+    p.g1_part_cap = (size_t)K3_G1_ROWS * 16u * latent > ((size_t)4u << 20) ? (size_t)K3_G1_ROWS * 16u * latent : (size_t)4u << 20;   /* floats: a block's compact partial rows (59 MB at 256 rows; 16 MB until step 147) */
     ok = ok && cudaMalloc(&p.g1_x, sizeof(float) * (size_t)p.g1_rows * latent) == cudaSuccess &&
          cudaMalloc(&p.g1_mid, sizeof(float) * (size_t)p.g1_rows * ff) == cudaSuccess &&
          cudaMalloc(&p.g1_part, sizeof(float) * p.g1_part_cap) == cudaSuccess &&
