@@ -12,6 +12,7 @@ This is a **source release**. Model weights, NVIDIA drivers, CUDA build tools (o
 
 - **Kimi K3.1 Pro:** [installation guide](https://argonautlabs.ai/guides/install-kimi-k31.html) · [CUDA and Metal configuration](tools/kimi-k3/README.md)
 - **DeepSeek V4.1 Flash 1017:** [setup, model file and streaming settings](tools/deepseek-v41/README.md) · [one-, two- and three-drive M5 Max results](#deepseek-v41-flash-on-the-same-macbook-pro-macos-metal)
+- **DeepSeek V4.1 Flash 1017 on two NVIDIA GPUs:** [results on two RTX PRO 6000](#deepseek-v41-flash-on-two-rtx-pro-6000-linux-cuda) · [switches and preload lists](tools/deepseek-v41/README.md#cuda-two-gpus-the-layers-split-between-them)
 
 ### Measured results at a glance
 
@@ -143,6 +144,24 @@ arithmetic: every run produced the same text, every decode step's logits equal t
 switches (1,500 steps compared), and a three-turn chat through the server gave the same three answers. Switches, the
 two- and three-drive setup, memory sizing and the CUDA counterparts:
 [DeepSeek V4.1 Flash](tools/deepseek-v41/README.md).
+
+### DeepSeek V4.1 Flash on two RTX PRO 6000 (Linux, CUDA)
+
+On CUDA the same model runs on two cards with its layers split between them (`DS4_CUDA_STREAM_SPLIT=1`): the first
+20 layers on one card, the other 20 on the second, each card with its own cache of routed experts and the rest
+streamed from NVMe. Measured on 18 November with `ds4-bench` on two RTX PRO 6000 Blackwell cards (96 GB each), the
+model file on a RAID0 of three NVMe drives, fresh processes, three runs per row:
+
+| setup | 512-token prompt, 200 generated | 1,556-token prompt, 300 generated |
+|---|---|---|
+| one card | 54.0–54.2 / 21.6–21.9 | 114.5 / 21.0 |
+| two cards | 53.1–53.3 / 44.6–44.7 | 112.2–112.6 / 45.6–45.9 |
+| two cards, the caches and a 48 GiB host-RAM tier preloaded at start-up | **144.8–149.0 / 47.7–47.8** | **219.0–220.2 / 49.1–49.2** |
+
+Each cell is prefill / decode in tok/s. Through the server, a chat prompt of about 1,600 tokens that follows another
+is processed in 4.6 to 4.9 s. Every decode step of these rows has the logits of the one-card build before the change
+(3,900 steps compared by hash). The split, the kernel and cache changes behind it, the preload lists and the
+limits: [two GPUs, the layers split between them](tools/deepseek-v41/README.md#cuda-two-gpus-the-layers-split-between-them).
 
 ### Architecture and validation
 

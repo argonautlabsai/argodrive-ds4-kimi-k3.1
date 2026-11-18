@@ -268,6 +268,7 @@ Never include a prompt you are going to measure.
 
 - `make_corpus.py`, `make_hotlist.py`, `make_cooc.py`: the ranking and the conditional table, as above.
 - `make_replica.py`: an experts-only sparse replica for a second or third drive, verified against the source.
+- `make_cuda_preload.py`: the two preload lists of the CUDA caches (VRAM and host RAM) from a ranking.
 - `make_decode_chart.py`: the decode chart at the top of this page, as one SVG for light and one for dark pages.
 - `route_cache_sim.py`: replays a recorded run (`DS4_ARGODRIVE_PREFILL_TOKENS_DUMP`, `DS4_MOE_RECORD_SELECTED_IDS`)
   through a model of the expert cache, to size a cache or compare eviction rules without running the engine. It
@@ -304,8 +305,108 @@ switches. Decode on the three short prompts:
 The 1,556-token prompt took 25.5 to 25.7 s to process with the switches and 47.8 s without. The Kimi K3.1 path gave
 the logits of its published references on the same binary (840 positions).
 
+## CUDA: two GPUs, the layers split between them
+
+DeepSeek V4.1 Flash runs its 40 layers one after the other, so two cards need not share a layer. With
+`DS4_CUDA_STREAM_SPLIT` the first card holds the embedding and the layers below the cut, the second the layers from
+the cut on and the output head; the residual stream crosses from one card to the other once per token, and once per
+sweep of the prompt pass. Each card has its own cache of routed experts, so two 96 GB cards keep 9,152 of the model's
+15,360 experts in VRAM where one keeps 3,890, and a host-RAM tier can hold more behind them.
+
+```
+DS4_CUDA_STREAM_SPLIT=1 DS4_STREAMING_CACHE_IGNORE_HOST_BUDGET=1 \
+DS4_CUDA_PARALLEL_EXPERT_READ=1 DS4_CUDA_EXPERT_READERS=8 DS4_CUDA_READ_THREADS=4 \
+DS4_CUDA_STAGE_RING=16 DS4_CUDA_UPLOAD_ON_READY=1 \
+./ds4-server -m DeepSeek-V4.1-Flash-1017-MXFP4-experts.gguf --cuda --ssd-streaming \
+    --ssd-streaming-cache-experts 9200 --gpu-devices 0,1 --gpu-vram auto --ctx 8192
+```
+
+| switch | effect |
+|---|---|
+| `DS4_CUDA_STREAM_SPLIT=<cut>` | with `--ssd-streaming --gpu-devices 0,1`: the layers below the cut on the first card, the rest on the second. The cut is 2, 8, 14 or 20 (the layers that own a compressed-KV cache); `1` or `auto` is 20. `--ssd-streaming-cache-experts` is then the total for both cards, divided by their share of the layers and capped by each card's free memory less the reserve |
+| `DS4_CUDA_VRAM_TIER_LOAD=<list>`, `DS4_CUDA_HOST_TIER_LOAD=<list>` | experts to load into the VRAM caches and into the host-RAM tier (`DS4_CUDA_HOST_EXPERT_CACHE_GB`) before the first prompt; with the split each card takes the experts of its own layers. `make_cuda_preload.py` writes both lists |
+| `DS4_CUDA_PREFILL_LAYER_SHARE=0` | turns off the prompt pass's per-layer share of the cache, which is on with the split (`=1` turns it on for one card) |
+| `DS4_CUDA_MXFP4_DOWN_TILE_ROWS=16\|32\|64`, `DS4_CUDA_MXFP4_GATE_TILE_ROWS=32\|64` | the larger blocks the MXFP4 routed-expert kernels used for short batches before this change |
+| `DS4_CUDA_STREAM_SPLIT_COPY=full`, `DS4_CUDA_NO_PEER_ACCESS=1`, `DS4_V41_LAYER_HASH=<n>`, `DS4_V41_STAGE_HASH=<layer>`, `DS4_CUDA_PREFILL_LAYER_SHARE_STATS=1` | checks: copy every working tensor at a crossing, cross through host memory, print a hash of every layer's (or one layer's every stage's) output, print what each prompt pass found in the caches |
+
+Three changes besides the split account for the speed:
+
+- **Kernel blocks sized for decode.** The MXFP4 routed-expert kernels ran a decode token in blocks sized for a prompt
+  batch: one layer's down projection was 80 blocks and its gate and up projections 216, which leaves most of a large
+  card idle. For batches of up to 8 tokens they now use blocks of 8 rows (down) and 16 rows (gate and up), 640 and
+  864 blocks a layer. Each row's arithmetic and its order are unchanged. Decode with every expert resident went from
+  35.5 to 51.3 tok/s on one card.
+- **A share of the cache for every layer in the prompt pass.** A 1,600-token prompt routes to about 285 of a layer's
+  384 experts, more than a layer's share of the cache (about 228 slots). Evicting the oldest expert whatever its
+  layer, each layer's loads pushed out what the next prompt would need first, and a second 1,600-token prompt loaded
+  as much as the first (33 s each from one NVMe drive). The prompt pass now evicts inside the layer first and keeps
+  each layer to its share; the next prompt finds 170 to 200 experts per layer in place and takes 12 to 16 s there.
+- **Caches loaded before the first prompt.** See below.
+
+**Preloading the caches.** `make_cuda_preload.py` turns a ranking into two lists: every ranked expert, the best of
+each layer first, for the VRAM caches, and the experts that follow each layer's first 220 for the RAM tier.
+
+```
+python3 tools/deepseek-v41/make_cuda_preload.py DeepSeek-V4.1-Flash-1017-MXFP4-experts.gguf \
+    tools/deepseek-v41/hotlists/deepseek-v4.1-flash-1017-readahead.txt preload --ram-gb 48
+# then, added to the command above:
+DS4_CUDA_VRAM_TIER_LOAD=preload.vram.txt DS4_CUDA_HOST_TIER_LOAD=preload.ram.txt \
+DS4_CUDA_HOST_EXPERT_CACHE_GB=48 DS4_CUDA_POOL_FIRST=1 DS4_CUDA_POOL_EVICT_BIAS=50
+```
+
+`ds4-server` loads them once its sessions exist and before it accepts a request, `ds4-bench` before the timed prompt
+pass: 22 s here for 160 GiB into the two caches and 48 GiB pinned and read into RAM. A cache takes the card memory
+that is free when it is built, less the reserve the prompt pass works in, which is why this happens after the
+session's own allocations and not when the model is opened. The ranking can also be a session's own request counts
+(`DS4_CUDA_REQ_HIST_DUMP=<file>`). A RAM tier loaded from a list stays as loaded: filling leftover slots on demand
+costs one serial read per miss and keeps what VRAM has just loaded, which VRAM evicts long after the tier dropped it.
+
+**Measured on 18 November 2026.** Two RTX PRO 6000 Blackwell cards (96 GB each) in an Ubuntu VM with 16 cores and
+80 GiB of RAM, the model file on a RAID0 of three NVMe drives read at about 15 GiB/s. `ds4-bench`, greedy, every run
+a fresh process, the head of *I Promessi Sposi* as the prompt; prefill is the prompt pass and decode the steady rate
+after the first token. Three runs per row where a range is given. Every row uses
+`DS4_STREAMING_CACHE_IGNORE_HOST_BUDGET=1` and asks for 4,600 cached experts per card.
+
+| setup | 512-token prompt, 200 generated | 1,556-token prompt, 300 generated |
+|---|---|---|
+| one card, serial reads | 46.7 / 17.0 | 112.8 / 16.3 |
+| one card, parallel expert reads | 54.0 to 54.2 / 21.6 to 21.9 | 114.5 / 21.0 |
+| two cards, parallel expert reads | 53.1 to 53.3 / 44.6 to 44.7 | 112.2 to 112.6 / 45.6 to 45.9 |
+| two cards, the caches and a 48 GiB RAM tier preloaded | **144.8 to 149.0 / 47.7 to 47.8** | **219.0 to 220.2 / 49.1 to 49.2** |
+
+Each cell is prefill / decode in tok/s; the two-card row without a preload was measured on the commit before the
+preload was added. A 3,000-token prompt in an 8,192-token context: 182.0 / 42.9 on two cards, 304.9 / 47.3 with the
+preload. With every expert of a token already in VRAM (a prompt of one repeated token) the two cards decode at
+57.0 tok/s: what is left between that and the table is expert loading, about three loads a token.
+
+Through `ds4-server` (8,192-token context), five chat prompts of about 1,600 tokens in a row on different text took
+15.1 s and then 7.0 to 7.4 s to process on two cards, and 8.5 s and then 4.6 to 4.9 s with the preload; the first
+of the five is the one that follows a start.
+
+The preload lists came from the ranking this directory ships. Lists made from one session's request counts on other
+chapters of the same book gave 47.4 to 47.8 and 49.7 to 49.8 tok/s decode, and with the shipped ranking the English
+long-context prompt of `tests/` (1,200 tokens, 200 generated) decoded at 43.9 tok/s against 39.8 without a preload.
+
+**The output is the one-card build's.** Every decode step of every row above has the logits, compared by hash, of the
+one-card run of the tree before these changes: 4,796 steps in 21 runs. So have the runs that cross through host
+memory, copy every working tensor at a crossing, cut at layer 14, cache a single expert, or use the previous kernel
+blocks. The server returned the same text for three chat requests on one card, on two and on two with the preload,
+and `tests/test_deepseek41_prefill --cuda` (two sessions, mixed appends, snapshots, cancel, restore) passes on one
+card and on two (`DS4_TEST_GPU_DEVICES=0,1`). Three things had to be made equal for that: the quantised MXFP4
+kernels and the token-tile attention, which multi-GPU configurations turned off, stay on with the split; and each
+card's weights are laid out on 256-byte boundaries, because cuBLAS sums a matrix that starts elsewhere in a
+different order.
+
+**Limits.** Each layer runs on one card; this is not the tensor-parallel mode. Requests are served one at a time:
+decoding several sessions' rows in one batch is off with the split. DSpark and the decode read-ahead are not part of
+it. Prompts beyond about 11,000 tokens have not been run on two cards. And the model still does not fit: with 9,152
+experts in VRAM and 2,739 in the RAM tier, 3,469 stay on the drive.
+
 ## What was measured and left out
 
+- A host-RAM tier filled on demand on CUDA, not from a list: no hit in 8,310 loads with a 24 GiB tier, because
+  VRAM evicts an expert long after a smaller tier has dropped it. The tier is worth its memory only when it is
+  loaded from a ranking.
 - Committing the rest of a reading layer's routed work before the reads return, behind a kernel that waits on the
   GPU for the host's release (the engine's inline tensor-parallel gate, used for reads): 14.35 / 14.43 / 13.92 tok/s
   against 14.22 / 14.05 / 14.23 without it, same text. Under 1 % and inside the spread of the runs, for a kernel
