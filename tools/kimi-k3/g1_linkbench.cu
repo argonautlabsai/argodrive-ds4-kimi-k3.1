@@ -15,6 +15,7 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <cuda_runtime.h>
 #include <dirent.h>
@@ -147,8 +148,12 @@ int main(int argc, char **argv) {
         if (c.files.empty()) { fprintf(stderr, "no expert files in %s\n", dir); return 1; }
         c.dev[0] = dev0; c.dev[1] = dev1; c.readers = readers;
         for (int w = 0; w < 2; w++) { CK(cudaSetDevice(c.dev[w])); CK(cudaMalloc(&c.region[w], CHUNK * (size_t)readers)); }
-        printf("%zu files of %.1f MB (%.1f GB per arm), %d readers, O_DIRECT; each arm reads different files than the one before only if --files allows\n",
-               c.files.size(), CHUNK / 1e6, c.files.size() * CHUNK / 1e9, readers);
+        printf("%zu files of %.1f MB, a third of them per arm (%.1f GB), %d readers, O_DIRECT; no file is read twice\n",
+               c.files.size(), CHUNK / 1e6, c.files.size() / 3 * CHUNK / 1e9, readers);
+        {   /* one fixed shuffle, so that every arm reads the same mix of directories and no file twice */
+            uint32_t x = 2463534242u;
+            for (size_t i = c.files.size(); i > 1; i--) { x ^= x << 13; x ^= x >> 17; x ^= x << 5; std::swap(c.files[i - 1], c.files[x % i]); }
+        }
         const size_t per_arm = c.files.size() / 3;
         const std::vector<std::string> all = c.files;
         for (int policy = 0; policy < 3; policy++) {
