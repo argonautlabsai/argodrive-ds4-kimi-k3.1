@@ -16017,6 +16017,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+    ds4_engine_streaming_preload(engine);   /* after every slot's session: see ds4.c */
 
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,

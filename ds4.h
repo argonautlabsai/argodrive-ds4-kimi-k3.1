@@ -417,6 +417,9 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
 void ds4_engine_tp_unbind(ds4_engine *e);
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
+/* Two-card SSD streaming with a preload list: build the expert caches and the RAM tier now. Call after the sessions
+ * are created; a no-op otherwise. */
+void ds4_engine_streaming_preload(ds4_engine *e);
 void ds4_session_free(ds4_session *s);
 int ds4_session_power(ds4_session *s);
 int ds4_session_set_power(ds4_session *s, int power_percent);

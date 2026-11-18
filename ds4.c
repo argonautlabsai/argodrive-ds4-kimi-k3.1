@@ -79907,6 +79907,19 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         ds4_gpu_set_streaming_expert_cache_budget(share);
                         ds4_gpu_set_streaming_expert_cache_expert_bytes(slab_expert_bytes);
                         ds4_gpu_set_streaming_expert_cache_layers((uint32_t)(tier == 0 ? cut : (int)DS4_N_LAYER - cut));
+                        {   /* the file range of this card's routed experts: what it takes from a VRAM ranking */
+                            uint64_t lo = UINT64_MAX, hi = 0;
+                            for (int il = tier == 0 ? 0 : cut; il < (tier == 0 ? cut : (int)DS4_N_LAYER); il++) {
+                                const ds4_tensor *x[3] = {e->weights.layer[il].ffn_gate_exps, e->weights.layer[il].ffn_up_exps,
+                                                          e->weights.layer[il].ffn_down_exps};
+                                for (int k = 0; k < 3; k++) {
+                                    if (!x[k]) continue;
+                                    if (x[k]->abs_offset < lo) lo = x[k]->abs_offset;
+                                    if (x[k]->abs_offset + x[k]->bytes > hi) hi = x[k]->abs_offset + x[k]->bytes;
+                                }
+                            }
+                            if (hi > lo) ds4_gpu_set_streaming_expert_cache_span(lo, hi);
+                        }
                         fprintf(stderr, "ds4: SSD streaming split: GPU%d may cache up to %u experts of %.2f MiB\n",
                                 gpu_cfg->device_indices[tier], share, (double)slab_expert_bytes / 1048576.0);
                     }
@@ -81640,6 +81653,40 @@ static int ds4_session_tp_register(ds4_session *s) {
     }
     s->tp_session_id = id;
     return 1;
+}
+
+/* DS4_CUDA_VRAM_TIER_LOAD / DS4_CUDA_HOST_TIER_LOAD with the layers on two cards: build each card's expert cache and
+ * the RAM tier now and load their rankings, so that the first prompt does not pay for the pinning and the reads.
+ * To be called once the sessions exist: a cache takes the card memory that is free when it is built, less the reserve
+ * the prompt pass works in, and a session graph allocated after it would come out of that reserve. Without the call
+ * the first routed layer of the first prompt does the same work. */
+void ds4_engine_streaming_preload(ds4_engine *e) {
+#ifdef DS41_SPLIT_BUILD
+    static bool done;
+    const char *seed_vram = getenv("DS4_CUDA_VRAM_TIER_LOAD"), *seed_ram = getenv("DS4_CUDA_HOST_TIER_LOAD");
+    const int cut = g_ds41_split_cut;
+    if (done || !e || cut <= 0 || !e->ssd_streaming || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 ||
+        !((seed_vram && seed_vram[0]) || (seed_ram && seed_ram[0]))) return;
+    done = true;
+    const double t0 = now_sec();
+    for (int tier = 0; tier < 2; tier++) {
+        const uint32_t il = tier == 0 ? 0u : (uint32_t)cut;
+        const ds4_layer_weights *l = &e->weights.layer[il];
+        if (!l->ffn_gate_exps || !l->ffn_down_exps || ds4_gpu_set_current_device(tier) != 0) continue;
+        const ds4_gpu_stream_expert_table table = graph_stream_expert_table_make(&e->model, l, il,
+            routed_expert_row_bytes(l->ffn_gate_exps) * DS4_N_FF_EXP,
+            routed_expert_row_bytes(l->ffn_down_exps) * DS4_N_EMBD);
+        const int32_t first_expert = 0;   /* asking for one expert builds the card's cache and seeds it */
+        if (!ds4_gpu_stream_expert_cache_begin_selected_load(&table, &first_expert, 1))
+            fprintf(stderr, "ds4: SSD streaming split: preload failed on card %d\n", tier);
+        (void)ds4_gpu_stream_expert_host_tier_prime(&table);   /* one RAM tier serves both cards */
+        (void)ds4_gpu_synchronize();
+    }
+    (void)ds4_gpu_set_current_device(0);
+    fprintf(stderr, "ds4: SSD streaming split: caches built and rankings loaded in %.1f s\n", now_sec() - t0);
+#else
+    (void)e;
+#endif
 }
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {

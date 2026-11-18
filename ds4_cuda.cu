@@ -98,6 +98,7 @@ template <typename T> struct ds4_per_tier {
     ds4_per_tier() : v() {}
     explicit ds4_per_tier(const T &init) { for (int i = 0; i < DS4_MAX_GPUS; i++) v[i] = init; }
 };
+static ds4_per_tier<uint64_t> g_stream_span_lo_pt, g_stream_span_hi_pt;   /* file range of a card's routed experts */
 #include "ds4_gpu_tp.h"
 #include "ds4_gpu_copy.h"
 #include "ds4_iq2_tables_cuda.inc"
@@ -31738,6 +31739,10 @@ static int cuda_host_expert_tier_load(char *dg, char *du, char *dd,
         }
         g_host_tier_by_gate.erase(it);
     }
+    /* A tier loaded from a ranking stays as loaded: a slot the list left over is not filled on demand. That fill is
+     * one serial read at a time (the bypass below takes the parallel read), and what it keeps is what VRAM has just
+     * loaded, which VRAM evicts long after the tier has dropped it. */
+    if (g_host_tier_pinned) { g_host_tier_bypass++; return -1; }
     uint32_t victim = UINT32_MAX;
     uint64_t oldest = UINT64_MAX;
     for (uint32_t i = 0; i < (uint32_t)g_host_tier_slots.size(); i++) {
@@ -31766,6 +31771,12 @@ static int cuda_host_expert_tier_load(char *dg, char *du, char *dd,
     g_host_tier_by_gate[gate] = victim;
     g_host_tier_reads++;
     return 1;
+}
+
+/* Pin the RAM tier and load its ranking now (DS4_CUDA_HOST_EXPERT_CACHE_GB, DS4_CUDA_HOST_TIER_LOAD); otherwise the
+ * first cache miss does it, inside the first prompt. Returns 1 when the tier is on. */
+extern "C" int ds4_gpu_stream_expert_host_tier_prime(const ds4_gpu_stream_expert_table *table) {
+    return table ? cuda_host_expert_tier_init(table) : -1;
 }
 
 
@@ -32356,6 +32367,9 @@ static int cuda_stream_selected_cache_begin_load(
                         if (line[0] == '#' || line[0] == '\n') continue;
                         unsigned long long lg = 0, lu = 0, ld = 0, lc = 0;
                         if (sscanf(line, "%llu %llu %llu %llu", &lg, &lu, &ld, &lc) != 4) continue;
+                        if (g_stream_span_hi_pt.v[g_stream_tier] &&
+                            ((uint64_t)lg < g_stream_span_lo_pt.v[g_stream_tier] ||
+                             (uint64_t)lg >= g_stream_span_hi_pt.v[g_stream_tier])) continue;   /* another card's layer */
                         if (g_stream_expert_by_gate.count((uint64_t)lg)) continue;
                         const uint32_t idx = (uint32_t)filled;
                         char *dg = cache.gate_ptr + (uint64_t)idx * table->gate_expert_bytes;
@@ -39558,6 +39572,13 @@ extern "C" void ds4_gpu_set_stream_split(int on) { g_stream_split_on = on ? 1 : 
 /* The number of layers the calling card serves: a layer's share of that card's expert cache
  * (DS4_CUDA_PREFILL_LAYER_SHARE). 0: the layers seen so far. */
 extern "C" void ds4_gpu_set_streaming_expert_cache_layers(uint32_t layers) { g_pf_share.layers = layers; }
+
+/* The file range that holds the routed experts of the calling card's layers (0, 0: every layer). A VRAM ranking
+ * (DS4_CUDA_VRAM_TIER_LOAD) lists experts of the whole model; a card seeds only its own. */
+extern "C" void ds4_gpu_set_streaming_expert_cache_span(uint64_t lo, uint64_t hi) {
+    g_stream_span_lo_pt.v[g_stream_tier] = lo;
+    g_stream_span_hi_pt.v[g_stream_tier] = hi;
+}
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
     if (experts != g_stream_expert_budget) cuda_stream_selected_cache_release();

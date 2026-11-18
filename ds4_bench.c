@@ -758,6 +758,7 @@ int main(int argc, char **argv) {
         close_engine(engine, tp_leader);
         return 1;
     }
+    ds4_engine_streaming_preload(engine);   /* start-up work, as in the server: not part of the timed prompt pass */
     if (cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR &&
         wait_distributed_route(session) != 0)
     {
