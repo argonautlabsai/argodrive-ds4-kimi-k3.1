@@ -67087,6 +67087,8 @@ static int generate_k3_cuda_argmax(
         token = ids[pos];
     }
     const double t_gen0 = now_sec(); double t_first_end = 0.0;   /* step 73 */
+    double g_wait0 = 0.0; uint64_t g_bytes0 = 0, g_cd0 = 0, g_ch0 = 0, g_cm0 = 0;   /* step 142: this generation's expert traffic */
+    ds4_gpu_k3_moe_raw_stats(&g_wait0, &g_bytes0); ds4_gpu_k3_cache_stats(&g_cd0, &g_ch0, &g_cm0);
     bool ok_session_keep = true;
     for (;;) {
         const double t0 = now_sec();
@@ -67292,6 +67294,17 @@ static int generate_k3_cuda_argmax(
         fprintf(stderr, "ds4: K3 decode split: first step %.2f s; steady %d tokens in %.2f s (%.2f tok/s); generation incl. first step %.2f tok/s\n",
                 first_s, produced - 1, steady_s, steady_s > 0.0 ? (double)(produced - 1) / steady_s : 0.0, gen_s > 0.0 ? (double)produced / gen_s : 0.0);
     }
+    if (produced > 0) {   /* step 142: fills count once each, read-ahead included */
+        double g_wait1 = 0.0; uint64_t g_bytes1 = 0, g_cd1 = 0, g_ch1 = 0, g_cm1 = 0;
+        ds4_gpu_k3_moe_raw_stats(&g_wait1, &g_bytes1); ds4_gpu_k3_cache_stats(&g_cd1, &g_ch1, &g_cm1);
+        fprintf(stderr, "ds4: K3 generation expert traffic per token: device cache %.0f, host pool %.0f, drives %.0f; %.2f GB read per token, %.1f GB/s averaged over the generation, %.3f s per token waiting for experts\n",
+                (double)(g_cd1 - g_cd0) / produced, (double)(g_ch1 - g_ch0) / produced, (double)(g_cm1 - g_cm0) / produced,
+                (double)(g_bytes1 - g_bytes0) / 1e9 / produced, gen_s > 0.0 ? (double)(g_bytes1 - g_bytes0) / 1e9 / gen_s : 0.0,
+                (g_wait1 - g_wait0) / produced);
+    }
+#if !defined(__APPLE__)
+    ds4_gpu_k3_g1_report();   /* step 140 */
+#endif
     if (ds4_gpu_k3_skip_mode()) {   /* step 57: totals since the process started */
         uint64_t sk = 0, so = 0, ob[6]; double sm = 0.0;
         ds4_gpu_k3_skip_stats(&sk, &sm, &so, ob);

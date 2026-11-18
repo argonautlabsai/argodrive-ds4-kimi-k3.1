@@ -41365,6 +41365,10 @@ struct k3_lru {
        Simulated on eight chat prompts at 1,584 slabs: LRU 30 %, decayed 35 % hits (Belady 55 %). */
     bool decay_mode = false;
     bool last_evicted_transient = false;            /* step 78: the slab alloc() just took was transient */
+    /* step 140: while bar_n != 0, alloc() leaves the slabs bar_lo .. bar_lo + bar_n - 1 alone (the second card's, during a call
+       whose experts are not computed there) */
+    uint32_t bar_lo = 0, bar_n = 0;
+    bool barred(uint32_t s) const { return bar_n != 0u && s - bar_lo < bar_n; }
     double tick = 0.0, lb = 0.0;                    /* tick advances per layer call; lb = -ln(decay) / 92 */
     std::vector<float> score;
     uint32_t rng = 12345u;
@@ -41413,16 +41417,16 @@ struct k3_lru {
             for (uint32_t i = 0; i < 64u && i < cap; i++) {
                 rng = rng * 1664525u + 1013904223u;
                 const uint32_t s = (rng >> 8) % cap;
-                if (pinned[s]) continue;
+                if (pinned[s] || barred(s)) continue;
                 if (score[s] < best) { best = score[s]; victim = (int)s; }
             }
-            if (victim < 0) { for (uint32_t s = 0; s < cap; s++) if (!pinned[s]) { victim = (int)s; break; } }
+            if (victim < 0) { for (uint32_t s = 0; s < cap; s++) if (!pinned[s] && !barred(s)) { victim = (int)s; break; } }
         } else {
             if (hot && bias_window && twin_map) {   /* step 75: prefer a cold slab whose expert the host pool still holds */
                 uint32_t seen = 0;
                 for (auto bt = order.rbegin(); bt != order.rend() && seen < bias_window; ++bt) {
                     const uint32_t s = *bt;
-                    if (pinned[s]) continue;
+                    if (pinned[s] || barred(s)) continue;
                     if (key[s] == K3_NOKEY || transient[s]) { victim = (int)s; break; }
                     if (chance[s]) continue;
                     seen++;
@@ -41433,7 +41437,7 @@ struct k3_lru {
             auto it = order.rbegin();
             while (it != order.rend()) {
                 const uint32_t s = *it;
-                if (pinned[s]) { ++it; continue; }
+                if (pinned[s] || barred(s)) { ++it; continue; }
                 if (chance[s] && key[s] != K3_NOKEY) {
                     /* second chance: back to the hot end; the reverse iterator keeps its base, so it now yields the
                        entry that preceded s and the scan goes on without advancing */
@@ -41555,6 +41559,23 @@ struct k3_raw_pool {
     float *host_tw = nullptr, *dev_tw = nullptr;
     size_t list_cap = 0;
     int device = 0, direct = 1;
+    /* step 140 (18 Nov 2026, DS4_K3_GPU1): a second card as an expert cache; see k3_g1_init. Its slabs are g1_base ..
+       g1_base + g1_n - 1 of the device cache. */
+    int g1_dev = -1, g1_mode = 1;                     /* the card; 1 = plain decode steps compute there, 0 = every use copies the slab over */
+    uint32_t g1_base = 0, g1_n = 0;
+    uint8_t *g1_region = nullptr;
+    cudaStream_t g1_stream = nullptr, g1_cp = nullptr;   /* that card's kernels and slab reads; its copy-downs */
+    cudaStream_t g1_up[8] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}; uint32_t g1_n_up = 0;   /* uploads into its slabs */
+    std::vector<cudaEvent_t> host_free1;              /* host slab -> its last use by a stream of that card */
+    float *g1_x = nullptr, *g1_mid = nullptr, *g1_part = nullptr, *g1_tw = nullptr; uint32_t *g1_tok = nullptr, *g1_iota = nullptr;   /* on that card */
+    float *g1_hx = nullptr, *g1_hpart = nullptr;      /* pinned: the input rows on their way over, the partial rows on their way back */
+    size_t g1_part_cap = 0, g1_list_cap = 0; uint32_t g1_rows = 0;
+    cudaEvent_t g1_ev_x = nullptr, g1_ev_in = nullptr, g1_ev_part = nullptr;
+    uint8_t *g1_scratch[4] = {nullptr, nullptr, nullptr, nullptr}, *g1_bounce[4] = {nullptr, nullptr, nullptr, nullptr};   /* a slab copied over: pinned, then on the first card */
+    cudaEvent_t g1_scr_dn[4] = {nullptr, nullptr, nullptr, nullptr}, g1_scr_up[4] = {nullptr, nullptr, nullptr, nullptr};
+    uint32_t g1_scr_next = 0;
+    uint64_t g1_uses = 0, g1_fetches = 0, g1_calls = 0;   /* main thread */
+    std::atomic<uint64_t> up_bytes[2] = {{0}, {0}};   /* bytes uploaded into each card's slabs */
     std::mutex mu;
     std::condition_variable cv_job, cv_done;
     std::deque<k3_raw_job> jobs;
@@ -41747,7 +41768,13 @@ static void k3_raw_worker(k3_raw_pool *p) {
         int ok = 1;
         if (job.read) {
             /* the slab's previous content may still be the source of an upload */
+            if (p->g1_n) (void)cudaSetDevice(p->device);   /* step 140: each event is asked on its own card */
             ok = cudaEventSynchronize(p->host_free[job.host]) == cudaSuccess;
+            if (ok && p->g1_n) {
+                (void)cudaSetDevice(p->g1_dev);
+                ok = cudaEventSynchronize(p->host_free1[job.host]) == cudaSuccess;
+                (void)cudaSetDevice(p->device);
+            }
             const double tr0 = k3_now_sec();
             int used = -1;
             if (ok) {
@@ -41801,15 +41828,18 @@ static void k3_raw_worker(k3_raw_pool *p) {
                 if (ok) { std::lock_guard<std::mutex> lk2(p->mu); p->hfail[(uint32_t)job.host] = 0; }
             }
         }
-        const cudaStream_t us = p->up_streams[(uint32_t)job.dev % p->n_up];   /* step 63 */
+        const bool on1 = p->g1_n != 0u && (uint32_t)job.dev - p->g1_base < p->g1_n;   /* step 140: a slab of the second card */
+        if (p->g1_n) (void)cudaSetDevice(on1 ? p->g1_dev : p->device);
+        const cudaStream_t us = on1 ? p->g1_up[(uint32_t)job.dev % p->g1_n_up] : p->up_streams[(uint32_t)job.dev % p->n_up];   /* step 63 */
         if (ok) {
             if (cudaStreamWaitEvent(us, p->dev_free[job.dev], 0) != cudaSuccess ||
                 cudaStreamWaitEvent(us, p->host_free[job.host], 0) != cudaSuccess ||
+                (p->g1_n && cudaStreamWaitEvent(us, p->host_free1[job.host], 0) != cudaSuccess) ||
                 cudaMemcpyAsync(p->dev_ptr[(size_t)job.dev] + job.off, h + job.off, job.len, cudaMemcpyHostToDevice,
                                 us) != cudaSuccess) {
                 fprintf(stderr, "ds4: K3 expert upload failed: %s\n", cudaGetErrorString(cudaGetLastError()));
                 ok = 0;
-            }
+            } else p->up_bytes[on1 ? 1 : 0] += job.len;
         }
         if (p->trace_fills) { const double tu = k3_now_sec(); if (tu > p->tf_up[(uint32_t)job.dev]) p->tf_up[(uint32_t)job.dev] = tu; }   /* step 68 */
         std::unique_lock<std::mutex> lk(p->mu);
@@ -41819,7 +41849,7 @@ static void k3_raw_worker(k3_raw_pool *p) {
         /* the last chunk of the slab: every chunk copy is queued on up_stream before this point */
         bool all_ok = p->chunk_failed[(uint32_t)job.dev] == 0u;
         if (all_ok && (cudaEventRecord(p->dev_ready[job.dev], us) != cudaSuccess ||
-                       cudaEventRecord(p->host_free[job.host], us) != cudaSuccess)) {
+                       cudaEventRecord(on1 ? p->host_free1[job.host] : p->host_free[job.host], us) != cudaSuccess)) {
             fprintf(stderr, "ds4: K3 expert upload events failed: %s\n", cudaGetErrorString(cudaGetLastError()));
             all_ok = false;
         }
@@ -41874,13 +41904,18 @@ static void k3_victim_copy(k3_raw_pool &p, uint32_t d, uint64_t old) {
     const int h = p.hc.alloc(old, true, nullptr, cold);
     if (h < 0) return;
     uint8_t *dst = p.host_region[(uint32_t)h / p.host_per_region] + (size_t)((uint32_t)h % p.host_per_region) * p.file_bytes;
-    const cudaStream_t cs = p.cp_streams[d % p.n_cp];   /* step 64 */
-    if (cudaStreamWaitEvent(cs, p.dev_free[d], 0) != cudaSuccess ||
-        cudaStreamWaitEvent(cs, p.host_free[(uint32_t)h], 0) != cudaSuccess ||
-        cudaMemcpyAsync(dst, p.dev_ptr[d], p.file_bytes, cudaMemcpyDeviceToHost, cs) != cudaSuccess ||
-        cudaEventRecord(p.dev_free[d], cs) != cudaSuccess ||
-        cudaEventRecord(p.host_free[(uint32_t)h], cs) != cudaSuccess) {
-        fprintf(stderr, "ds4: K3 victim copy-down failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+    const bool on1 = p.g1_n != 0u && d - p.g1_base < p.g1_n;   /* step 140: a slab of the second card copies down on that card's stream */
+    const cudaStream_t cs = on1 ? p.g1_cp : p.cp_streams[d % p.n_cp];   /* step 64 */
+    if (on1) (void)cudaSetDevice(p.g1_dev);
+    const bool okc = cudaStreamWaitEvent(cs, p.dev_free[d], 0) == cudaSuccess &&
+                     cudaStreamWaitEvent(cs, p.host_free[(uint32_t)h], 0) == cudaSuccess &&
+                     (!p.g1_n || cudaStreamWaitEvent(cs, p.host_free1[(uint32_t)h], 0) == cudaSuccess) &&
+                     cudaMemcpyAsync(dst, p.dev_ptr[d], p.file_bytes, cudaMemcpyDeviceToHost, cs) == cudaSuccess &&
+                     cudaEventRecord(p.dev_free[d], cs) == cudaSuccess &&
+                     cudaEventRecord(on1 ? p.host_free1[(uint32_t)h] : p.host_free[(uint32_t)h], cs) == cudaSuccess;
+    if (!okc) fprintf(stderr, "ds4: K3 victim copy-down failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+    if (on1) (void)cudaSetDevice(p.device);
+    if (!okc) {
         p.hc.drop((uint32_t)h);
         return;
     }
@@ -41903,6 +41938,100 @@ static uint32_t k3_env_u32(const char *name, uint32_t dflt) {
     if (!e || !e[0]) return dflt;
     const long v = atol(e);
     return v < 0 ? dflt : (uint32_t)v;
+}
+
+/* Step 140 (18 Nov 2026): a second card as an expert cache, DS4_K3_GPU1=<CUDA device>. Its slabs join the device cache as
+   the range g1_base .., so one policy decides what stays; every stream and event that touches them lives on that card. An
+   expert cached there is computed there: a plain decode step sends the layer's input row and the token lists over, each
+   expert writes its latent row there, and the rows come back into their places in the first card's partials, where the
+   reduce runs as before. Only the two transposed GEMV kernels run on the second card, with the arguments they have on the
+   first, so a row has the same bits wherever it was made. A verification block does the same (step 141) with compact
+   partials, one row per token and slot: it then takes them whatever its width, as blocks too wide for the dense ones always
+   did. A call that is not computed in place (prompt passes; every call with DS4_K3_GPU1_MODE=copy) copies a slab it finds
+   there to a scratch slab of the first card and allocates only on the first card. Transfers go through pinned host memory.
+   DS4_K3_GPU1 may name the first card: the same code then runs against a second region of the one card (256 slabs unless
+   DS4_K3_GPU1_SLABS says otherwise). DS4_K3_GPU1_RESERVE_MB (2048) is what the cache leaves free on the second card. */
+#define K3_G1_ROWS 64u
+static bool k3_g1_init(k3_raw_pool &p, int dev, uint32_t ff, uint32_t latent, uint32_t cap_host) {
+    int n_dev = 0;
+    if (cudaGetDeviceCount(&n_dev) != cudaSuccess || dev < 0 || dev >= n_dev) {
+        (void)cudaGetLastError();
+        fprintf(stderr, "ds4: kimi-k3 DS4_K3_GPU1=%d: no such CUDA device (%d visible)\n", dev, n_dev);
+        return false;
+    }
+    const bool same = dev == p.device;
+    const uint32_t n0 = p.dc.cap;
+    uint32_t n = 0;
+    bool ok = cudaSetDevice(dev) == cudaSuccess;
+    size_t free_b = 0, total_b = 0;
+    ok = ok && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess;
+    if (ok) {
+        const uint64_t reserve = (uint64_t)k3_env_u32("DS4_K3_GPU1_RESERVE_MB", 2048u) << 20;
+        const uint64_t fit = free_b > reserve ? (free_b - reserve) / p.file_bytes : 0u;
+        n = k3_env_u32("DS4_K3_GPU1_SLABS", same ? 256u : 0u);
+        if (n == 0u || n > fit) n = (uint32_t)(fit > 32768u ? 32768u : fit);
+        if (n0 + n > 32768u) n = 32768u - n0;
+        if (n < 16u) { fprintf(stderr, "ds4: kimi-k3 DS4_K3_GPU1=%d: only %.1f GB free there\n", dev, (double)free_b / 1e9); ok = false; }
+    }
+    ok = ok && cudaMalloc(&p.g1_region, p.file_bytes * (size_t)n) == cudaSuccess;
+    ok = ok && cudaStreamCreateWithFlags(&p.g1_stream, cudaStreamNonBlocking) == cudaSuccess &&
+         cudaStreamCreateWithFlags(&p.g1_cp, cudaStreamNonBlocking) == cudaSuccess &&
+         cudaEventCreateWithFlags(&p.g1_ev_in, cudaEventDisableTiming) == cudaSuccess &&
+         cudaEventCreateWithFlags(&p.g1_ev_part, cudaEventDisableTiming) == cudaSuccess;
+    for (uint32_t i = 0; ok && i < p.n_up; i++) { ok = cudaStreamCreateWithFlags(&p.g1_up[i], cudaStreamNonBlocking) == cudaSuccess; if (ok) p.g1_n_up = i + 1u; }
+    for (uint32_t i = 0; ok && i < 4u; i++) ok = cudaEventCreateWithFlags(&p.g1_scr_dn[i], cudaEventDisableTiming) == cudaSuccess;
+    if (ok) {
+        p.host_free1.resize(cap_host);
+        for (uint32_t s = 0; ok && s < cap_host; s++) ok = cudaEventCreateWithFlags(&p.host_free1[s], cudaEventDisableTiming) == cudaSuccess;
+    }
+    if (ok) {
+        p.dev_ptr.resize(n0 + n); p.dev_free.resize(n0 + n); p.dev_ready.resize(n0 + n); p.dev_host.resize(n0 + n, -1); p.hhit.resize(n0 + n, 0);
+        p.wanted.resize(n0 + n, 0); p.cold_job.resize(n0 + n, 0); p.pf_slab.resize(n0 + n, 0); p.chunks_left.resize(n0 + n, 0); p.chunk_failed.resize(n0 + n, 0);
+        p.tf_enq.resize(n0 + n, 0.0); p.tf_pick.resize(n0 + n, 0.0); p.tf_r0.resize(n0 + n, 0.0); p.tf_r1.resize(n0 + n, 0.0); p.tf_up.resize(n0 + n, 0.0); p.tf_rdy.resize(n0 + n, 0.0); p.tf_tier.resize(n0 + n, -1);
+        for (uint32_t s = n0; ok && s < n0 + n; s++) {
+            p.dev_ptr[s] = p.g1_region + (size_t)(s - n0) * p.file_bytes;
+            ok = cudaEventCreateWithFlags(&p.dev_free[s], cudaEventDisableTiming) == cudaSuccess &&
+                 cudaEventCreateWithFlags(&p.dev_ready[s], cudaEventDisableTiming) == cudaSuccess;
+        }
+    }
+    p.g1_rows = K3_G1_ROWS; p.g1_list_cap = (size_t)K3_G1_ROWS * 64u; p.g1_part_cap = (size_t)4u << 20;   /* floats: 16 MB of partial rows */
+    ok = ok && cudaMalloc(&p.g1_x, sizeof(float) * (size_t)p.g1_rows * latent) == cudaSuccess &&
+         cudaMalloc(&p.g1_mid, sizeof(float) * (size_t)p.g1_rows * ff) == cudaSuccess &&
+         cudaMalloc(&p.g1_part, sizeof(float) * p.g1_part_cap) == cudaSuccess &&
+         cudaMalloc(&p.g1_tok, sizeof(uint32_t) * p.g1_list_cap) == cudaSuccess &&
+         cudaMalloc(&p.g1_iota, sizeof(uint32_t) * p.g1_list_cap) == cudaSuccess &&
+         cudaMalloc(&p.g1_tw, sizeof(float) * p.g1_list_cap) == cudaSuccess;
+    if (ok) {   /* step 141: identity rows for the compact partials, as dev_iota on the first card */
+        std::vector<uint32_t> io(p.g1_list_cap); for (size_t i = 0; i < p.g1_list_cap; i++) io[i] = (uint32_t)i;
+        ok = cudaMemcpy(p.g1_iota, io.data(), sizeof(uint32_t) * p.g1_list_cap, cudaMemcpyHostToDevice) == cudaSuccess;
+    }
+    /* the transposed GEMV kernels' shared memory is an attribute of the card's context */
+    ok = ok && cudaFuncSetAttribute(k3_raw_gate_up_v2_kernel<K3_GEMV2_MAX_TOK>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)k3_gemv2_smem_gate_up(ff, latent)) == cudaSuccess &&
+         cudaFuncSetAttribute(k3_raw_down_v2_kernel<K3_GEMV2_MAX_TOK>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)k3_gemv2_smem_down(ff, latent)) == cudaSuccess;
+    if (!ok) fprintf(stderr, "ds4: kimi-k3 DS4_K3_GPU1=%d: setup on that card failed: %s\n", dev, cudaGetErrorString(cudaGetLastError()));
+    ok = cudaSetDevice(p.device) == cudaSuccess && ok;
+    ok = ok && cudaEventCreateWithFlags(&p.g1_ev_x, cudaEventDisableTiming) == cudaSuccess &&
+         cudaMallocHost((void **)&p.g1_hx, sizeof(float) * (size_t)p.g1_rows * latent) == cudaSuccess &&
+         cudaMallocHost((void **)&p.g1_hpart, sizeof(float) * p.g1_part_cap) == cudaSuccess;
+    for (uint32_t i = 0; ok && i < 4u; i++)
+        ok = cudaEventCreateWithFlags(&p.g1_scr_up[i], cudaEventDisableTiming) == cudaSuccess &&
+             cudaMalloc(&p.g1_scratch[i], p.file_bytes) == cudaSuccess &&
+             cudaMallocHost((void **)&p.g1_bounce[i], p.file_bytes) == cudaSuccess;
+    if (!ok) { fprintf(stderr, "ds4: kimi-k3 DS4_K3_GPU1=%d: setup failed: %s\n", dev, cudaGetErrorString(cudaGetLastError())); return false; }
+    { const char *m = getenv("DS4_K3_GPU1_MODE"); p.g1_mode = m && !strcmp(m, "copy") ? 0 : 1; }
+    p.g1_dev = dev; p.g1_base = n0; p.g1_n = n;
+    p.dc.grow(n);
+    fprintf(stderr, "ds4: kimi-k3 second card (step 140): CUDA device %d%s, %u expert slabs (%.1f GB of %.1f GB free there), %s\n", dev,
+            same ? " (the first card itself: a second region of it)" : "", n, (double)n * p.file_bytes / 1e9, (double)free_b / 1e9,
+            p.g1_mode ? "plain decode steps compute their experts in place" : "every use copies the slab to the first card (DS4_K3_GPU1_MODE=copy)");
+    return true;
+}
+extern "C" void ds4_gpu_k3_g1_report(void) {
+    k3_raw_pool &p = k3_raw_get();
+    if (!p.g1_n) return;
+    fprintf(stderr, "ds4: K3 second card: %u slabs; %llu decode calls used it, %llu experts computed there, %llu slabs copied over; uploads %.1f GB to the first card, %.1f GB to the second\n",
+            p.g1_n, (unsigned long long)p.g1_calls, (unsigned long long)p.g1_uses, (unsigned long long)p.g1_fetches,
+            (double)p.up_bytes[0].load() / 1e9, (double)p.up_bytes[1].load() / 1e9);
 }
 
 /* Sizes the host cache from what is free (the device cache is sized by ds4_gpu_k3_cache_grow after the first forward:
@@ -42122,6 +42251,10 @@ static bool k3_raw_pool_ensure(uint32_t ff, uint32_t latent) {
     if (getenv("DS4_K3_EXPERT_THREADS") && (long)n_threads != atol(getenv("DS4_K3_EXPERT_THREADS")))
         fprintf(stderr, "ds4: kimi-k3 DS4_K3_EXPERT_THREADS=%s is outside 1..256; running %u reader threads\n",
                 getenv("DS4_K3_EXPERT_THREADS"), n_threads);
+    {   /* step 140: before the readers start */
+        const char *g1 = getenv("DS4_K3_GPU1");
+        if (g1 && g1[0] && !k3_g1_init(p, atoi(g1), ff, latent, cap_host)) return false;
+    }
     p.ff = ff; p.latent = latent; p.ready = true;
     for (uint32_t t = 0; t < n_threads; t++) std::thread(k3_raw_worker, &p).detach();
     fprintf(stderr, "ds4: kimi-k3 expert caches: device %u slabs to start (grows after the first forward), host %u slabs "
@@ -42578,6 +42711,12 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
     }
     /* the previous layer's lists may still be the source of an in-flight copy */
     if (cudaEventSynchronize(p.lists_uploaded) != cudaSuccess) return cuda_ok(cudaGetLastError(), "K3 raw lists sync");
+    if (p.g1_n) {   /* step 140: and of the second card's copies of them and of the input row */
+        (void)cudaSetDevice(p.g1_dev);
+        const cudaError_t e1 = cudaEventSynchronize(p.g1_ev_in);
+        (void)cudaSetDevice(p.device);
+        if (e1 != cudaSuccess) return cuda_ok(e1, "K3 second-card lists sync");
+    }
     for (uint32_t t = 0; t < n_tok; t++) {
         for (uint32_t i = 0; i < n_used; i++) {
             const uint32_t e = (uint32_t)selected[(size_t)t * n_used + i];
@@ -42590,11 +42729,17 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
         }
     }
     const size_t n_list = (size_t)n_tok * n_used;
+    /* step 141: a verification block whose experts on the second card are computed there keeps the compact partials whatever
+       its width, so the rows made on that card come back as plain copies into their places */
+    static int g1_blk_env = -1;
+    if (g1_blk_env < 0) g1_blk_env = (getenv("DS4_K3_NONDETERMINISTIC") || getenv("DS4_K3_GEMV_V1") || getenv("DS4_K3_VERIFY_GEMM") || getenv("DS4_K3_GEMV_SELFTEST")) ? 0 : 1;
+    const bool g1_blk = p.g1_n != 0u && p.g1_mode == 1 && g1_blk_env == 1 && p.verify != 0 && n_tok > 1u && n_tok <= p.g1_rows && !skip_on &&
+                        n_list <= p.g1_list_cap && n_list * latent <= p.g1_part_cap;
     {   /* step 128: see vcompact below (the same condition: a verification block whose dense partials would not fit) */
         static uint32_t vt_cap_mb = 0;
         if (!vt_cap_mb) vt_cap_mb = k3_env_u32("DS4_K3_PARTIALS_MB", 256u);
         if (p.verify != 0 && n_tok > 1u && !getenv("DS4_K3_NONDETERMINISTIC") &&
-            (size_t)n_union * n_tok * latent * sizeof(float) > ((size_t)vt_cap_mb << 20)) {
+            (g1_blk || (size_t)n_union * n_tok * latent * sizeof(float) > ((size_t)vt_cap_mb << 20))) {
             for (uint32_t t = 0; t < n_tok; t++) {
                 uint32_t *row = p.host_tent + (size_t)t * n_used;
                 const int32_t *sel = selected + (size_t)t * n_used;
@@ -42671,7 +42816,7 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
     static uint32_t part_cap_mb = 0;
     if (!part_cap_mb) part_cap_mb = k3_env_u32("DS4_K3_PARTIALS_MB", 256u);
     const size_t part_floats = (size_t)n_union * n_tok * latent;
-    const bool use_part = determ && part_floats * sizeof(float) <= (size_t)part_cap_mb << 20;
+    const bool use_part = determ && part_floats * sizeof(float) <= (size_t)part_cap_mb << 20 && !g1_blk;   /* step 141 */
     /* step 128: a verification block too wide for the dense partials (32 rows fit the 256 MB by 21 MB: 512 experts x 32 rows x
        latent; 64 rows could need 822 MB) takes the compact ones with each row's slots listed in ascending expert id (vtent above),
        so its reduce adds a row's sixteen experts in the plain step's order: [rows x 16 x latent] instead of [union x rows x latent] */
@@ -42713,20 +42858,94 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
     }
     static int selftest_on = -1;
     if (selftest_on < 0) selftest_on = getenv("DS4_K3_GEMV_SELFTEST") ? 1 : 0;
-    const bool multi = p.ms_n >= 2u && use_part && n_tok == 1u && gemv_v2 && !gemm_ok && !selftest_on;
+    const bool multi = p.ms_n >= 2u && use_part && n_tok == 1u && gemv_v2 && !gemm_ok && !selftest_on && p.g1_n == 0u;
     if (multi) {
         if (cudaEventRecord(p.ms_fork, stream) != cudaSuccess) return cuda_ok(cudaGetLastError(), "K3 GEMV fork");
         for (uint32_t i = 0; i < p.ms_n; i++)
             if (cudaStreamWaitEvent(p.ms_stream[i], p.ms_fork, 0) != cudaSuccess) return cuda_ok(cudaGetLastError(), "K3 GEMV fork wait");
     }
+    /* step 140, the second card. A plain decode step may allocate there; computed in place when it runs the transposed GEMV
+       kernels into dense partials. Every other call leaves that card's slabs to the decode steps and copies over what it
+       finds there. */
+    const bool g1_plain = n_tok == 1u && !verify;
+    const bool g1_blk_on = g1_blk && use_cpart && gemv_v2 && !gemm_ok;   /* step 141: a verification block, rows in the compact partials */
+    const bool g1_inplace = g1_blk_on || (p.g1_n != 0u && p.g1_mode == 1 && g1_plain && !skip_on && use_part && gemv_v2 && !gemm_ok && !selftest_on &&
+                                          part_floats <= p.g1_part_cap && n_list <= p.g1_list_cap && n_tok <= p.g1_rows);
+    struct k3_g1_bar { k3_lru &c; ~k3_g1_bar() { c.bar_n = 0u; } } g1_bar{p.dc};
+    if (p.g1_n != 0u && !g1_plain && !g1_blk_on) { p.dc.bar_lo = p.g1_base; p.dc.bar_n = p.g1_n; }
+    bool g1_prepped = false;
+    uint32_t n_g1 = 0;
+    const uint32_t g1_n_rows = g1_blk_on ? (uint32_t)n_list : n_union;   /* rows of `latent` floats that may come back */
+    uint8_t g1_is[4096];
+    if (g1_inplace) memset(g1_is, 0, g1_n_rows);
+    auto g1_prep = [&]() -> bool {   /* the input row and the lists, to the second card; its partial rows cleared */
+        bool ok = cudaMemcpyAsync(p.g1_hx, x->ptr, (size_t)n_tok * latent * sizeof(float), cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
+                  cudaEventRecord(p.g1_ev_x, stream) == cudaSuccess &&
+                  cudaSetDevice(p.g1_dev) == cudaSuccess &&
+                  cudaStreamWaitEvent(p.g1_stream, p.g1_ev_x, 0) == cudaSuccess &&
+                  cudaMemcpyAsync(p.g1_x, p.g1_hx, (size_t)n_tok * latent * sizeof(float), cudaMemcpyHostToDevice, p.g1_stream) == cudaSuccess &&
+                  cudaMemcpyAsync(p.g1_tok, p.host_tok, sizeof(uint32_t) * n_list, cudaMemcpyHostToDevice, p.g1_stream) == cudaSuccess &&
+                  cudaMemcpyAsync(p.g1_tw, p.host_tw, sizeof(float) * n_list, cudaMemcpyHostToDevice, p.g1_stream) == cudaSuccess &&
+                  cudaEventRecord(p.g1_ev_in, p.g1_stream) == cudaSuccess &&
+                  cudaMemsetAsync(p.g1_part, 0, sizeof(float) * (size_t)g1_n_rows * latent, p.g1_stream) == cudaSuccess;
+        if (!ok) (void)cuda_ok(cudaGetLastError(), "K3 second-card input");
+        ok = cudaSetDevice(p.device) == cudaSuccess && ok;
+        if (ok) p.g1_calls++;
+        return ok;
+    };
+    auto g1_launch = [&](uint32_t d, uint32_t e) -> bool {   /* the expert in slab d, where it is: the plain step's two kernels */
+        if (!g1_prepped) { if (!g1_prep()) return false; g1_prepped = true; }
+        bool ok = cudaSetDevice(p.g1_dev) == cudaSuccess && cudaStreamWaitEvent(p.g1_stream, p.dev_ready[d], 0) == cudaSuccess;
+        if (ok) {
+            const uint8_t *slab1 = p.dev_ptr[d];
+            /* the first card's destinations: the expert's dense row for a plain step, list rows of the compact partials for a block */
+            float *acc1 = g1_blk_on ? p.g1_part : p.g1_part + (size_t)part_idx[e] * n_tok * latent;
+            const uint32_t *orow1 = g1_blk_on ? p.g1_iota + off[e] : p.g1_tok + off[e];
+            for (uint32_t k0 = 0; k0 < count[e]; k0 += (uint32_t)K3_GEMV2_MAX_TOK) {   /* the first card's chunks (step 80); one for a plain step */
+                const uint32_t m = count[e] - k0 < (uint32_t)K3_GEMV2_MAX_TOK ? count[e] - k0 : (uint32_t)K3_GEMV2_MAX_TOK;
+                k3_raw_gate_up_v2_kernel<K3_GEMV2_MAX_TOK><<<gu_grid, 256, k3_gemv2_smem_gate_up_n(latent, m), p.g1_stream>>>(
+                    p.g1_mid, slab1, p.g1_x, p.g1_tok + off[e] + k0, m, ff, latent, p.w1p, p.w1s, p.w3p, p.w3s, beta, beta_linear);
+                k3_raw_down_v2_kernel<K3_GEMV2_MAX_TOK><<<d_grid, 256, k3_gemv2_smem_down_n(ff, m), p.g1_stream>>>(
+                    acc1, slab1, p.g1_mid, orow1 + k0, p.g1_tw + off[e] + k0, m, ff, latent, p.w2p, p.w2s);
+            }
+            ok = cudaGetLastError() == cudaSuccess && cudaEventRecord(p.dev_free[d], p.g1_stream) == cudaSuccess;
+        }
+        if (!ok) (void)cuda_ok(cudaGetLastError(), "K3 second-card launch");
+        ok = cudaSetDevice(p.device) == cudaSuccess && ok;
+        if (ok) {
+            if (g1_blk_on) memset(g1_is + off[e], 1, count[e]); else g1_is[part_idx[e]] = 1;
+            n_g1++; p.g1_uses++;
+        }
+        return ok;
+    };
+    auto g1_fetch = [&](uint32_t d) -> const uint8_t * {   /* slab d to a scratch slab of this card, behind the scratch's last user */
+        const uint32_t i = p.g1_scr_next++ % 4u;
+        bool ok = cudaSetDevice(p.g1_dev) == cudaSuccess &&
+                  cudaStreamWaitEvent(p.g1_stream, p.dev_ready[d], 0) == cudaSuccess &&
+                  cudaStreamWaitEvent(p.g1_stream, p.g1_scr_up[i], 0) == cudaSuccess &&   /* the pinned copy's previous upload has left it */
+                  cudaMemcpyAsync(p.g1_bounce[i], p.dev_ptr[d], p.file_bytes, cudaMemcpyDeviceToHost, p.g1_stream) == cudaSuccess &&
+                  cudaEventRecord(p.g1_scr_dn[i], p.g1_stream) == cudaSuccess &&
+                  cudaEventRecord(p.dev_free[d], p.g1_stream) == cudaSuccess;
+        if (!ok) (void)cuda_ok(cudaGetLastError(), "K3 second-card slab read");
+        ok = cudaSetDevice(p.device) == cudaSuccess && ok;
+        ok = ok && cudaStreamWaitEvent(stream, p.g1_scr_dn[i], 0) == cudaSuccess &&
+             cudaMemcpyAsync(p.g1_scratch[i], p.g1_bounce[i], p.file_bytes, cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+             cudaEventRecord(p.g1_scr_up[i], stream) == cudaSuccess;
+        if (!ok) { (void)cuda_ok(cudaGetLastError(), "K3 second-card slab copy"); return nullptr; }
+        p.g1_fetches++;
+        return p.g1_scratch[i];
+    };
     auto launch = [&](uint32_t d, uint32_t e) -> bool {
-        const uint8_t *slab = p.dev_ptr[d];
+        const bool on1 = p.g1_n != 0u && d - p.g1_base < p.g1_n;   /* step 140 */
+        if (on1 && g1_inplace) return g1_launch(d, e);
+        const uint8_t *slab = on1 ? g1_fetch(d) : p.dev_ptr[d];
+        if (!slab) return false;
         float *acc_out = use_part ? p.dev_part + (size_t)part_idx[e] * n_tok * latent : (use_cpart ? p.dev_cpart : (float *)out->ptr);
         const uint32_t *orow = use_cpart ? p.dev_iota + off[e] : p.dev_tok + off[e];   /* step 76: output rows (input rows stay dev_tok) */
         const uint32_t si = multi ? (p.ms_next++ % p.ms_n) : 0u;
         cudaStream_t ls = multi ? p.ms_stream[si] : stream;
         float *mid_buf = multi ? p.ms_mid + (size_t)si * ff : p.dev_mid;
-        if (cudaStreamWaitEvent(ls, p.dev_ready[d], 0) != cudaSuccess) return cuda_ok(cudaGetLastError(), "K3 raw wait") != 0;
+        if (!on1 && cudaStreamWaitEvent(ls, p.dev_ready[d], 0) != cudaSuccess) return cuda_ok(cudaGetLastError(), "K3 raw wait") != 0;   /* step 140: the copy waited for a second-card slab */
         if (gemm_ok && count[e] >= (uint32_t)gemm_min && g_k3_f32_act) {   /* step 106c: exact bf16 weights, 3-term bf16 activations */
             k3_gemm32_scratch &g = *g_k3_gemm32;
             const uint32_t nb = ff * latent / 32u, kt = count[e];
@@ -42812,7 +43031,7 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
             k3_raw_down_acc_kernel<<<d_grid, 256, 0, stream>>>(acc_out, slab, p.dev_mid, orow,
                                                                p.dev_tw + off[e], count[e], ff, latent, p.w2p, p.w2s);
         }
-        return cudaEventRecord(p.dev_free[d], ls) == cudaSuccess;
+        return on1 || cudaEventRecord(p.dev_free[d], ls) == cudaSuccess;   /* step 140: g1_fetch recorded a second-card slab's */
     };
     uint32_t next = 0, launched = 0, pending = 0, cold_inflight = 0;
     int failed = 0;
@@ -43163,6 +43382,26 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
             if (cudaEventRecord(p.ms_join[i], p.ms_stream[i]) != cudaSuccess ||
                 cudaStreamWaitEvent(stream, p.ms_join[i], 0) != cudaSuccess) return cuda_ok(cudaGetLastError(), "K3 GEMV join");
         }
+    }
+    if (n_g1) {   /* step 140: the rows made on the second card take their places in the partials, then the reduce as ever */
+        const size_t rowb = (size_t)latent * sizeof(float);   /* a plain step's dense row (one token) or one row of the compact partials */
+        float *const g1_dst = g1_blk_on ? p.dev_cpart : p.dev_part;
+        uint32_t lo = 0, hi = g1_n_rows - 1u;
+        while (!g1_is[lo]) lo++;
+        while (!g1_is[hi]) hi--;
+        bool ok = cudaSetDevice(p.g1_dev) == cudaSuccess &&
+                  cudaMemcpyAsync((char *)p.g1_hpart + lo * rowb, (const char *)p.g1_part + lo * rowb, (size_t)(hi - lo + 1u) * rowb, cudaMemcpyDeviceToHost, p.g1_stream) == cudaSuccess &&
+                  cudaEventRecord(p.g1_ev_part, p.g1_stream) == cudaSuccess;
+        ok = cudaSetDevice(p.device) == cudaSuccess && ok;
+        ok = ok && cudaStreamWaitEvent(stream, p.g1_ev_part, 0) == cudaSuccess;
+        for (uint32_t a = lo; ok && a <= hi; ) {
+            if (!g1_is[a]) { a++; continue; }
+            uint32_t b = a;
+            while (b < hi && g1_is[b + 1u]) b++;
+            ok = cudaMemcpyAsync((char *)g1_dst + a * rowb, (const char *)p.g1_hpart + a * rowb, (size_t)(b - a + 1u) * rowb, cudaMemcpyHostToDevice, stream) == cudaSuccess;
+            a = b + 1u;
+        }
+        if (!ok) return cuda_ok(cudaGetLastError(), "K3 second-card rows");
     }
     if (use_part) k3_part_reduce_kernel<<<(unsigned)((n_tok * latent + 255u) / 256u), 256, 0, stream>>>((float *)out->ptr, p.dev_part, n_union, n_tok, latent);
     else if (use_cpart) k3_tent_reduce_kernel<<<(unsigned)((n_tok * latent + 255u) / 256u), 256, 0, stream>>>((float *)out->ptr, p.dev_cpart, p.dev_tent, n_tok, n_used, latent);   /* step 76 */
