@@ -41928,7 +41928,13 @@ static void k3_victim_copy(k3_raw_pool &p, uint32_t d, uint64_t old) {
     const bool on1 = p.g1_n != 0u && d - p.g1_base < p.g1_n;   /* step 140: a slab of the second card copies down on that card's stream */
     const cudaStream_t cs = on1 ? p.g1_cp : p.cp_streams[d % p.n_cp];   /* step 64 */
     if (on1) (void)cudaSetDevice(p.g1_dev);
+    /* step 151: and behind the slab's last upload (dev_ready). A slab that was filled and never used, a read-ahead its layer
+       did not need, has no kernel behind its upload, so dev_free alone let this copy start while the upload was still
+       running: the host pool then kept a half-written expert. Eviction by recency never takes such a slab that soon; the
+       decayed-count rule does (its score is the lowest), and with a deep read-ahead it showed in two of eight runs as
+       logits that differed in the last bits from some position on. */
     const bool okc = cudaStreamWaitEvent(cs, p.dev_free[d], 0) == cudaSuccess &&
+                     cudaStreamWaitEvent(cs, p.dev_ready[d], 0) == cudaSuccess &&
                      cudaStreamWaitEvent(cs, p.host_free[(uint32_t)h], 0) == cudaSuccess &&
                      (!p.g1_n || cudaStreamWaitEvent(cs, p.host_free1[(uint32_t)h], 0) == cudaSuccess) &&
                      cudaMemcpyAsync(dst, p.dev_ptr[d], p.file_bytes, cudaMemcpyDeviceToHost, cs) == cudaSuccess &&
