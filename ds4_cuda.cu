@@ -41667,6 +41667,9 @@ struct k3_raw_pool {
     int trace_fills = 0; uint64_t trace_fill_calls = 0, trace_fill_printed = 0;
     std::vector<double> tf_enq, tf_pick, tf_r0, tf_r1, tf_up, tf_rdy; std::vector<int8_t> tf_tier;
     double wait_s = 0.0;
+    /* step 145 (diagnostic): DS4_K3_READ_STATS. rs_bytes[(layer * 896 + expert) * 8 + (prompt pass ? 4 : 0) + tier] bytes read;
+       rs_cnt[(layer * 896 + expert) * 4 + k] decode uses served from VRAM (0), host RAM (1), a drive (2) */
+    std::atomic<uint64_t> *rs_bytes = nullptr; uint32_t *rs_cnt = nullptr;
 };
 /* Heap-allocated and never destroyed on purpose: a static pool's destructor runs pthread_cond_destroy at exit, which
    blocks until every waiter has left, and the detached reader threads wait on cv_job forever (t8/t9 hung for hours). */
@@ -41800,6 +41803,8 @@ static void k3_raw_worker(k3_raw_pool *p) {
             if (p->trace_fills && job.dev >= 0) { const uint32_t td = (uint32_t)job.dev; if (p->tf_r0[td] == 0.0 || tr0 < p->tf_r0[td]) p->tf_r0[td] = tr0; const double tr1 = tr0 + ms / 1e3; if (tr1 > p->tf_r1[td]) p->tf_r1[td] = tr1; p->tf_tier[td] = (int8_t)used; }   /* step 68 */
             if (ok && used >= 0 && used < 4) {
                 p->tier_bytes[used] += job.len;
+                if (p->rs_bytes && job.layer < 93u && job.expert < 896u)   /* step 145 */
+                    p->rs_bytes[((size_t)job.layer * 896u + job.expert) * 8u + (job.bulk ? 4u : 0u) + (size_t)used].fetch_add(job.len, std::memory_order_relaxed);
                 /* step 42: the read came from a tier other than the one dispatched to (a missing file): count it,
                    so a benchmark can never again quietly measure the wrong device */
                 const int intended = p->eta_mode ? (home < 4 ? home : -1) : (tier == 2 ? 2 : (tier == 1 ? 1 : -1));
@@ -42043,6 +42048,22 @@ static bool k3_g1_init(k3_raw_pool &p, int dev, uint32_t ff, uint32_t latent, ui
 }
 extern "C" void ds4_gpu_k3_g1_report(void) {
     k3_raw_pool &p = k3_raw_get();
+    if (p.rs_bytes && p.rs_cnt) {   /* step 145 */
+        const char *rs = getenv("DS4_K3_READ_STATS");
+        FILE *f = rs && rs[0] ? fopen(rs, "w") : NULL;
+        if (f) {
+            fprintf(f, "# layer expert | decode uses served from VRAM, from host RAM, by a drive read | bytes read in decode from RAID, Samsung, tier C, tier D | bytes read in prompt passes from the same four\n");
+            for (uint32_t l = 0; l < 93u; l++) for (uint32_t e = 0; e < 896u; e++) {
+                const size_t i = (size_t)l * 896u + e;
+                unsigned long long b[8], any = 0;
+                for (int k = 0; k < 8; k++) { b[k] = p.rs_bytes[i * 8u + (size_t)k].load(); any += b[k]; }
+                const uint32_t *c = p.rs_cnt + i * 4u;
+                if (!any && !c[0] && !c[1] && !c[2]) continue;
+                fprintf(f, "%u %u %u %u %u %llu %llu %llu %llu %llu %llu %llu %llu\n", l, e, c[0], c[1], c[2], b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+            }
+            fclose(f);
+        }
+    }
     if (p.dc.decay_mode)
         fprintf(stderr, "ds4: K3 decayed-count rule (step 144): %llu device victims; in %llu of them the lowest sampled score was a slab of the call in progress and was passed over\n",
                 (unsigned long long)p.dc.decay_victims, (unsigned long long)p.dc.decay_in_call);
@@ -42123,6 +42144,14 @@ static bool k3_raw_pool_ensure(uint32_t ff, uint32_t latent) {
     }
     p.hc.init(cap_host);
     p.dc.init(cap_dev);
+    {   /* step 145 */
+        const char *rs = getenv("DS4_K3_READ_STATS");
+        if (rs && rs[0] && !p.rs_bytes) {
+            p.rs_bytes = new std::atomic<uint64_t>[(size_t)93u * 896u * 8u]();
+            p.rs_cnt = (uint32_t *)calloc((size_t)93u * 896u * 4u, sizeof(uint32_t));
+            fprintf(stderr, "ds4: kimi-k3 per-expert read statistics on (step 145), written to %s at the end\n", rs);
+        }
+    }
     {   /* step 143: DS4_K3_CACHE_POLICY=decay-device: the decayed use count (DS4_K3_CACHE_DECAY per token) decides in the
            device cache alone; the host pool, a victim cache whose slabs empty and refill all the time, keeps its recency order */
         const char *pol = getenv("DS4_K3_CACHE_POLICY");
@@ -43251,6 +43280,7 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
             int d = p.dc.lookup(k, hot);
             if (d >= 0 && !p.dc.filling[(uint32_t)d]) {
                 p.hits_dev++;
+                if (p.rs_cnt && hot && layer < 93u && e < 896u) p.rs_cnt[((size_t)layer * 896u + e) * 4u]++;   /* step 145 */
                 if (p.pf_slab[(uint32_t)d]) { p.pf_slab[(uint32_t)d] = 0; p.dc.pinned[(uint32_t)d] = 0; p.pf_hit++; }   /* a prefetch consumed */
                 if (hot) (void)p.hc.lookup(k, true);   /* keep the host copy's recency in step with the device hit */
                 if (!launch((uint32_t)d, e)) return 0;
@@ -43260,6 +43290,7 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
             if (d >= 0) {
                 /* step 29: a prefetch of this expert is still in flight: adopt it as one of this layer's fills */
                 if (!p.wanted[(uint32_t)d]) {
+                    if (p.rs_cnt && hot && layer < 93u && e < 896u) p.rs_cnt[((size_t)layer * 896u + e) * 4u + 2u]++;   /* step 145: a read already under way */
                     p.wanted[(uint32_t)d] = 1; pending++; p.pf_adopted++; p.pf_slab[(uint32_t)d] = 0;
                     if (p.pf_pending) p.pf_pending--;
                     if (p.cold_job[(uint32_t)d]) cold_inflight++;
@@ -43298,6 +43329,7 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
             p.dev_host[(uint32_t)d] = h; p.hhit[(uint32_t)d] = read ? 0 : 1;   /* step 75 */
             if (p.victim && hot && !host_all && evicted != K3_NOKEY && !(verify_admit > 1 && verify && p.dc.last_evicted_transient)) k3_victim_copy(p, (uint32_t)d, evicted);   /* step 78 */
             if (read) p.misses++; else p.hits_host++;
+            if (p.rs_cnt && hot && layer < 93u && e < 896u) p.rs_cnt[((size_t)layer * 896u + e) * 4u + (read ? 2u : 1u)]++;   /* step 145 */
             p.wanted[(uint32_t)d] = 1; p.cold_job[(uint32_t)d] = cold_tier ? 1 : 0;
             if (cold_tier) cold_inflight++;
             push_fill(layer, e, (uint32_t)d, h, read, false);
