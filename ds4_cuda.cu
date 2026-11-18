@@ -18044,7 +18044,8 @@ __global__ __launch_bounds__(256) static void k3_q8_0_f32x_rows110_kernel(float 
         }
     }
 }
-static float *g_k3_f32_wscratch = nullptr;
+static ds4_per_tier<float *> g_k3_f32_wscratch_pt;   /* step 146: one per card (the calling thread's) */
+#define g_k3_f32_wscratch (g_k3_f32_wscratch_pt.v[g_stream_tier])
 static const uint64_t K3_F32_WSLICE = 64ull << 20;   /* fp32 values per dequantized weight slice (256 MB) */
 static int k3_q8_0_f32_multi(ds4_gpu_tensor *out, const char *wp, const ds4_gpu_tensor *x, uint64_t in_dim, uint64_t out_dim,
                              uint64_t blocks, uint64_t n_tok, int tier) {
@@ -41971,6 +41972,14 @@ static uint32_t k3_env_u32(const char *name, uint32_t dflt) {
    there to a scratch slab of the first card and allocates only on the first card. Transfers go through pinned host memory.
    DS4_K3_GPU1 may name the first card: the same code then runs against a second region of the one card (256 slabs unless
    DS4_K3_GPU1_SLABS says otherwise). DS4_K3_GPU1_RESERVE_MB (2048) is what the cache leaves free on the second card. */
+/* step 146 (spine split): the engine names the second card and what its expert cache must leave free there (the
+   attention caches and working tensors of the layers that run on it); the pool then opens that card's cache as
+   DS4_K3_GPU1 would. DS4_K3_GPU1=off keeps the cache on the first card alone. */
+static int g_k3_split_g1_dev = -1;
+static uint32_t g_k3_split_g1_reserve_mb = 0;
+extern "C" void ds4_gpu_k3_split_second_card(int cuda_device, uint32_t reserve_mb) {
+    g_k3_split_g1_dev = cuda_device; g_k3_split_g1_reserve_mb = reserve_mb;
+}
 #define K3_G1_ROWS 64u
 static bool k3_g1_init(k3_raw_pool &p, int dev, uint32_t ff, uint32_t latent, uint32_t cap_host) {
     int n_dev = 0;
@@ -41986,7 +41995,7 @@ static bool k3_g1_init(k3_raw_pool &p, int dev, uint32_t ff, uint32_t latent, ui
     size_t free_b = 0, total_b = 0;
     ok = ok && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess;
     if (ok) {
-        const uint64_t reserve = (uint64_t)k3_env_u32("DS4_K3_GPU1_RESERVE_MB", 2048u) << 20;
+        const uint64_t reserve = (uint64_t)k3_env_u32("DS4_K3_GPU1_RESERVE_MB", g_k3_split_g1_reserve_mb ? g_k3_split_g1_reserve_mb : 2048u) << 20;   /* step 146 */
         const uint64_t fit = free_b > reserve ? (free_b - reserve) / p.file_bytes : 0u;
         n = k3_env_u32("DS4_K3_GPU1_SLABS", same ? 256u : 0u);
         if (n == 0u || n > fit) n = (uint32_t)(fit > 32768u ? 32768u : fit);
@@ -42308,7 +42317,8 @@ static bool k3_raw_pool_ensure(uint32_t ff, uint32_t latent) {
                 getenv("DS4_K3_EXPERT_THREADS"), n_threads);
     {   /* step 140: before the readers start */
         const char *g1 = getenv("DS4_K3_GPU1");
-        if (g1 && g1[0] && !k3_g1_init(p, atoi(g1), ff, latent, cap_host)) return false;
+        const int g1_dev = g1 && g1[0] ? (!strcmp(g1, "off") ? -1 : atoi(g1)) : g_k3_split_g1_dev;   /* step 146: the spine split's second card */
+        if (g1_dev >= 0 && !k3_g1_init(p, g1_dev, ff, latent, cap_host)) return false;
     }
     p.ff = ff; p.latent = latent; p.ready = true;
     for (uint32_t t = 0; t < n_threads; t++) std::thread(k3_raw_worker, &p).detach();
@@ -42662,9 +42672,9 @@ extern "C" int ds4_gpu_k3_pool_prepare_staging(uint32_t ff, uint32_t latent, uin
     pool.join();
     return pool_ok;
 }
-extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const int32_t *selected,
-                                               const float *weights, uint32_t n_tok, uint32_t n_used, uint32_t layer,
-                                               uint32_t ff, uint32_t latent, float beta, float beta_linear) {
+static int k3_moe_raw_batch_impl(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const int32_t *selected,
+                                 const float *weights, uint32_t n_tok, uint32_t n_used, uint32_t layer,
+                                 uint32_t ff, uint32_t latent, float beta, float beta_linear) {
     if (!out || !x || !selected || !weights || n_tok == 0u || n_used == 0u || n_used > 64u) return 0;
     if (latent % 32u != 0u || ff % 32u != 0u || latent > 4096u || ff > 4096u) return 0;
     if (out->bytes < (uint64_t)n_tok * latent * sizeof(float) || x->bytes < (uint64_t)n_tok * latent * sizeof(float)) return 0;
@@ -43467,6 +43477,39 @@ extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gp
     return cuda_ok(cudaGetLastError(), "K3 raw MoE launch");
 }
 
+/* step 146 (spine split): the pool and its kernels' home are the first card. A layer that runs on the second card sends
+   its latent rows over and takes the experts' sum back: two peer copies of n_tok x latent floats, each ordered by an
+   event on the receiving card's stream. Where an expert is computed is unchanged (the card that caches it), and so
+   are its kernels and their arguments, so the rows have the bits they have without the split. */
+extern "C" int ds4_gpu_k3_moe_raw_batch_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const int32_t *selected,
+                                               const float *weights, uint32_t n_tok, uint32_t n_used, uint32_t layer,
+                                               uint32_t ff, uint32_t latent, float beta, float beta_linear) {
+    const int tier = out ? ds4_tensor_device_idx(out) : 0;
+    if (g_n_gpus <= 1 || tier == 0 || !out || !x)
+        return k3_moe_raw_batch_impl(out, x, selected, weights, n_tok, n_used, layer, ff, latent, beta, beta_linear);
+    static ds4_gpu_tensor *x0 = nullptr, *o0 = nullptr;
+    const uint64_t bytes = (uint64_t)n_tok * latent * sizeof(float);
+    if (bytes == 0u || out->bytes < bytes || x->bytes < bytes) return 0;
+    if (!x0 || x0->bytes < bytes) {
+        if (ds4_gpu_set_current_device(0) != 0) return 0;
+        if (x0) { (void)cudaDeviceSynchronize(); ds4_gpu_tensor_free(x0); ds4_gpu_tensor_free(o0); x0 = o0 = nullptr; }
+        x0 = ds4_gpu_tensor_alloc_ptr_on(0, bytes); o0 = ds4_gpu_tensor_alloc_ptr_on(0, bytes);
+        (void)ds4_gpu_set_current_device(tier);
+        if (!x0 || !o0) {
+            if (x0) ds4_gpu_tensor_free(x0);
+            if (o0) ds4_gpu_tensor_free(o0);
+            x0 = o0 = nullptr;
+            fprintf(stderr, "ds4: K3 spine split: no VRAM on the first card for %u latent rows\n", n_tok);
+            return 0;
+        }
+    }
+    if (!ds4_gpu_tensor_copy_xdev_default(x0, x, bytes)) return 0;
+    if (ds4_gpu_set_current_device(0) != 0) return 0;
+    const int rc = k3_moe_raw_batch_impl(o0, x0, selected, weights, n_tok, n_used, layer, ff, latent, beta, beta_linear);
+    const int back = ds4_gpu_set_current_device(tier);
+    if (!rc || back != 0) return 0;
+    return ds4_gpu_tensor_copy_xdev_default(out, o0, bytes);
+}
 extern "C" int ds4_gpu_k3_moe_raw_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const int32_t *selected,
                                          const float *weights, uint32_t n_used, uint32_t layer, uint32_t ff,
                                          uint32_t latent, float beta, float beta_linear) {
@@ -43712,8 +43755,8 @@ extern "C" int ds4_gpu_k3_route_hist(uint32_t *counts_out, const ds4_gpu_tensor 
                                      uint32_t n_expert, uint32_t n_used) {
     if (!counts_out || !logits || !bias || n_tok == 0u || n_expert == 0u || n_expert > 1024u || n_used == 0u || n_used > 64u) return 0;
     if (logits->bytes < (uint64_t)n_tok * n_expert * sizeof(float)) return 0;
-    static uint32_t *d_counts = nullptr;
-    static float *d_bias = nullptr;
+    static ds4_per_tier<uint32_t *> d_counts_pt; static ds4_per_tier<float *> d_bias_pt;   /* step 146: one per card */
+    uint32_t *&d_counts = d_counts_pt.v[g_stream_tier]; float *&d_bias = d_bias_pt.v[g_stream_tier];
     if (!d_counts && (cudaMalloc(&d_counts, 1024u * sizeof(uint32_t)) != cudaSuccess ||
                       cudaMalloc(&d_bias, 1024u * sizeof(float)) != cudaSuccess)) { cudaGetLastError(); return 0; }
     cudaStream_t stream = cuda_decode_stream();
@@ -44410,7 +44453,9 @@ __global__ static void k3_attn_softmax_exact_g_kernel(float *s, uint32_t lds, si
 
 /* step 103: the batch attention as GEMM passes per group of heads, scores in a scratch of at most DS4_K3_ATTN_GEMM_MB (256) or one
    head; false (nothing launched) when the scratch cannot be had, and the caller runs its kernel */
-static float *g_k3_attn_s = nullptr; static size_t g_k3_attn_s_bytes = 0;
+static ds4_per_tier<float *> g_k3_attn_s_pt; static ds4_per_tier<size_t> g_k3_attn_s_bytes_pt;   /* step 146: one per card */
+#define g_k3_attn_s (g_k3_attn_s_pt.v[g_stream_tier])
+#define g_k3_attn_s_bytes (g_k3_attn_s_bytes_pt.v[g_stream_tier])
 static size_t k3_attn_gemm_bytes(uint32_t n_tok, uint32_t n_cols, uint32_t heads, uint32_t *G_out) {
     static size_t budget = 0;
     if (!budget) budget = (size_t)k3_env_u32("DS4_K3_ATTN_GEMM_MB", 256u) << 20;
@@ -44651,8 +44696,8 @@ extern "C" int ds4_gpu_k3_kda_decode_batch(
         kda_mode = getenv("DS4_K3_KDA_LOOP") ? 0 : (m && !strcmp(m, "loop")) ? 1 : (m && !strcmp(m, "token")) ? 0 : 2;
     }
     if (kda_mode == 2) {
-        static float *kbuf = nullptr;
-        static size_t kcap = 0;
+        static ds4_per_tier<float *> kbuf_pt; static ds4_per_tier<size_t> kcap_pt;   /* step 146: one per card */
+        float *&kbuf = kbuf_pt.v[g_stream_tier]; size_t &kcap = kcap_pt.v[g_stream_tier];
         const uint32_t chunk_max = 512u;
         const size_t need = (size_t)4u * chunk_max * projection * sizeof(float);
         if (kcap < need) {
@@ -44931,9 +44976,11 @@ __global__ static void k3_lat_store_kvb_list_kernel(float *key_cache, float *val
         }
     }
 }
-static int32_t *g_k3_sel_lists = nullptr;
-static uint32_t *g_k3_sel_counts = nullptr;
-static uint32_t g_k3_sel_cap = 0;
+static ds4_per_tier<int32_t *> g_k3_sel_lists_pt; static ds4_per_tier<uint32_t *> g_k3_sel_counts_pt;   /* step 146: one per card */
+static ds4_per_tier<uint32_t> g_k3_sel_cap_pt;
+#define g_k3_sel_lists (g_k3_sel_lists_pt.v[g_stream_tier])
+#define g_k3_sel_counts (g_k3_sel_counts_pt.v[g_stream_tier])
+#define g_k3_sel_cap (g_k3_sel_cap_pt.v[g_stream_tier])
 extern "C" int ds4_gpu_k3_kvb_chain_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset,
                                            uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok) {
     if (!out || !x || !model_map || n_tok == 0u || (in_dim & 31u) != 0u) return 0;

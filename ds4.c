@@ -64109,7 +64109,7 @@ static bool k3_dsa_dump_wanted(uint32_t il, uint32_t pos) {
     return false;
 }
 
-typedef struct {
+typedef struct k3_gpu_buffers {
     ds4_gpu_tensor *cur, *attn_in, *normed, *attn_out, *prefix, *mixed, *ffn_out, *logits, *tokens;
     ds4_gpu_tensor *q_a, *q_an, *q, *kv, *latent_norm, *kvb, *k_nope, *value, *heads, *gate, *gated;
     ds4_gpu_tensor *kda_q, *kda_k, *kda_v, *kda_f_a, *kda_raw_gate, *kda_beta, *kda_ogate, *kda_out;
@@ -64120,10 +64120,34 @@ typedef struct {
     ds4_gpu_tensor **kda_conv, **kda_state, **key_cache, **value_cache;
     ds4_gpu_tensor **idx_cache, *dsa_q, *dsa_k, *dsa_w, *dsa_scores, *dsa_sel, *dsa_mask;   /* step 95 */
     uint32_t cache_cap;
+    struct k3_gpu_buffers *t1;   /* step 146: the working tensors again on the second card (the per-layer arrays shared) */
 } k3_gpu_buffers;
 
+/* Step 146 (18 Nov 2026), the spine split: DS4_CUDA_STREAM_SPLIT=<cut> with --ssd-streaming and two --gpu-devices. Layers
+   cut.. run on the second card, which holds their spine weights, their attention caches and KDA states and a second set of
+   the working tensors (b->t1, bb->t1). The residual stream and its anchors go over before layer `cut` and come back after
+   the last layer, so the embedding, the output head and everything between two forwards stay on the first card. The
+   routed experts are the pool's business: it takes a layer's rows from either card. Every kernel gets the arguments it
+   gets on one card, so the logits are the same bits. */
+static int g_k3_split_cut = 0;    /* 0: one card */
+static int g_k3_split_dev1 = -1;  /* the second card's CUDA device */
+static int g_k3_alloc_tier = 0;   /* the card k3_gpu_alloc_* use: a layer's, while that layer's own tensors are made */
+static inline int k3_tier(uint32_t il) { return g_k3_split_cut > 0 && (int)il >= g_k3_split_cut ? 1 : 0; }
+static inline k3_gpu_buffers *k3_b_of(k3_gpu_buffers *b, uint32_t il) { return k3_tier(il) && b->t1 ? b->t1 : b; }
+static ds4_gpu_tensor *k3_gpu_alloc_bytes(uint64_t bytes) {
+    return g_k3_split_cut > 0 ? ds4_gpu_tensor_alloc_ptr_on(g_k3_alloc_tier, bytes) : ds4_gpu_tensor_alloc(bytes);
+}
+/* tensors of the sizes of src[0..n-1] on `tier` (NULL where src has none); false: some could not be made */
+static bool k3_gpu_tensors_clone(ds4_gpu_tensor **dst, ds4_gpu_tensor *const *src, size_t n, int tier) {
+    for (size_t i = 0; i < n; i++) {
+        dst[i] = NULL;
+        if (src[i] && !(dst[i] = ds4_gpu_tensor_alloc_ptr_on(tier, ds4_gpu_tensor_bytes(src[i])))) return false;
+    }
+    return true;
+}
+
 static ds4_gpu_tensor *k3_gpu_alloc_f32(uint64_t elems) {
-    ds4_gpu_tensor *t = ds4_gpu_tensor_alloc(elems * sizeof(float));
+    ds4_gpu_tensor *t = k3_gpu_alloc_bytes(elems * sizeof(float));
     if (!t) ds4_die("K3 GPU buffer allocation failed");
     return t;
 }
@@ -64520,8 +64544,8 @@ static void k3_sc_report(uint32_t il, const char *stage, const float *gpu, const
     fprintf(stderr, "ds4: K3 stage check layer %u %-22s rel err %.3e, max abs %.3e at %llu (gpu %.7g cpu %.7g)\n", il, stage,
             den > 0 ? sqrt(num / den) : sqrt(num), mx, (unsigned long long)at, gpu[at], cpu[at]);
 }
-static bool k3_gpu_layer(k3_gpu_buffers *b, const ds4_model *model, const ds4_layer_weights *l, uint32_t il,
-                         uint32_t pos, uint32_t *n_anchor) {
+static bool k3_gpu_layer_tier(k3_gpu_buffers *b, const ds4_model *model, const ds4_layer_weights *l, uint32_t il,
+                              uint32_t pos, uint32_t *n_anchor) {
     const uint32_t n = DS4_N_EMBD;
     if (il == 1 && getenv("DS4_K3_TRACE_STAGE")) k3_trace_weights(l, il, "sequential");
     const uint32_t heads = DS4_N_HEAD, nope = DS4_N_KEY_MLA, rot = DS4_N_ROT, vdim = DS4_N_VALUE_MLA;
@@ -64741,8 +64765,9 @@ static bool k3_gpu_layer(k3_gpu_buffers *b, const ds4_model *model, const ds4_la
  * row offsets, so the numbers are those of the sequential pass), the spine matmuls run once over all rows, and each
  * expert of the layer's routed union is read from disk once and applied to every token that routed to it.
  * ========================================================================= */
-typedef struct {
+typedef struct k3_gpu_batch {
     uint32_t n_tok;
+    struct k3_gpu_batch *t1;   /* step 146: the same set on the second card */
     ds4_gpu_tensor *dsa_q, *dsa_k, *dsa_w, *dsa_scores, *dsa_sel, *dsa_mask;   /* step 95: before `tokens`, outside the block check */
     ds4_gpu_tensor *tokens, *cur, *attn_in, *normed, *attn_out, *prefix, *mixed, *ffn_out, *anchors;
     ds4_gpu_tensor *q_a, *q_an, *q, *kv, *kv_latent, *latent_norm, *kvb, *k_nope, *value, *heads, *gate, *gated;
@@ -64750,14 +64775,15 @@ typedef struct {
     ds4_gpu_tensor *router_logits, *moe_latent, *routed, *routed_norm, *moe_up, *sh_gate, *sh_up, *sh_mid, *sh_down;
     ds4_gpu_tensor *dense_gate, *dense_up, *dense_mid;
 } k3_gpu_batch;
+static inline k3_gpu_batch *k3_bb_of(k3_gpu_batch *bb, uint32_t il) { return k3_tier(il) && bb->t1 ? bb->t1 : bb; }   /* step 146 */
 
-static ds4_gpu_tensor *k3_gpu_try_f32(uint64_t elems) { return ds4_gpu_tensor_alloc(elems * sizeof(float)); }
+static ds4_gpu_tensor *k3_gpu_try_f32(uint64_t elems) { return k3_gpu_alloc_bytes(elems * sizeof(float)); }
 static void k3_dsa_batch_free(k3_gpu_batch *bb) {   /* step 95 */
     ds4_gpu_tensor **d[6] = {&bb->dsa_q, &bb->dsa_k, &bb->dsa_w, &bb->dsa_scores, &bb->dsa_sel, &bb->dsa_mask};
     for (int i = 0; i < 6; i++) if (*d[i]) { ds4_gpu_tensor_free(*d[i]); *d[i] = NULL; }
 }
 /* step 55: false (and nothing allocated) when the VRAM is not there */
-static bool k3_gpu_batch_alloc(k3_gpu_batch *bb, uint32_t T) {
+static bool k3_gpu_batch_alloc_tier(k3_gpu_batch *bb, uint32_t T) {
     const uint32_t n = DS4_N_EMBD, heads = DS4_N_HEAD, nope = DS4_N_KEY_MLA, rot = DS4_N_ROT, vdim = DS4_N_VALUE_MLA;
     const uint32_t proj = DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM, latent = g_ds4_shape.n_routed_latent;
     const uint32_t sh = (uint32_t)DS4_N_FF_EXP * DS4_N_EXPERT_SHARED;
@@ -64812,12 +64838,32 @@ static bool k3_gpu_batch_alloc(k3_gpu_batch *bb, uint32_t T) {
     return true;
 }
 
-static void k3_gpu_batch_free(k3_gpu_batch *bb) {
+static void k3_gpu_batch_free_tier(k3_gpu_batch *bb) {
     k3_dsa_batch_free(bb);   /* step 95 */
     ds4_gpu_tensor **t = (ds4_gpu_tensor **)&bb->tokens;
     const size_t n = (sizeof(*bb) - offsetof(k3_gpu_batch, tokens)) / sizeof(ds4_gpu_tensor *);
     for (size_t i = 0; i < n; i++) if (t[i]) ds4_gpu_tensor_free(t[i]);
     memset(bb, 0, sizeof(*bb));
+}
+
+static void k3_gpu_batch_free(k3_gpu_batch *bb) {
+    if (bb->t1) { k3_gpu_batch_free_tier(bb->t1); free(bb->t1); bb->t1 = NULL; }   /* step 146 */
+    k3_gpu_batch_free_tier(bb);
+}
+/* step 146: with the spine split, the same buffers again on the second card */
+static bool k3_gpu_batch_alloc(k3_gpu_batch *bb, uint32_t T) {
+    if (!k3_gpu_batch_alloc_tier(bb, T)) return false;
+    if (g_k3_split_cut <= 0) return true;
+    k3_gpu_batch *t1 = xcalloc(1, sizeof(*t1));
+    t1->n_tok = T;
+    const size_t n_t = (sizeof(*bb) - offsetof(k3_gpu_batch, tokens)) / sizeof(ds4_gpu_tensor *);
+    bool ok = k3_gpu_tensors_clone((ds4_gpu_tensor **)&t1->tokens, (ds4_gpu_tensor *const *)&bb->tokens, n_t, 1);
+    ds4_gpu_tensor *const d0[6] = {bb->dsa_q, bb->dsa_k, bb->dsa_w, bb->dsa_scores, bb->dsa_sel, bb->dsa_mask};
+    ds4_gpu_tensor **d1[6] = {&t1->dsa_q, &t1->dsa_k, &t1->dsa_w, &t1->dsa_scores, &t1->dsa_sel, &t1->dsa_mask};
+    for (int i = 0; ok && i < 6; i++) ok = k3_gpu_tensors_clone(d1[i], &d0[i], 1, 1);
+    bb->t1 = t1;
+    if (!ok) { k3_gpu_batch_free(bb); return false; }
+    return true;
 }
 
 static double g_k3_pf_attn = 0.0, g_k3_pf_route = 0.0, g_k3_pf_moe = 0.0;
@@ -64883,8 +64929,8 @@ static void k3_prefill_hint_next(k3_gpu_batch *bb, const ds4_model *model, const
     g_k3_pp_hints++; g_k3_pp_experts += m;
 }
 
-static bool k3_gpu_layer_batch(k3_gpu_buffers *b, k3_gpu_batch *bb, const ds4_model *model, const ds4_layer_weights *l,
-                               uint32_t il, uint32_t pos0, uint32_t *n_anchor, uint32_t ckpt_row, float **ck_conv, float **ck_state) {
+static bool k3_gpu_layer_batch_tier(k3_gpu_buffers *b, k3_gpu_batch *bb, const ds4_model *model, const ds4_layer_weights *l,
+                                    uint32_t il, uint32_t pos0, uint32_t *n_anchor, uint32_t ckpt_row, float **ck_conv, float **ck_state) {
     if (il == 1 && getenv("DS4_K3_TRACE_STAGE")) k3_trace_weights(l, il, "batched");
     const bool timing = getenv("DS4_K3_TRACE_TIMING") != NULL;
     const double tl0 = timing ? k3_pf_mark(bb->cur) : 0.0;
@@ -65133,6 +65179,59 @@ static bool k3_gpu_layer_batch(k3_gpu_buffers *b, k3_gpu_batch *bb, const ds4_mo
     return true;
 }
 
+
+/* step 146 (spine split): the rows and their anchors change cards; work queued afterwards on the receiving card waits for
+   the copies (an event per copy), and that card becomes the calling thread's */
+static bool k3_split_hop(ds4_gpu_tensor *dst_cur, const ds4_gpu_tensor *src_cur, ds4_gpu_tensor *dst_anchors,
+                         const ds4_gpu_tensor *src_anchors, uint64_t cur_bytes, uint64_t anchor_bytes, int to_tier) {
+    bool ok = ds4_gpu_tensor_copy_xdev_default(dst_cur, src_cur, cur_bytes) != 0;
+    if (ok && anchor_bytes) ok = ds4_gpu_tensor_copy_xdev_default(dst_anchors, src_anchors, anchor_bytes) != 0;
+    return ds4_gpu_set_current_device(to_tier) == 0 && ok;
+}
+/* one decode row through layer il, on that layer's card */
+static bool k3_gpu_layer(k3_gpu_buffers *b, const ds4_model *model, const ds4_layer_weights *l, uint32_t il,
+                         uint32_t pos, uint32_t *n_anchor) {
+    if (g_k3_split_cut <= 0) return k3_gpu_layer_tier(b, model, l, il, pos, n_anchor);
+    k3_gpu_buffers *t1 = b->t1;
+    if (!t1) return false;
+    const uint64_t row = (uint64_t)DS4_N_EMBD * sizeof(float);
+    if ((int)il == g_k3_split_cut && !k3_split_hop(t1->cur, b->cur, t1->anchors, b->anchors, row, (uint64_t)*n_anchor * row, 1)) {
+        (void)ds4_gpu_set_current_device(0);
+        fprintf(stderr, "ds4: K3 spine split: the residual stream did not reach the second card (layer %u)\n", il);
+        return false;
+    }
+    const int tier = k3_tier(il);
+    bool ok = k3_gpu_layer_tier(tier ? t1 : b, model, l, il, pos, n_anchor);
+    if (tier && (!ok || il + 1u == DS4_N_LAYER))   /* back for the output head (after a failure: the card set back) */
+        ok = k3_split_hop(b->cur, t1->cur, b->anchors, t1->anchors, row, (uint64_t)*n_anchor * row, 0) && ok;
+    return ok;
+}
+/* a batch of rows (a prompt pass, a verification block) through layer il, on that layer's card */
+static bool k3_gpu_layer_batch(k3_gpu_buffers *b, k3_gpu_batch *bb, const ds4_model *model, const ds4_layer_weights *l,
+                               uint32_t il, uint32_t pos0, uint32_t *n_anchor, uint32_t ckpt_row, float **ck_conv, float **ck_state) {
+    if (g_k3_split_cut <= 0) return k3_gpu_layer_batch_tier(b, bb, model, l, il, pos0, n_anchor, ckpt_row, ck_conv, ck_state);
+    k3_gpu_batch *t1 = bb->t1;
+    if (!t1 || !b->t1) return false;
+    const uint64_t rows = (uint64_t)bb->n_tok * DS4_N_EMBD * sizeof(float);   /* anchors: [row][16][n] */
+    if ((int)il == g_k3_split_cut) {
+        t1->n_tok = bb->n_tok;
+        if (!k3_split_hop(t1->cur, bb->cur, t1->anchors, bb->anchors, rows, *n_anchor ? rows * 16u : 0u, 1)) {
+            (void)ds4_gpu_set_current_device(0);
+            fprintf(stderr, "ds4: K3 spine split: %u rows did not reach the second card (layer %u)\n", bb->n_tok, il);
+            return false;
+        }
+    }
+    if (!k3_tier(il)) return k3_gpu_layer_batch_tier(b, bb, model, l, il, pos0, n_anchor, ckpt_row, ck_conv, ck_state);
+    /* a caller that keeps a layer's KDA inputs (the drafter) has put that layer's own tensors into bb: they live on this card */
+    ds4_gpu_tensor **own[6] = { &t1->kda_q, &t1->kda_k, &t1->kda_v, &t1->kda_raw_gate, &t1->kda_beta, &t1->kda_ogate };
+    ds4_gpu_tensor *got[6] = { bb->kda_q, bb->kda_k, bb->kda_v, bb->kda_raw_gate, bb->kda_beta, bb->kda_ogate }, *keep[6];
+    for (int i = 0; i < 6; i++) { keep[i] = *own[i]; if (got[i] && ds4_gpu_tensor_device(got[i]) == 1) *own[i] = got[i]; }
+    bool ok = k3_gpu_layer_batch_tier(b->t1, t1, model, l, il, pos0, n_anchor, ckpt_row, ck_conv, ck_state);
+    for (int i = 0; i < 6; i++) *own[i] = keep[i];
+    if (!ok || il + 1u == DS4_N_LAYER)   /* back for the output head (after a failure: the card set back) */
+        ok = k3_split_hop(bb->cur, t1->cur, bb->anchors, t1->anchors, rows, rows * 16u, 0) && ok;
+    return ok;
+}
 
 /* step 44/45: target rows for the drafter. The residual stream after the DSpark capture layers (decoder layers 2, 23,
    47, 71, 89) is staged per pass on the host as [T][5][n] bf16; the committed rows then go to the dump file
@@ -65454,10 +65553,10 @@ static int k3_gpu_prefill_one(k3_gpu_buffers *b, const ds4_model *model, const d
     k3_rows_begin(T, n);
     for (uint32_t il = 0; il < L && ok; il++) {
         ok = k3_gpu_layer_batch(b, &bb, model, &weights->layer[il], il, pos0, &n_anchor, ckpt_row, ck_conv, ck_state);
-        if (ok) k3_rows_capture(k3_rows_index(il), bb.cur, T);
+        if (ok) k3_rows_capture(k3_rows_index(il), k3_bb_of(&bb, il)->cur, T);
         if (ok && trace) {
             float *h = xmalloc((size_t)T * n * sizeof(float));
-            if (ds4_gpu_tensor_read(bb.cur, 0, h, (uint64_t)T * n * sizeof(float)) != 0) {
+            if (ds4_gpu_tensor_read(k3_bb_of(&bb, il)->cur, 0, h, (uint64_t)T * n * sizeof(float)) != 0) {
                 for (uint32_t t = 0; t < T; t++) {
                     char name[64]; snprintf(name, sizeof(name), "gpu pos %u layer %u hidden", pos0 + t, il);
                     print_vec_stats(name, h + (size_t)t * n, n);
@@ -65924,7 +66023,33 @@ static bool k3_ckpt_restore(k3_gpu_buffers *b, const k3_ckpt *cc) {
     return true;
 }
 
+/* step 146: the second card's set of the decode tensors, sized from the first card's */
+static void k3_gpu_buffers_twin_free(k3_gpu_buffers *b) {
+    k3_gpu_buffers *t1 = b->t1;
+    if (!t1) return;
+    ds4_gpu_tensor **t = (ds4_gpu_tensor **)&t1->cur;
+    const size_t n = (offsetof(k3_gpu_buffers, kda_conv) - offsetof(k3_gpu_buffers, cur)) / sizeof(ds4_gpu_tensor *);
+    for (size_t i = 0; i < n; i++) if (t[i]) ds4_gpu_tensor_free(t[i]);
+    { ds4_gpu_tensor *d[6] = {t1->dsa_q, t1->dsa_k, t1->dsa_w, t1->dsa_scores, t1->dsa_sel, t1->dsa_mask}; for (int i = 0; i < 6; i++) if (d[i]) ds4_gpu_tensor_free(d[i]); }
+    free(t1);
+    b->t1 = NULL;
+}
+static bool k3_gpu_buffers_twin(k3_gpu_buffers *b) {
+    if (g_k3_split_cut <= 0) return true;
+    k3_gpu_buffers *t1 = xcalloc(1, sizeof(*t1));
+    const size_t n = (offsetof(k3_gpu_buffers, kda_conv) - offsetof(k3_gpu_buffers, cur)) / sizeof(ds4_gpu_tensor *);
+    bool ok = k3_gpu_tensors_clone((ds4_gpu_tensor **)&t1->cur, (ds4_gpu_tensor *const *)&b->cur, n, 1);
+    ds4_gpu_tensor *const d0[6] = {b->dsa_q, b->dsa_k, b->dsa_w, b->dsa_scores, b->dsa_sel, b->dsa_mask};
+    ds4_gpu_tensor **d1[6] = {&t1->dsa_q, &t1->dsa_k, &t1->dsa_w, &t1->dsa_scores, &t1->dsa_sel, &t1->dsa_mask};
+    for (int i = 0; ok && i < 6; i++) ok = k3_gpu_tensors_clone(d1[i], &d0[i], 1, 1);
+    t1->kda_conv = b->kda_conv; t1->kda_state = b->kda_state; t1->key_cache = b->key_cache; t1->value_cache = b->value_cache;
+    t1->idx_cache = b->idx_cache; t1->cache_cap = b->cache_cap;   /* per layer: each tensor on its layer's card */
+    b->t1 = t1;
+    if (!ok) k3_gpu_buffers_twin_free(b);
+    return ok;
+}
 static void k3_gpu_buffers_free(k3_gpu_buffers *b) {
+    k3_gpu_buffers_twin_free(b);   /* step 146 */
     ds4_gpu_tensor **t = (ds4_gpu_tensor **)&b->cur;
     const size_t n = (offsetof(k3_gpu_buffers, kda_conv) - offsetof(k3_gpu_buffers, cur)) / sizeof(ds4_gpu_tensor *);
     for (size_t i = 0; i < n; i++) if (t[i]) ds4_gpu_tensor_free(t[i]);
@@ -66002,7 +66127,7 @@ static int k3_oracle_verify_run(k3_gpu_buffers *b, const ds4_model *model, const
         k3_rows_begin(nb, n);
         for (uint32_t il = 0; il < L && ok; il++) {
             ok = k3_gpu_layer_batch(b, &vb, model, &weights->layer[il], il, pos, &n_anchor, 0u, NULL, NULL);
-            if (ok) k3_rows_capture(k3_rows_index(il), vb.cur, nb);
+            if (ok) k3_rows_capture(k3_rows_index(il), k3_bb_of(&vb, il)->cur, nb);
         }
         if (ok) ok = ds4_gpu_k3_residual_mix_batch_tensor(vb.mixed, vb.cur, vb.anchors, n_anchor, nb, model->map, model->size,
                      weights->output_res_norm->abs_offset, weights->output_res_proj->abs_offset, n, DS4_RMS_EPS) != 0;
@@ -66179,7 +66304,7 @@ static int k3_draft_run(k3_gpu_buffers *b, const ds4_model *model, const ds4_voc
                 vb.kda_raw_gate = kin[il].raw_gate; vb.kda_beta = kin[il].beta; vb.kda_ogate = kin[il].ogate;
             }
             ok = k3_gpu_layer_batch(b, &vb, model, &weights->layer[il], il, pos, &n_anchor, 0u, NULL, NULL);
-            if (ok) k3_rows_capture(k3_rows_index(il), vb.cur, nb);
+            if (ok) k3_rows_capture(k3_rows_index(il), k3_bb_of(&vb, il)->cur, nb);
         }
         vb.kda_q = vb_q; vb.kda_k = vb_k; vb.kda_v = vb_v; vb.kda_raw_gate = vb_rg; vb.kda_beta = vb_beta; vb.kda_ogate = vb_og;
         if (ok) ok = ds4_gpu_k3_residual_mix_batch_tensor(vb.mixed, vb.cur, vb.anchors, n_anchor, nb, model->map, model->size,
@@ -66550,7 +66675,7 @@ static bool k3_qwen_bufs(void) {
     /* step 133: 69 KDA layers x (six inputs + two snapshots) as separate tensors each round up to the allocator's megabytes
        (759 MB of inputs at 32 rows where 543 MB are used, 552 MB of snapshots for 465 MB). Two allocations and views instead:
        about 0.3 GB of VRAM back to the device expert cache. DS4_K3_QWEN_SPLIT_BUFS=1 restores the separate tensors. */
-    const bool one_alloc = getenv("DS4_K3_QWEN_SPLIT_BUFS") == NULL;
+    const bool one_alloc = getenv("DS4_K3_QWEN_SPLIT_BUFS") == NULL && g_k3_split_cut <= 0;   /* step 146: each layer's on its own card */
 #else
     const bool one_alloc = false;
 #endif
@@ -66579,12 +66704,14 @@ static bool k3_qwen_bufs(void) {
     for (uint32_t il = 0; il < L && ok; il++) {
         if (!ds4_k3_layer_is_kda(il)) continue;
         k3_kda_inputs *k = &g_k3_qwen.kin[il];
+        g_k3_alloc_tier = k3_tier(il);   /* step 146 */
         k->q = k3_gpu_try_f32((uint64_t)kin_rows * proj); k->k = k3_gpu_try_f32((uint64_t)kin_rows * proj);
         k->v = k3_gpu_try_f32((uint64_t)kin_rows * proj); k->raw_gate = k3_gpu_try_f32((uint64_t)kin_rows * proj);
         k->beta = k3_gpu_try_f32((uint64_t)kin_rows * DS4_N_KDA_HEAD); k->ogate = k3_gpu_try_f32((uint64_t)kin_rows * proj);
         g_k3_qwen.snap_state[il] = k3_gpu_try_f32(state_floats); g_k3_qwen.snap_conv[il] = k3_gpu_try_f32(conv_floats);
         ok = k->q && k->k && k->v && k->raw_gate && k->beta && k->ogate && g_k3_qwen.snap_state[il] && g_k3_qwen.snap_conv[il];
     }
+    g_k3_alloc_tier = 0;
     if (ok) ok = (g_k3_qwen.vlg = k3_gpu_try_f32((uint64_t)width * DS4_N_VOCAB)) != NULL;
     if (ok) ok = ds4_gpu_k3_verify_prepare(width, DS4_N_EXPERT_USED, DS4_N_EXPERT, g_ds4_shape.n_routed_latent) != 0;   /* step 128 */
     if (!ok) {
@@ -66596,11 +66723,18 @@ static bool k3_qwen_bufs(void) {
     g_k3_qwen.bufs = true;
     return true;
 }
+/* step 146: a wide block's KDA inputs of a layer on the second card are that card's batch tensors (they have the block's width) */
+static k3_kda_inputs k3_qwen_wide_set(uint32_t il) {
+    const k3_gpu_batch *t1 = k3_tier(il) ? g_k3_qwen.vb.t1 : NULL;
+    if (!t1) return g_k3_qwen.kin_wide;
+    const k3_kda_inputs k = { t1->kda_q, t1->kda_k, t1->kda_v, t1->kda_raw_gate, t1->kda_beta, t1->kda_ogate };
+    return k;
+}
 /* step 129: a wide block's KDA inputs of one layer, GPU -> host after the layer (`rows` rows) and host -> GPU for a replay. The
    host copy is laid out for the configured width: q, k, v, raw_gate, ogate ([width x proj] each), then beta ([width x heads]). */
 static bool k3_qwen_kin_move(uint32_t il, uint32_t rows, bool to_host) {
     const uint32_t width = k3_qwen_rows(), proj = DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM;
-    k3_kda_inputs *k = &g_k3_qwen.kin_wide;
+    k3_kda_inputs kws = k3_qwen_wide_set(il), *k = &kws;   /* step 146 */
     float *h = g_k3_qwen.kin_host ? g_k3_qwen.kin_host[il] : NULL;
     if (!h || rows > width) return false;
     ds4_gpu_tensor *t[5] = {k->q, k->k, k->v, k->raw_gate, k->ogate};
@@ -66665,9 +66799,9 @@ static bool k3_qwen_block(k3_gpu_buffers *b, const ds4_model *model, const ds4_v
         if (ok && wide && ds4_k3_layer_is_kda(il)) ok = k3_qwen_kin_move(il, nb, true);
         if (ok && k3_hash_layers_on()) {
             for (uint32_t i = 0; i < nb; i++) {
-                k3_hash_row("prefix", pos + i, il, vb->prefix, i, n);
-                if (il >= DS4_N_LEADING_DENSE) k3_hash_row("routed", pos + i, il, vb->routed, i, g_ds4_shape.n_routed_latent);
-                k3_hash_row("cur", pos + i, il, vb->cur, i, n);
+                k3_hash_row("prefix", pos + i, il, k3_bb_of(vb, il)->prefix, i, n);
+                if (il >= DS4_N_LEADING_DENSE) k3_hash_row("routed", pos + i, il, k3_bb_of(vb, il)->routed, i, g_ds4_shape.n_routed_latent);
+                k3_hash_row("cur", pos + i, il, k3_bb_of(vb, il)->cur, i, n);
             }
         }
     }
@@ -66702,13 +66836,16 @@ static bool k3_qwen_block(k3_gpu_buffers *b, const ds4_model *model, const ds4_v
             if (!ds4_k3_layer_is_kda(il)) continue;
             const ds4_layer_weights *l = &weights->layer[il];
             const k3_kda_inputs *ki = &kin[il];
-            if (wide) { ok = k3_qwen_kin_move(il, commit, false); ki = &g_k3_qwen.kin_wide; }   /* step 129: the committed rows, back from the host */
+            k3_kda_inputs kw;
+            if (g_k3_split_cut > 0) (void)ds4_gpu_set_current_device(k3_tier(il));   /* step 146: the replay runs on the layer's card */
+            if (wide) { ok = k3_qwen_kin_move(il, commit, false); kw = k3_qwen_wide_set(il); ki = &kw; }   /* step 129: the committed rows, back from the host */
             ok = ok && ds4_gpu_tensor_copy(b->kda_state[il], 0, g_k3_qwen.snap_state[il], 0, state_bytes) != 0 &&
                  ds4_gpu_tensor_copy(b->kda_conv[il], 0, g_k3_qwen.snap_conv[il], 0, conv_bytes) != 0 &&
-                 ds4_gpu_k3_kda_decode_batch(vb->kda_out, b->kda_conv[il], b->kda_state[il], ki->q, ki->k, ki->v, ki->raw_gate, ki->beta, ki->ogate, model->map, model->size,
+                 ds4_gpu_k3_kda_decode_batch(k3_bb_of(vb, il)->kda_out, b->kda_conv[il], b->kda_state[il], ki->q, ki->k, ki->v, ki->raw_gate, ki->beta, ki->ogate, model->map, model->size,
                      l->kda_q_conv->abs_offset, l->kda_k_conv->abs_offset, l->kda_v_conv->abs_offset, l->kda_a_log->abs_offset, l->kda_dt_bias->abs_offset, l->kda_o_norm->abs_offset,
                      DS4_N_KDA_HEAD, DS4_KDA_GATE_LOWER_BOUND, DS4_RMS_EPS, g_ds4_shape.kda_a_log_per_channel ? 1 : 0, commit) != 0;
         }
+        if (g_k3_split_cut > 0) (void)ds4_gpu_set_current_device(0);   /* step 146 */
         g_k3_qwen.t_replay += now_sec() - tr0;
         if (!ok) { g_k3_verify_on = 0; ds4_gpu_k3_set_verify(0); fprintf(stderr, "ds4: K3 Qwen: KDA replay failed at pos %u\n", pos); return false; }
         if (acc == 0u) g_k3_qwen.n_zero++; else g_k3_qwen.n_partial++;
@@ -66787,6 +66924,15 @@ static int generate_k3_cuda_argmax(
         ds4_generation_done_fn done,
         void              * emit_ud) {
     fprintf(stderr, "ds4: using Kimi K3 CUDA decode path (batched prompt pass, dense MLA cache)\n");
+    if (g_k3_split_cut > 0) {   /* step 146 */
+        static bool said = false;
+        (void)ds4_gpu_set_current_device(0);
+        if (!said) {
+            said = true;
+            fprintf(stderr, "ds4: kimi-k3 spine split (step 146): layers 0-%d on the first card, %d-%u on the second; the residual stream crosses twice per forward\n",
+                    g_k3_split_cut - 1, g_k3_split_cut, (unsigned)DS4_N_LAYER - 1u);
+        }
+    }
     {   /* step 106: fp32 activations in the spine and prompt-pass expert matmuls (DS4_K3_F32_ACT=0: the int8 / bf16 paths) */
         const char *fa = getenv("DS4_K3_F32_ACT");
         const int on = fa ? (fa[0] && strcmp(fa, "0") != 0) : 1;
@@ -66799,11 +66945,22 @@ static int generate_k3_cuda_argmax(
         fprintf(stderr, "ds4: K3 could not install the decode weights on the GPU\n");
         return 1;
     }
+    if (g_k3_split_cut > 0) {   /* step 146: what the second card's expert cache leaves free there */
+        const uint64_t cap = (uint64_t)(ctx_size > 0 ? ctx_size : 2048);
+        const char *pr = getenv("DS4_K3_SPLIT_PASS_ROWS");   /* the longest prompt pass to keep room for (default: the context) */
+        const uint64_t pass_rows = pr && atoi(pr) > 0 ? (uint64_t)atoi(pr) : cap;
+        uint64_t need = (uint64_t)1536 << 20;   /* scratch, cuBLAS, a verification block's set, a margin */
+        for (uint32_t il = (uint32_t)g_k3_split_cut; il < DS4_N_LAYER; il++)
+            need += ds4_k3_layer_is_kda(il) ? (uint64_t)24 << 20
+                                            : cap * DS4_N_HEAD * (DS4_N_KEY_MLA + DS4_N_ROT + DS4_N_VALUE_MLA) * (uint64_t)ds4_gpu_k3_mla_cache_elem_bytes();
+        need += pass_rows * k3_gpu_batch_bytes_per_row();
+        ds4_gpu_k3_split_second_card(g_k3_split_dev1, (uint32_t)(need >> 20));
+    }
     if (!getenv("DS4_K3_POOL_LAZY")) {   /* step 77: the expert pool is created here, not inside the first token */
         const double tp0 = now_sec();
         static bool k3_stage_done = false;   /* step 87 */
         uint64_t *st_off = NULL, *st_len = NULL; uint32_t st_n = 0;
-        if (!k3_stage_done && ds4_k3_expert_source_active() && !getenv("DS4_K3_SPINE_LAZY")) {
+        if (!k3_stage_done && ds4_k3_expert_source_active() && !getenv("DS4_K3_SPINE_LAZY") && g_k3_split_cut <= 0) {   /* step 146: the split's weights were placed card by card at load */
             k3_stage_done = true;
             st_off = xmalloc((size_t)model->n_tensors * sizeof(uint64_t)); st_len = xmalloc((size_t)model->n_tensors * sizeof(uint64_t));
             for (uint64_t i = 0; i < model->n_tensors; i++) {
@@ -66848,6 +67005,10 @@ static int generate_k3_cuda_argmax(
         const uint32_t cap_max = getenv("DS4_K3_CACHE_CAP") ? (uint32_t)atoi(getenv("DS4_K3_CACHE_CAP")) : 4096u;
         if (cache_cap > cap_max) cache_cap = cap_max;
         if (cache_cap > ds4_gpu_k3_attn_max_pos()) cache_cap = ds4_gpu_k3_attn_max_pos();   /* step 99: the attention kernels' limit */
+    }
+    if (g_k3_split_cut > 0 && (cache_cap > 2048u || (getenv("DS4_K3_DSA") && getenv("DS4_K3_DSA")[0] && strcmp(getenv("DS4_K3_DSA"), "0") != 0))) {   /* step 146 */
+        fprintf(stderr, "ds4: K3 spine split: contexts above 2,048 positions (the latent cache, the DSA indexer) are not split yet; run them on one card\n");
+        return 1;
     }
     if ((uint32_t)n_ids >= cache_cap) {
         fprintf(stderr, "ds4: K3 v1 cache holds %u positions; the prompt has %d tokens\n", cache_cap, n_ids);
@@ -66946,6 +67107,7 @@ static int generate_k3_cuda_argmax(
     b.key_cache = xcalloc(L, sizeof(*b.key_cache)); b.value_cache = xcalloc(L, sizeof(*b.value_cache));
     g_k3_lat_cap = cache_cap;   /* step 96b */
     for (uint32_t il = 0; il < L; il++) {
+        g_k3_alloc_tier = k3_tier(il);   /* step 146: a layer's caches and states live on its card */
         if (ds4_k3_layer_is_kda(il)) {
             b.kda_conv[il] = k3_gpu_alloc_f32((uint64_t)3 * 3 * proj);
             b.kda_state[il] = k3_gpu_alloc_f32((uint64_t)DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM * DS4_N_KDA_HEAD_DIM);
@@ -66977,8 +67139,8 @@ static int generate_k3_cuda_argmax(
                 g_k3_lat.norm[il] = k3_gpu_alloc_f32((uint64_t)cache_cap * DS4_N_KV_LORA);
                 b.key_cache[il] = g_k3_lat.key; b.value_cache[il] = g_k3_lat.val;   /* every layer reads the shared buffer */
             } else {
-            b.key_cache[il] = ds4_gpu_tensor_alloc((uint64_t)cache_cap * heads * (nope + rot) * eb);
-            b.value_cache[il] = ds4_gpu_tensor_alloc((uint64_t)cache_cap * heads * vdim * eb);
+            b.key_cache[il] = k3_gpu_alloc_bytes((uint64_t)cache_cap * heads * (nope + rot) * eb);
+            b.value_cache[il] = k3_gpu_alloc_bytes((uint64_t)cache_cap * heads * vdim * eb);
             }
             if (!b.key_cache[il] || !b.value_cache[il]) ds4_die("K3 MLA cache allocation failed");
             if (k3_dsa_on()) {   /* step 95: index keys, 128 floats per position */
@@ -66988,6 +67150,7 @@ static int generate_k3_cuda_argmax(
         }
     }
     if (k3_dsa_on()) {   /* step 95 */
+        g_k3_alloc_tier = 0;
         if (ds4_gpu_k3_mla_cache_elem_bytes() != 4) ds4_die("K3 DSA needs the full-precision attention cache (unset DS4_K3_MLA_CACHE)");
         b.dsa_q = k3_gpu_alloc_f32((uint64_t)g_k3_dsa.heads * 128u); b.dsa_k = k3_gpu_alloc_f32(128u); b.dsa_w = k3_gpu_alloc_f32(g_k3_dsa.heads);
         b.dsa_scores = k3_gpu_alloc_f32(cache_cap);
@@ -66999,6 +67162,8 @@ static int generate_k3_cuda_argmax(
     }
     if (ds4_gpu_k3_mla_cache_elem_bytes() == 2) fprintf(stderr, "ds4: K3 MLA caches in half precision (%s): %.1f GB for %u positions\n", getenv("DS4_K3_MLA_CACHE"),
         (double)cache_cap * (double)(DS4_N_LAYER - DS4_N_LAYER * 3 / 4) * heads * ((nope + rot) + vdim) * 2.0 / 1e9, cache_cap);
+    g_k3_alloc_tier = 0;
+    if (!k3_gpu_buffers_twin(&b)) ds4_die("K3 spine split: no VRAM for the second card's working tensors");   /* step 146 */
     }   /* fresh buffers */
     /* step 39: a saved prefix is restored; otherwise a long prefix shared with the previous request is prefilled
        first and saved (ckpt_split), so the next conversation with the same prefix starts from it */
@@ -67035,7 +67200,7 @@ static int generate_k3_cuda_argmax(
     /* step 45: the drafter follows this request only if its context can be the exact prefix the target starts from */
     g_k3_draft.active = false;
     g_k3_draft_cache_cap = cache_cap;
-    if (k3_draft_start()) {
+    if (g_k3_split_cut <= 0 && k3_draft_start()) {   /* step 146: the DSpark drafter stays a one-card option */
         if (k3_draft_truncate(pos0) && g_k3_draft.len == pos0) g_k3_draft.active = true;
         else fprintf(stderr, "ds4: K3 drafter: sidecar holds %u rows, the request starts at %u: drafting off for this request\n", g_k3_draft.len, pos0);
     }
@@ -67107,15 +67272,16 @@ static int generate_k3_cuda_argmax(
             k3_rows_begin(1u, n);
             for (uint32_t il = 0; il < L && ok; il++) {
                 ok = k3_gpu_layer(&b, model, &weights->layer[il], il, pos, &n_anchor);
+                const k3_gpu_buffers *lb = k3_b_of(&b, il);   /* step 146: the set of the card that ran the layer */
                 if (ok && k3_hash_layers_on()) {
-                    k3_hash_row("prefix", pos, il, b.prefix, 0u, n);
-                    if (il >= DS4_N_LEADING_DENSE) k3_hash_row("routed", pos, il, b.routed, 0u, latent);
-                    k3_hash_row("cur", pos, il, b.cur, 0u, n);
+                    k3_hash_row("prefix", pos, il, lb->prefix, 0u, n);
+                    if (il >= DS4_N_LEADING_DENSE) k3_hash_row("routed", pos, il, lb->routed, 0u, latent);
+                    k3_hash_row("cur", pos, il, lb->cur, 0u, n);
                 }
-                if (ok) k3_rows_capture(k3_rows_index(il), b.cur, 1u);
+                if (ok) k3_rows_capture(k3_rows_index(il), lb->cur, 1u);
                 if (ok && trace) {
                     float *h = xmalloc((size_t)n * sizeof(float));
-                    if (ds4_gpu_tensor_read(b.cur, 0, h, (uint64_t)n * sizeof(float)) != 0) {
+                    if (ds4_gpu_tensor_read(lb->cur, 0, h, (uint64_t)n * sizeof(float)) != 0) {
                         char name[64]; snprintf(name, sizeof(name), "gpu pos %u layer %u hidden", pos, il);
                         print_vec_stats(name, h, n);
                     }
@@ -73239,7 +73405,7 @@ int ds4_engine_generate_argmax(
                     ds4_backend_name(e->backend));
             return 1;
         }
-        if (e->multi_tier || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        if ((e->multi_tier && !ds4_model_is_kimi_k3()) || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {   /* step 146: Kimi keeps its own path on two cards */
             ds4_session *s = NULL;
             char err[256] = {0};
             const double t_prefill0 = now_sec();
@@ -77397,7 +77563,8 @@ static int engine_stream_split_cut(const ds4_engine *e, const ds4_gpu_config *cf
     const char *s = getenv("DS4_CUDA_STREAM_SPLIT");
     if (!s || !s[0] || !strcmp(s, "0")) return 0;
     if (!e || !e->ssd_streaming || !cfg || cfg->n_gpus != 2 || e->cuda_tensor_parallel ||
-        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 || DS4_N_LAYER < 2) return 0;
+        (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 && DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_KIMI_K3) ||   /* step 146: Kimi's spine split */
+        DS4_N_LAYER < 2) return 0;
     const int cut = (!strcmp(s, "1") || !strcmp(s, "auto")) ? (int)DS4_N_LAYER / 2 : atoi(s);
     return cut >= 1 && cut < (int)DS4_N_LAYER ? cut : 0;
 }
@@ -77783,11 +77950,13 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
         const int cut = engine_stream_split_cut(e, &e->gpu_cfg);
         if (cut > 0) {
             for (int i = 0; i < (int)DS4_N_LAYER + 2; i++) e->placement[i] = i <= cut ? 0 : 1;
+            const bool head_home = ds4_model_is_kimi_k3();   /* step 146: Kimi's residual stream returns to the first card for the output head */
+            if (head_home) e->placement[DS4_N_LAYER + 1] = 0;
             e->n_placement_entries = DS4_N_LAYER + 2;
             e->multi_tier = 1;
-            fprintf(stderr, "ds4: SSD streaming split (DS4_CUDA_STREAM_SPLIT): embedding and layers 0-%d on GPU%d, "
-                    "layers %d-%d and the output head on GPU%d\n", cut - 1, e->gpu_cfg.device_indices[0], cut,
-                    (int)DS4_N_LAYER - 1, e->gpu_cfg.device_indices[1]);
+            fprintf(stderr, "ds4: SSD streaming split (DS4_CUDA_STREAM_SPLIT): embedding%s and layers 0-%d on GPU%d, "
+                    "layers %d-%d%s on GPU%d\n", head_home ? ", output head" : "", cut - 1, e->gpu_cfg.device_indices[0], cut,
+                    (int)DS4_N_LAYER - 1, head_home ? "" : " and the output head", e->gpu_cfg.device_indices[1]);
             return 0;
         }
     }
@@ -77990,6 +78159,16 @@ static int engine_install_per_device_caches(ds4_engine *e) {
                                             logical_tier, physical_device,
                                             home_offset, home_bytes) != 0) {
             goto cleanup;
+        }
+        {   /* step 146 (Kimi's spine split): a layer's router matrix also predicts that layer's experts from the layer
+             * before it (the read-ahead hint), so the first layer of the second card keeps a copy of it (26 MB) on the
+             * first card */
+            const int k3_cut = ds4_model_is_kimi_k3() ? engine_stream_split_cut(e, &e->gpu_cfg) : 0;
+            if (k3_cut > 0 && logical_tier != 0 && t == e->weights.layer[k3_cut].ffn_gate_inp &&
+                engine_append_device_cache_span(per_dev_ranges, per_dev_n, per_dev_cap, 0, g_gpu[0].device_id,
+                                                home_offset, home_bytes) != 0) {
+                goto cleanup;
+            }
         }
         if (cuda_tp_decode && entry >= 1 && entry <= (int)DS4_N_LAYER) {
             if (logical_tier >= tp_half) {
@@ -79912,6 +80091,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #ifdef DS4_HAS_DEEPSEEK41_GPU
                     g_ds41_split_cut = cut;   /* the session graphs build a set of working tensors per card */
 #endif
+                    if (ds4_model_is_kimi_k3()) {   /* step 146: Kimi's own path reads the cut and the second card */
+                        g_k3_split_cut = cut;
+                        g_k3_split_dev1 = gpu_cfg->device_indices[1];
+                    }
                     (void)ds4_gpu_set_model_fd(e->model.fd);   /* again: the model map is registered now */
                     ds4_gpu_set_ssd_streaming(true);
                     for (int tier = 0; tier < 2; tier++) {
@@ -79933,6 +80116,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                             }
                             if (hi > lo) ds4_gpu_set_streaming_expert_cache_span(lo, hi);
                         }
+                        if (!ds4_model_is_kimi_k3())   /* step 146: Kimi's expert pool sizes its own caches */
                         fprintf(stderr, "ds4: SSD streaming split: GPU%d may cache up to %u experts of %.2f MiB\n",
                                 gpu_cfg->device_indices[tier], share, (double)slab_expert_bytes / 1048576.0);
                     }
