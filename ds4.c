@@ -41826,6 +41826,16 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(engram_prefetch, (g->carry_cap ? g->carry_cap : g->prefill_cap) * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM) \
     X(engram_kv, (DS4_N_HC + 1u) * DS4_N_EMBD) X(logits, DS4_N_VOCAB)
 
+/* Two-card SSD streaming (DS4_CUDA_STREAM_SPLIT): a graph's working tensors exist once per card. The graph's own
+ * fields name the set of the card it is on; this holds the other card's. */
+typedef struct ds41_tier_set {
+#define DS41_FIELD(name, count) ds4_gpu_tensor *name;
+    DS41_SCRATCH(DS41_FIELD)
+#undef DS41_FIELD
+    ds41_prefill_row batch, *rows_view, carry;
+    ds4_gpu_tensor *prefill_tokens;
+} ds41_tier_set;
+
 typedef struct {
     uint32_t ctx, pos, prefill_cap, carry_cap;
     /* Rows the unpruned sweep would run here; batched kernels that pick by
@@ -41875,7 +41885,210 @@ typedef struct {
 #define DS41_FIELD(name, count) ds4_gpu_tensor *name;
     DS41_SCRATCH(DS41_FIELD)
 #undef DS41_FIELD
+    /* Two-card SSD streaming: layers >= split_cut run on the second card. `tier` is the card the working tensors
+     * above belong to now, `other` the other card's set; ds41_tier_enter() exchanges them. NULL on one card. */
+    int split_cut, tier;
+    ds41_tier_set *other;
 } ds41_gpu_graph;
+
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+#define DS41_SPLIT_BUILD 1
+/* The cut the engine opened with (0: every layer on one card) and the card ds41_alloc() allocates on while a graph is
+ * being built. */
+static int g_ds41_split_cut, g_ds41_alloc_tier;
+static ds4_gpu_tensor *ds41_alloc_at(int tier, uint64_t bytes) {
+    return g_ds41_split_cut ? ds4_gpu_tensor_alloc_ptr_on(tier, bytes) : ds4_gpu_tensor_alloc(bytes);
+}
+static ds4_gpu_tensor *ds41_alloc(uint64_t bytes) { return ds41_alloc_at(g_ds41_alloc_tier, bytes); }
+/* A host-written (managed) tensor: allocated once, then named again for the second card as a view of the first. */
+static ds4_gpu_tensor *ds41_alloc_shared(const ds4_gpu_tensor *first, uint64_t bytes) {
+    return first ? ds4_gpu_tensor_view_on(first, g_ds41_alloc_tier) : ds4_gpu_tensor_alloc_managed(bytes);
+}
+#else
+#define ds41_alloc_at(tier, bytes) ds4_gpu_tensor_alloc(bytes)
+#define ds41_alloc(bytes) ds4_gpu_tensor_alloc(bytes)
+#define ds41_alloc_shared(first, bytes) ds4_gpu_tensor_alloc_managed(bytes)
+#endif
+
+/* The card that runs layer il. */
+static int ds41_layer_tier(const ds41_gpu_graph *g, uint32_t il) {
+    return g->other && il >= (uint32_t)g->split_cut ? 1 : 0;
+}
+
+/* Exchange the graph's working tensors with the other card's set. */
+static DS4_MAYBE_UNUSED void ds41_tier_swap(ds41_gpu_graph *g) {
+    ds41_tier_set *o = g->other;
+    ds4_gpu_tensor *t;
+#define DS41_SWAP(name, count) t = g->name; g->name = o->name; o->name = t;
+    DS41_SCRATCH(DS41_SWAP)
+#undef DS41_SWAP
+    t = g->prefill_tokens; g->prefill_tokens = o->prefill_tokens; o->prefill_tokens = t;
+    const ds41_prefill_row batch = g->batch, carry = g->carry;
+    ds41_prefill_row *const rows = g->rows_view;
+    g->batch = o->batch; g->carry = o->carry; g->rows_view = o->rows_view;
+    o->batch = batch; o->carry = carry; o->rows_view = rows;
+}
+
+static void ds41_tier_set_free(ds41_tier_set *o, uint32_t prefill_cap) {
+    if (!o) return;
+    for (uint32_t i = 0; o->rows_view && i < prefill_cap; i++) {
+#define DS41_SET_ROW_FREE(name, count) ds4_gpu_tensor_free(o->rows_view[i].name);
+        DS41_PREFILL_ROWS(DS41_SET_ROW_FREE)
+#undef DS41_SET_ROW_FREE
+    }
+#define DS41_SET_BATCH_FREE(name, count) ds4_gpu_tensor_free(o->batch.name);
+    DS41_PREFILL_ROWS(DS41_SET_BATCH_FREE)
+#undef DS41_SET_BATCH_FREE
+#define DS41_SET_CARRY_FREE(name, count, format) ds4_gpu_tensor_free(o->carry.name);
+    DS41_CARRY_ROWS(DS41_SET_CARRY_FREE)
+#undef DS41_SET_CARRY_FREE
+#define DS41_SET_FREE(name, count) ds4_gpu_tensor_free(o->name);
+    DS41_SCRATCH(DS41_SET_FREE)
+#undef DS41_SET_FREE
+    free(o->rows_view);
+    ds4_gpu_tensor_free(o->prefill_tokens);
+    free(o);
+}
+
+/* While a graph is built: keep the first card's set and start the second card's. */
+static DS4_MAYBE_UNUSED bool ds41_tier_alloc_next(ds41_gpu_graph *g) {
+#ifdef DS41_SPLIT_BUILD
+    ds41_tier_swap(g);
+    g_ds41_alloc_tier = 1;
+    g->rows_view = calloc(g->prefill_cap, sizeof(*g->rows_view));
+    g->prefill_tokens = ds41_alloc((uint64_t)g->prefill_cap * sizeof(int32_t));
+    return g->rows_view && g->prefill_tokens;
+#else
+    (void)g;
+    return false;
+#endif
+}
+
+/* A graph copy made before a card switch names the card that was left: give it the graph's working tensors again. */
+static DS4_MAYBE_UNUSED void ds41_tier_adopt(ds41_gpu_graph *row, const ds41_gpu_graph *g) {
+#define DS41_ADOPT(name, count) row->name = g->name;
+    DS41_SCRATCH(DS41_ADOPT)
+#undef DS41_ADOPT
+    row->batch = g->batch; row->carry = g->carry; row->rows_view = g->rows_view;
+    row->prefill_tokens = g->prefill_tokens;
+    row->tier = g->tier;
+}
+
+/* DS4_CUDA_STREAM_SPLIT_COPY=full: every working tensor crosses at a card switch, not only the state the next layer
+ * reads. A check of that list: both settings must give the same logits. */
+static DS4_MAYBE_UNUSED bool ds41_tier_copy_full(void) {
+    static int cached = -1;
+    if (cached < 0) { const char *e = getenv("DS4_CUDA_STREAM_SPLIT_COPY"); cached = e && !strcmp(e, "full"); }
+    return cached != 0;
+}
+
+/* Make `tier` the card the graph works on. The card being left is drained, the state the next layer reads is copied
+ * to the other card's tensors and the working fields are exchanged. rows: the prompt-pass rows whose batch and carry
+ * state must follow (0 while decoding: the hidden state, its split weights and `pre` do). */
+static bool ds41_tier_enter(ds41_gpu_graph *g, int tier, uint32_t rows) {
+#ifdef DS41_SPLIT_BUILD
+    if (!g->other) return true;
+    if (tier == g->tier) return ds4_gpu_set_current_device(tier) == 0;
+    if (ds4_gpu_set_current_device(g->tier) != 0 || !ds4_gpu_synchronize()) return false;
+    ds41_tier_set *o = g->other;
+    const bool full = ds41_tier_copy_full();
+    bool ok = true;
+#define DS41_CROSS(dst, src, bytes) \
+    do { const uint64_t b_ = (bytes); if (ok && b_) ok = ds4_gpu_tensor_copy_xdev_default((dst), (src), b_) != 0; } while (0)
+    if (full) {
+#define DS41_HOP(name, count) \
+        if (strcmp(#name, "engram_prefetch") && strcmp(#name, "image_text_mask")) \
+            DS41_CROSS(o->name, g->name, ds4_gpu_tensor_bytes(g->name));
+        DS41_SCRATCH(DS41_HOP)
+#undef DS41_HOP
+        DS41_CROSS(o->prefill_tokens, g->prefill_tokens, ds4_gpu_tensor_bytes(g->prefill_tokens));
+    } else {
+        DS41_CROSS(o->residual, g->residual, ds4_gpu_tensor_bytes(g->residual));
+        DS41_CROSS(o->pre, g->pre, ds4_gpu_tensor_bytes(g->pre));
+        DS41_CROSS(o->ffn_split, g->ffn_split, ds4_gpu_tensor_bytes(g->ffn_split));
+    }
+    if (rows) {
+        const uint32_t batch_rows = full || rows > g->prefill_cap ? g->prefill_cap : rows;
+        const uint32_t carry_rows = full || rows > g->carry_cap ? g->carry_cap : rows;
+        if (full) {
+#define DS41_HOP(name, count) \
+            if (strcmp(#name, "engram_rows") && strcmp(#name, "selected_comp")) \
+                DS41_CROSS(o->batch.name, g->batch.name, ds4_gpu_tensor_bytes(g->batch.name));
+            DS41_PREFILL_STORAGE(DS41_HOP)
+            if (!g->prefill_alias) { DS41_PREFILL_ALIASES(DS41_HOP) }
+#undef DS41_HOP
+        } else {
+            /* what a layer reads of the rows the layer before it left: the carry's fields (the selection is shared) */
+#define DS41_HOP(name) DS41_CROSS(o->batch.name, g->batch.name, \
+                ds4_gpu_tensor_bytes(g->batch.name) / g->prefill_cap * batch_rows)
+            DS41_HOP(residual); DS41_HOP(pre); DS41_HOP(ffn_split); DS41_HOP(block_mask);
+#undef DS41_HOP
+        }
+#define DS41_HOP(name, count, format) \
+        if (g->carry_cap) DS41_CROSS(o->carry.name, g->carry.name, \
+            (uint64_t)ds41_carry_words(count, format, g->compact_carry) * carry_rows * sizeof(float));
+        DS41_CARRY_ROWS(DS41_HOP)
+#undef DS41_HOP
+    }
+#undef DS41_CROSS
+    if (!ok || ds4_gpu_set_current_device(tier) != 0) return false;
+    if (full && g->block_list_mask == g->block_mask) g->block_list_mask = o->block_mask;
+    ds41_tier_swap(g);
+    g->tier = tier;
+    return true;
+#else
+    (void)g; (void)tier; (void)rows;
+    return true;
+#endif
+}
+
+/* DS4_V41_LAYER_HASH=<n> (diagnostic): a hash of the hidden state after every layer of the prompt pass (the last row
+ * of each chunk) and of the first n decode steps that follow, to find the layer where two configurations part. */
+static int ds41_layer_hash_steps(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_V41_LAYER_HASH");
+        cached = e && *e ? atoi(e) : 0;
+        if (cached < 0) cached = 0;
+    }
+    return cached;
+}
+static int ds41_layer_hash_left = -1;   /* decode steps still to hash; -1: not started */
+static void ds41_layer_hash(const char *phase, uint32_t il, uint32_t pos, const ds4_gpu_tensor *t) {
+    const uint64_t bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    uint8_t *buf = malloc((size_t)bytes);
+    if (buf && t && ds4_gpu_tensor_read(t, 0, buf, bytes)) {
+        uint64_t h = UINT64_C(1469598103934665603);
+        for (uint64_t i = 0; i < bytes; i++) { h ^= buf[i]; h *= UINT64_C(1099511628211); }
+        fprintf(stderr, "ds4: v41-hash %s pos=%u layer=%u %016llx\n", phase, pos, il, (unsigned long long)h);
+    }
+    free(buf);
+}
+
+/* DS4_V41_STAGE_HASH=<layer> (diagnostic): after every stage of that layer in the prompt pass, a hash of each working
+ * tensor of the chunk's first and last row. */
+static int ds41_stage_hash_layer(void) {
+    static int cached = -2;
+    if (cached == -2) { const char *e = getenv("DS4_V41_STAGE_HASH"); cached = e && *e ? atoi(e) : -1; }
+    return cached;
+}
+static uint64_t ds41_tensor_hash(const ds4_gpu_tensor *t) {
+    const uint64_t bytes = t ? ds4_gpu_tensor_bytes(t) : 0;
+    uint8_t *buf = bytes ? malloc((size_t)bytes) : NULL;
+    uint64_t h = UINT64_C(1469598103934665603);
+    if (buf && ds4_gpu_tensor_read(t, 0, buf, bytes))
+        for (uint64_t i = 0; i < bytes; i++) { h ^= buf[i]; h *= UINT64_C(1099511628211); }
+    else h = 0;
+    free(buf);
+    return h;
+}
+static void ds41_stage_hash(const char *label, uint32_t il, uint32_t row_index, const ds41_prefill_row *row) {
+    fprintf(stderr, "ds4: v41-stage layer=%u row=%u stage='%s'", il, row_index, label);
+#define DS41_STAGE_HASH(name, count) fprintf(stderr, " " #name "=%08x", (unsigned)(ds41_tensor_hash(row->name) >> 32));
+    DS41_PREFILL_ROWS(DS41_STAGE_HASH)
+#undef DS41_STAGE_HASH
+    fputc('\n', stderr);
+}
 
 static bool ds41_read_array(const ds4_model *m, const char *key, uint32_t type,
                             uint64_t count, void *out, size_t bytes) {
@@ -41891,6 +42104,11 @@ static bool ds41_index_bf16_on(void) { return !(ds4_gpu_v41_off() & DS4_GPU_V41_
 
 static void ds41_graph_free(ds41_gpu_graph *g) {
     if (!g) return;
+    ds41_tier_set_free(g->other, g->prefill_cap);   /* the other card's set */
+    g->other = NULL;
+#ifdef DS41_SPLIT_BUILD
+    g_ds41_alloc_tier = 0;
+#endif
     ds41_dspark_free(g->dspark);
     ds4_engram_reader_free(g->engram_reader);
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -42053,6 +42271,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     g->allocation_bytes = ds41_graph_bytes(ctx);
     g->streaming = streaming;
     g->tp_world = 1;
+#ifdef DS41_SPLIT_BUILD
+    if (streaming && g_ds41_split_cut) {   /* DS4_CUDA_STREAM_SPLIT: a set of working tensors for each card */
+        g->split_cut = g_ds41_split_cut;
+        if (!(g->other = calloc(1, sizeof(*g->other)))) goto fail;
+    }
+#endif
     g->token_map = malloc((size_t)DS4_N_VOCAB * sizeof(uint32_t));
     g->prefill_ids = malloc((size_t)(g->carry_cap ? g->carry_cap : g->prefill_cap) *
                             sizeof(*g->prefill_ids));
@@ -42081,23 +42305,25 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
             weights_stat.st_dev != rows_stat.st_dev || weights_stat.st_ino != rows_stat.st_ino)
             goto fail;
         const uint64_t bytes = (uint64_t)DS4_N_EMBD * DS4_N_HC * 4;
-        g->engram_q_norm[i] = ds4_gpu_tensor_alloc(bytes);
-        g->engram_k_norm[i] = ds4_gpu_tensor_alloc(bytes);
+        g->engram_q_norm[i] = ds41_alloc_at(ds41_layer_tier(g, il), bytes);   /* on the card that runs the layer */
+        g->engram_k_norm[i] = ds41_alloc_at(ds41_layer_tier(g, il), bytes);
         if (!g->engram_q_norm[i] || !g->engram_k_norm[i] ||
             !ds4_gpu_tensor_write(g->engram_q_norm[i], 0, tensor_data(m, w->layer[il].engram_q_norm), bytes) ||
             !ds4_gpu_tensor_write(g->engram_k_norm[i], 0, tensor_data(m, w->layer[il].engram_k_norm), bytes)) goto fail;
     }
     if (!streaming) ds41_engram_warm(m, path, g->allocation_bytes);
     for (uint32_t i = 0; i < 40; i++) {
-        g->window[i] = ds4_gpu_tensor_alloc(128u * 512u * sizeof(float));
+        g->window[i] = ds41_alloc_at(ds41_layer_tier(g, i), 128u * 512u * sizeof(float));
         if (!g->window[i]) goto fail;
     }
     for (uint32_t i = 0; i < 4; i++) {
         const uint64_t cap = ctx / (i < 3 ? 2u : 1u) + 1u;
-        g->compressed[i] = ds4_gpu_tensor_alloc(cap * 512u * sizeof(float));
-        g->index_cache[i] = ds4_gpu_tensor_alloc(cap * 128u * sizeof(float));
-        g->previous_kv[i] = ds4_gpu_tensor_alloc(512u * sizeof(float));
-        g->previous_score[i] = ds4_gpu_tensor_alloc(512u * sizeof(float));
+        /* the keys of source layer 2, 8, 14 or 20, read by the layers up to the next source: all on its card */
+        const int home = ds41_layer_tier(g, i == 0 ? 2u : i == 1 ? 8u : i == 2 ? 14u : 20u);
+        g->compressed[i] = ds41_alloc_at(home, cap * 512u * sizeof(float));
+        g->index_cache[i] = ds41_alloc_at(home, cap * 128u * sizeof(float));
+        g->previous_kv[i] = ds41_alloc_at(home, 512u * sizeof(float));
+        g->previous_score[i] = ds41_alloc_at(home, 512u * sizeof(float));
         if (!g->compressed[i] || !g->index_cache[i] || !g->previous_kv[i] || !g->previous_score[i]) goto fail;
 #ifdef __APPLE__
         if (ds41_index_bf16_on() && !(g->index_bf16[i] = ds4_gpu_tensor_alloc(cap * 128u * sizeof(uint16_t))))
@@ -42107,16 +42333,22 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
 #ifdef __APPLE__
     if (ds41_index_bf16_on() && !(g->index_bf16_flag = ds4_gpu_tensor_alloc(sizeof(uint32_t)))) goto fail;
 #endif
+    /* With the layers on two cards the working tensors below exist once per card: the first pass builds the first
+     * card's set, the second pass the second card's, which names the host-written (managed) tensors of the first
+     * again instead of allocating them. One pass, as before, on one card. */
+    for (int tier_pass = 0; tier_pass < (g->other ? 2 : 1); tier_pass++) {
+    if (tier_pass && !ds41_tier_alloc_next(g)) goto fail;
 #define DS41_ALLOC(name, count) \
     if (!(g->name = (!strcmp(#name, "engram_prefetch") || !strcmp(#name, "image_text_mask") ? \
-            ds4_gpu_tensor_alloc_managed : ds4_gpu_tensor_alloc)( \
-                (uint64_t)((count) != 0 ? (count) : 1u) * sizeof(float)))) goto fail;
+            ds41_alloc_shared(g->other ? g->other->name : NULL, \
+                (uint64_t)((count) != 0 ? (count) : 1u) * sizeof(float)) : \
+            ds41_alloc((uint64_t)((count) != 0 ? (count) : 1u) * sizeof(float))))) goto fail;
     DS41_SCRATCH(DS41_ALLOC)
 #undef DS41_ALLOC
 #define DS41_BATCH_ALLOC(name, count) \
     if (!(g->batch.name = (!strcmp(#name, "engram_rows") || !strcmp(#name, "selected_comp") ? \
-            ds4_gpu_tensor_alloc_managed : ds4_gpu_tensor_alloc)( \
-                (uint64_t)(count) * g->prefill_cap * 4u))) goto fail;
+            ds41_alloc_shared(g->other ? g->other->batch.name : NULL, (uint64_t)(count) * g->prefill_cap * 4u) : \
+            ds41_alloc((uint64_t)(count) * g->prefill_cap * 4u)))) goto fail;
     DS41_PREFILL_STORAGE(DS41_BATCH_ALLOC)
     /* Engram projection ends before HC normalization. HC normalization
      * precedes Q projection or follows attention; routed expert outputs are
@@ -42151,10 +42383,18 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     if (!ds4_gpu_tensor_fill_f32(g->batch.block_mask, 0,
         (uint64_t)g->prefill_cap * ((g->ctx + 7u) / 8u))) goto fail;
 #define DS41_CARRY_ALLOC(name, count, format) \
-    if (g->carry_cap && !(g->carry.name = ds4_gpu_tensor_alloc( \
+    if (g->carry_cap && !(g->carry.name = ds41_alloc( \
             (uint64_t)ds41_carry_words(count, format, g->compact_carry) * g->carry_cap * sizeof(float)))) goto fail;
     DS41_CARRY_ROWS(DS41_CARRY_ALLOC)
 #undef DS41_CARRY_ALLOC
+    }
+#ifdef DS41_SPLIT_BUILD
+    if (g->other) {   /* the first card's set is the one in use */
+        ds41_tier_swap(g);
+        g_ds41_alloc_tier = 0;
+        g->tier = 0;
+    }
+#endif
 #ifndef __APPLE__
     g->engram_reader = ds4_engram_reader_create();
 #endif
@@ -43323,7 +43563,8 @@ static bool ds41_graph_encode_logits(ds41_gpu_graph *g, const ds4_model *m, cons
 
 static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
                              const ds4_weights *w, float *logits) {
-    if (!g->valid || !logits || !ds4_gpu_begin_commands()) return false;
+    if (!g->valid || !logits || !ds41_tier_enter(g, ds41_layer_tier(g, DS4_N_LAYER - 1u), 0) ||
+        !ds4_gpu_begin_commands()) return false;
     bool ok = ds41_graph_encode_logits(g, m, w);
     if (!ds4_gpu_end_commands()) ok = false;
     return ok && ds4_gpu_tensor_read(g->logits, 0, logits,
@@ -44453,7 +44694,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         }
     }
     const float initial_pre[] = {1, 0, 0, 0};
-    bool ok = ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) &&
+    bool ok = ds41_tier_enter(g, ds41_layer_tier(g, 0), 0) &&   /* the embedding is on layer 0's card */
+        ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) &&
         ds4_gpu_begin_commands() && ds41_embed(g, m, w, g->residual, g->x, token, g->pos);
     /* Unfused quality kernels bind whole expert tensors. Keep just the current
      * layer mapped, using the same admitted reserve as layer-major prefill. */
@@ -44489,6 +44731,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
 #endif
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
+        if (!ds41_tier_enter(g, ds41_layer_tier(g, il), 0)) { ok = false; break; }
         if (layer_resident)
             ok = metal_graph_stream_map_layer(m, w, il) && ds4_gpu_begin_commands();
         const unsigned table = il == 1 ? 0 : 1;
@@ -44505,6 +44748,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
 #else
             ok = ds41_graph_layer(g, m, l, il, token);
 #endif
+        }
+        if (ok && ds41_layer_hash_steps() && ds41_layer_hash_left != 0) {
+            if (ds41_layer_hash_left < 0) ds41_layer_hash_left = ds41_layer_hash_steps();
+            ds41_layer_hash("decode", il, g->pos, g->residual);
+            if (il + 1u == DS4_N_LAYER) ds41_layer_hash_left--;
         }
         /* TP gates already submit ordered, bounded command buffers; they keep
          * the layer 13 drain. Drain before publishing the token to the CPU. */
@@ -45024,6 +45272,7 @@ static bool ds41_graph_prefill_sweep_body(ds41_gpu_graph *g, const ds4_model *m,
         return false;
     const uint32_t initial_start = g->pos;
     g->valid = false;
+    if (!ds41_tier_enter(g, ds41_layer_tier(g, 0), 0)) return false;
     ds41_gpu_graph row = *g;
     /* The complete current layer is mapped for prefill. Refresh the bounded
      * decode cache from it before advancing to the next layer. */
@@ -45060,6 +45309,11 @@ static bool ds41_graph_prefill_sweep_body(ds41_gpu_graph *g, const ds4_model *m,
 #endif
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         if (cancel && cancel(cancel_ud)) { ok = false; break; }
+        if (g->other && g->tier != ds41_layer_tier(g, il)) {   /* this layer runs on the other card: the rows follow */
+            ok = ds41_tier_enter(g, ds41_layer_tier(g, il), total_count);
+            ds41_tier_adopt(&row, g);
+            if (!ok) break;
+        }
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
         ar_prefill_next_layer = ar_prefill && il + 1u < DS4_N_LAYER ? &w->layer[il + 1u] : NULL;
 #endif
@@ -45246,6 +45500,8 @@ static bool ds41_graph_prefill_sweep_body(ds41_gpu_graph *g, const ds4_model *m,
                 if (ok) ok = ds41_carry_copy(g, off, count, false);
             }
             if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+            if (ok && !il && ds41_layer_hash_steps())
+                ds41_layer_hash("prefill-embed", 0, start + count - 1u, g->rows_view[count - 1u].residual);
             const double t_ready = profile ? now_sec() : 0;
             if (ok && ds41_engram_layer(il)) {
                 const uint32_t engram = il == 1 ? 0 : 1;
@@ -45265,6 +45521,10 @@ static bool ds41_graph_prefill_sweep_body(ds41_gpu_graph *g, const ds4_model *m,
             const double t_engram = profile ? now_sec() : 0;
             double stage_start = stage_profile ? now_sec() : 0;
 #define DS41_STAGE(label) do { \
+                if (ok && ds41_stage_hash_layer() == (int)il) { \
+                    ds41_stage_hash((label), il, 0, &g->rows_view[0]); \
+                    ds41_stage_hash((label), il, count - 1u, &g->rows_view[count - 1u]); \
+                } \
                 if (ok && stage_profile) { \
                     ok = ds4_gpu_end_commands() != 0; \
                     const double now = now_sec(); \
@@ -45381,6 +45641,10 @@ static bool ds41_graph_prefill_sweep_body(ds41_gpu_graph *g, const ds4_model *m,
                         (off == first ? t_map - t0 : 0) * 1000, (t_engram - t_ready) * 1000,
                         (t_encoded - t_engram) * 1000, (t_done - t_encoded) * 1000,
                         (now_sec() - t_done) * 1000);
+            if (ok && ds41_layer_hash_steps()) {
+                ds41_layer_hash("prefill", il, start + count - 1u, g->rows_view[count - 1u].residual);
+                ds41_layer_hash_left = ds41_layer_hash_steps();
+            }
             if (!ok) fprintf(stderr, "ds4: V4.1 layer-major prefill failed at layer %u\n", il);
             if (ok && progress) {
                 const uint32_t after = (total_count * il + off + count) / DS4_N_LAYER;
@@ -45445,6 +45709,7 @@ static ds41_gpu_graph *ds41_batch_workspace(ds41_gpu_graph *const *graphs, int c
 
 static bool ds41_cuda_row_batch_supported(const ds41_gpu_graph *g, const ds4_weights *w) {
 #ifndef __APPLE__
+    if (g->other) return false;   /* two-card streaming: the row batches have no card switch */
     const bool placement = (g->streaming && g->tp_world == 1) ||
         (!g->streaming && g->tp_world == 2);
     if (!placement || g->quality || g->imatrix || g->image_count ||
@@ -77110,6 +77375,30 @@ static bool engine_cuda_tp_decode_requested(const ds4_engine *e);
 static bool engine_cuda_tp_ep_requested(const ds4_engine *e);
 static bool engine_cuda_tp_output_env_requested(void);
 
+/* Two-card SSD streaming for DeepSeek V4.1 (stages S2/S3, 18 Nov 2026). DS4_CUDA_STREAM_SPLIT=<cut> with --ssd-streaming
+ * and two --gpu-devices: layers 0 .. cut-1 and the embedding on the first card, layers cut .. and the output head on the
+ * second; "1" or "auto" cuts in the middle. Each card keeps an expert cache for its own layers, so a layer's routed
+ * experts are computed on the card that runs the layer and one hidden state crosses per token. Returns the cut, or 0
+ * when the switch is not set or does not apply (the engine then refuses streaming on several cards, as before). */
+static int engine_stream_split_cut(const ds4_engine *e, const ds4_gpu_config *cfg) {
+    const char *s = getenv("DS4_CUDA_STREAM_SPLIT");
+    if (!s || !s[0] || !strcmp(s, "0")) return 0;
+    if (!e || !e->ssd_streaming || !cfg || cfg->n_gpus != 2 || e->cuda_tensor_parallel ||
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 || DS4_N_LAYER < 2) return 0;
+    const int cut = (!strcmp(s, "1") || !strcmp(s, "auto")) ? (int)DS4_N_LAYER / 2 : atoi(s);
+    return cut >= 1 && cut < (int)DS4_N_LAYER ? cut : 0;
+}
+/* a tensor that is never resident: the routed experts of a layer (streamed from the drive) and the Engram tables (read by
+ * rows on the host, named as the single-card mapping names them) */
+static bool engine_stream_split_routed_tensor(const ds4_engine *e, const ds4_tensor *t, int entry) {
+    if (!e || !t) return false;
+    if (t == e->model.ngram_tensor || ds4_streq(t->name, "blk.1.engram_embd.weight") ||
+        ds4_streq(t->name, "blk.14.engram_embd.weight")) return true;
+    if (entry < 1 || entry > (int)DS4_N_LAYER) return false;
+    const ds4_layer_weights *layer = &e->weights.layer[entry - 1];
+    return t == layer->ffn_gate_exps || t == layer->ffn_up_exps || t == layer->ffn_down_exps;
+}
+
 /* Compute per-entry byte footprint estimates. Walks the tensor table once
  * and adds each tensor's bytes to its entry bucket. Also adds a per-layer
  * KV/scratch estimate so the packer's budget math reflects runtime
@@ -77119,11 +77408,13 @@ static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
     const bool cuda_tp_ep = engine_cuda_tp_ep_requested(e);
     for (int i = 0; i < n_entries; i++) out[i] = 0;
 
+    const bool stream_split = engine_stream_split_cut(e, &e->gpu_cfg) > 0;
     for (uint64_t i = 0; i < e->model.n_tensors; i++) {
         const ds4_tensor *t = &e->model.tensors[i];
         if (t->bytes == 0 || t == e->model.ngram_tensor) continue;
         int entry = tensor_to_entry(t, DS4_N_LAYER);
         if (entry < 0 || entry >= n_entries) entry = 0;
+        if (stream_split && engine_stream_split_routed_tensor(e, t, entry)) continue;   /* S2: resident bytes only */
         if (cuda_tp_ep && engine_cuda_tp_output_env_requested() &&
             t == e->weights.output) {
             /* Output TP stores one vocabulary-row slice per participating
@@ -77474,6 +77765,20 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
     size_t entry_bytes[DS4_MAX_LAYER + 2];
     if (engine_compute_entry_bytes(e, entry_bytes) != 0) return -1;
 
+    {   /* S2: the streaming split places by its cut, not by the packer (entry 0 is the embedding, layer il is entry
+         * il + 1, the last entry is the output head) */
+        const int cut = engine_stream_split_cut(e, &e->gpu_cfg);
+        if (cut > 0) {
+            for (int i = 0; i < (int)DS4_N_LAYER + 2; i++) e->placement[i] = i <= cut ? 0 : 1;
+            e->n_placement_entries = DS4_N_LAYER + 2;
+            e->multi_tier = 1;
+            fprintf(stderr, "ds4: SSD streaming split (DS4_CUDA_STREAM_SPLIT): embedding and layers 0-%d on GPU%d, "
+                    "layers %d-%d and the output head on GPU%d\n", cut - 1, e->gpu_cfg.device_indices[0], cut,
+                    (int)DS4_N_LAYER - 1, e->gpu_cfg.device_indices[1]);
+            return 0;
+        }
+    }
+
     ds4_layer_pack_config pcfg;
     memset(&pcfg, 0, sizeof(pcfg));
     pcfg.n_gpus = e->gpu_cfg.n_gpus;
@@ -77626,6 +77931,8 @@ static int engine_install_per_device_caches(ds4_engine *e) {
         if (t->bytes == 0) continue;
         int entry = tensor_to_entry(t, DS4_N_LAYER);
         if (entry < 0 || entry >= e->n_placement_entries) entry = 0;
+        if (engine_stream_split_cut(e, &e->gpu_cfg) > 0 &&
+            (t == e->model.ngram_tensor || engine_stream_split_routed_tensor(e, t, entry))) continue;   /* S3: streamed */
         int logical_tier = e->placement[entry];
         if (logical_tier == DS4_LAYER_PACK_CPU) continue;        /* CPU spill: skip here. */
         if (logical_tier < 0 || logical_tier >= e->gpu_cfg.n_gpus) {
@@ -78914,7 +79221,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
         const bool supported = (e->backend == DS4_BACKEND_METAL ||
 #if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(__APPLE__)
                 (e->backend == DS4_BACKEND_CUDA && !opt->cuda_tensor_parallel &&
-                 (!gpu_cfg || gpu_cfg->n_gpus <= 1)) ||
+                 (!gpu_cfg || gpu_cfg->n_gpus <= 1 ||
+                  engine_stream_split_cut(e, gpu_cfg) > 0)) ||   /* S3: two cards with DS4_CUDA_STREAM_SPLIT */
 #endif
                  false) &&
 #ifdef DS4_ROCM_BUILD
@@ -79364,7 +79672,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
     }
-    if (e->ssd_streaming && e->multi_tier) {
+    if (e->ssd_streaming && e->multi_tier && engine_stream_split_cut(e, gpu_cfg) <= 0) {
         fprintf(stderr,
                 "ds4: --ssd-streaming is not compatible with multi-GPU placement\n");
         ds4_engine_close(e);
@@ -79568,12 +79876,41 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA);
 #endif
             (void)ds4_gpu_set_model_fd(e->model.fd);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+            /* S3: said before anything is installed, so no backend choice is made for "several cards" first */
+            if (engine_stream_split_cut(e, gpu_cfg) > 0) ds4_gpu_set_stream_split(1);
+#endif
 
             if (engine_install_gpu_placement(e) != 0) {
                 ds4_engine_close(e);
                 *out = NULL;
                 return 1;
             }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+            {   /* S3: the streaming state of each card. --ssd-streaming-cache-experts is the total for both cards, shared
+                 * by the layers each owns; a card's own free VRAM caps its share when the cache is first used. */
+                const int cut = engine_stream_split_cut(e, gpu_cfg);
+                uint64_t slab_expert_bytes = 0;
+                if (cut > 0 && ds4_streaming_routed_expert_bytes(&e->weights, &slab_expert_bytes)) {
+                    const uint32_t total = e->ssd_streaming_cache_experts ? e->ssd_streaming_cache_experts : 1000000u;
+                    ds4_gpu_set_stream_split(1);
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+                    g_ds41_split_cut = cut;   /* the session graphs build a set of working tensors per card */
+#endif
+                    (void)ds4_gpu_set_model_fd(e->model.fd);   /* again: the model map is registered now */
+                    ds4_gpu_set_ssd_streaming(true);
+                    for (int tier = 0; tier < 2; tier++) {
+                        const uint32_t share = (uint32_t)((uint64_t)total * (uint64_t)(tier == 0 ? cut : (int)DS4_N_LAYER - cut) / DS4_N_LAYER);
+                        if (ds4_gpu_set_current_device(tier) != 0) { ds4_engine_close(e); *out = NULL; return 1; }
+                        ds4_gpu_set_streaming_expert_cache_budget(share);
+                        ds4_gpu_set_streaming_expert_cache_expert_bytes(slab_expert_bytes);
+                        fprintf(stderr, "ds4: SSD streaming split: GPU%d may cache up to %u experts of %.2f MiB\n",
+                                gpu_cfg->device_indices[tier], share, (double)slab_expert_bytes / 1048576.0);
+                    }
+                    (void)ds4_gpu_set_current_device(0);
+                }
+            }
+#endif
             if (engine_install_dspark_support_cache(e) != 0) {
                 ds4_engine_close(e);
                 *out = NULL;
@@ -81120,6 +81457,9 @@ bool ds4_engine_is_deepseek41(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    g_ds41_split_cut = 0;
+#endif
     ds4_engine_tp_unbind(e);
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     /* Built at open but never bound. */

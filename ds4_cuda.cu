@@ -86,6 +86,18 @@ typedef struct {
 } cuda_block_iq2_xxs;
 
 #include "ds4_gpu_mgpu.h"
+
+/* Two-card SSD streaming (stage S1, 18 Nov 2026): the streaming expert cache, its slot table, its staging buffers,
+ * its upload streams and their events exist once per logical tier. A converted global keeps its name as a macro that
+ * selects the calling thread's tier, so the code that uses it reads as before. g_stream_tier follows
+ * ds4_gpu_set_current_device(); with one card it stays 0 and everything below is the single object it was. */
+static thread_local int g_stream_tier = 0;
+static int g_stream_split_on = 0;   /* S3: SSD streaming on several cards was asked for (ds4_gpu_set_stream_split) */
+template <typename T> struct ds4_per_tier {
+    T v[DS4_MAX_GPUS];
+    ds4_per_tier() : v() {}
+    explicit ds4_per_tier(const T &init) { for (int i = 0; i < DS4_MAX_GPUS; i++) v[i] = init; }
+};
 #include "ds4_gpu_tp.h"
 #include "ds4_gpu_copy.h"
 #include "ds4_iq2_tables_cuda.inc"
@@ -116,7 +128,8 @@ static int g_network_tp_rank = -1;
 static bool g_network_tp_sharding_suspended;
 static ds4_gpu_tensor *g_network_tp_pairs;
 static cudaStream_t g_model_prefetch_stream;
-static cudaStream_t g_model_upload_stream;
+static ds4_per_tier<cudaStream_t> g_model_upload_stream_pt;
+#define g_model_upload_stream (g_model_upload_stream_pt.v[g_stream_tier])
 static int g_cublas_ready;
 static int g_quality_mode;
 static int g_decode_fast_attention;
@@ -183,9 +196,12 @@ typedef struct {
     uint64_t prefill_capacity;
 } cuda_stream_selected_cache;
 
-static cuda_stream_selected_cache g_stream_selected_cache;
-static uint32_t g_stream_expert_budget;
-static uint64_t g_stream_expert_bytes;
+static ds4_per_tier<cuda_stream_selected_cache> g_stream_selected_cache_pt;
+#define g_stream_selected_cache (g_stream_selected_cache_pt.v[g_stream_tier])
+static ds4_per_tier<uint32_t> g_stream_expert_budget_pt;
+#define g_stream_expert_budget (g_stream_expert_budget_pt.v[g_stream_tier])
+static ds4_per_tier<uint64_t> g_stream_expert_bytes_pt;
+#define g_stream_expert_bytes (g_stream_expert_bytes_pt.v[g_stream_tier])
 struct cuda_stream_expert_slot {
     uint64_t gate, up, down, used;
     uint8_t in_pool; /* filled from the host pool: a re-miss costs a DMA, not an NVMe read */
@@ -222,10 +238,13 @@ static uint64_t cuda_prefill_cold_age(void) {
     }
     return age;
 }
-static std::vector<cuda_stream_expert_slot> g_stream_expert_slots;
-static std::unordered_map<uint64_t, uint32_t> g_stream_expert_by_gate;
+static ds4_per_tier<std::vector<cuda_stream_expert_slot>> g_stream_expert_slots_pt;
+#define g_stream_expert_slots (g_stream_expert_slots_pt.v[g_stream_tier])
+static ds4_per_tier<std::unordered_map<uint64_t, uint32_t>> g_stream_expert_by_gate_pt;
+#define g_stream_expert_by_gate (g_stream_expert_by_gate_pt.v[g_stream_tier])
 /* Zero is empty; one is an unread look-ahead entry, older than any demand hit. */
-static uint64_t g_stream_expert_clock = 1;
+static ds4_per_tier<uint64_t> g_stream_expert_clock_pt(1);
+#define g_stream_expert_clock (g_stream_expert_clock_pt.v[g_stream_tier])
 /* Deferred-miss MoE (DS4_CUDA_MOE_DEFER=1): see cuda_routed_moe_deferred(). */
 static int g_moe_skip_load = 0;          /* routed_moe_launch: use the cache as set, do not load */
 /* DS4_CUDA_PREFILL_WAVES=1: two-pass prefill MoE. Pass 1 runs the routed MoE over
@@ -306,11 +325,20 @@ static void cuda_decode_partition_report(void) {
 }
 static int g_remap_via_upload_stream = 0; /* begin_load: write the remap through the upload stream (legacy stream is gated) */
 static uint64_t g_chunked_reads = 0, g_chunked_pieces = 0; /* DS4_CUDA_EXPERT_CHUNKS statistics */
-static int g_slot_table_rebuild = 1;     /* host mirror must be rebuilt from the index */
-static int g_slot_table_dirty = 0;       /* mirror changed since the last device copy */
-static int32_t *g_slot_table_h = NULL;   /* pinned host mirror [64][n_total_expert] */
-static int32_t *g_slot_table_d = NULL;
-static uint32_t g_slot_table_n = 0;      /* n_total_expert */
+/* host mirror must be rebuilt from the index */
+static ds4_per_tier<int> g_slot_table_rebuild_pt(1);
+#define g_slot_table_rebuild (g_slot_table_rebuild_pt.v[g_stream_tier])
+/* mirror changed since the last device copy */
+static ds4_per_tier<int> g_slot_table_dirty_pt;
+#define g_slot_table_dirty (g_slot_table_dirty_pt.v[g_stream_tier])
+/* pinned host mirror [64][n_total_expert] */
+static ds4_per_tier<int32_t *> g_slot_table_h_pt;
+#define g_slot_table_h (g_slot_table_h_pt.v[g_stream_tier])
+static ds4_per_tier<int32_t *> g_slot_table_d_pt;
+#define g_slot_table_d (g_slot_table_d_pt.v[g_stream_tier])
+/* n_total_expert */
+static ds4_per_tier<uint32_t> g_slot_table_n_pt;
+#define g_slot_table_n (g_slot_table_n_pt.v[g_stream_tier])
 static uint64_t g_layer_gate_off[64];
 static uint8_t g_layer_gate_seen[64];
 static uint64_t g_layer_gate_expert_bytes = 0;
@@ -357,7 +385,8 @@ static void cuda_stream_selected_cache_release(void) {
     ds4_gpu_stream_expert_cache_prefetch_finish(true);
     cuda_spec_quiesce();
     g_slot_table_rebuild = 1;
-    const int tier = g_stream_selected_cache.logical_tier;
+    /* S3: with a cache per card the one released is the calling card's; a cache that was never built names tier 0 */
+    const int tier = g_stream_split_on ? g_stream_tier : g_stream_selected_cache.logical_tier;
     if (tier >= 0 && tier < g_n_gpus) {
         (void)ds4_gpu_set_current_device(tier);
     }
@@ -686,18 +715,25 @@ static int g_model_load_progress_started;
 static int g_model_load_progress_tty;
 static void *g_cuda_tmp;
 static uint64_t g_cuda_tmp_bytes;
-static void *g_tt_scratch;
-static uint64_t g_tt_scratch_bytes;
-static int g_tt_scratch_device = -1;
+static ds4_per_tier<void *> g_tt_scratch_pt;
+#define g_tt_scratch (g_tt_scratch_pt.v[g_stream_tier])
+static ds4_per_tier<uint64_t> g_tt_scratch_bytes_pt;
+#define g_tt_scratch_bytes (g_tt_scratch_bytes_pt.v[g_stream_tier])
+static ds4_per_tier<int> g_tt_scratch_device_pt(-1);
+#define g_tt_scratch_device (g_tt_scratch_device_pt.v[g_stream_tier])
 #ifdef DS4_CUDA_HAVE_MXF4
 static void *g_indexer_mxf4_scratch;
 static uint64_t g_indexer_mxf4_scratch_bytes;
 static int g_indexer_mxf4_scratch_device = -1;
 #endif
-static void *g_model_stage_raw[4];
-static void *g_model_stage[4];
-static cudaEvent_t g_model_stage_event[4];
-static uint64_t g_model_stage_bytes;
+static void * g_model_stage_raw_pt[DS4_MAX_GPUS][4];
+#define g_model_stage_raw (g_model_stage_raw_pt[g_stream_tier])
+static void * g_model_stage_pt[DS4_MAX_GPUS][4];
+#define g_model_stage (g_model_stage_pt[g_stream_tier])
+static cudaEvent_t g_model_stage_event_pt[DS4_MAX_GPUS][4];
+#define g_model_stage_event (g_model_stage_event_pt[g_stream_tier])
+static ds4_per_tier<uint64_t> g_model_stage_bytes_pt;
+#define g_model_stage_bytes (g_model_stage_bytes_pt.v[g_stream_tier])
 /* Expert reads were limited to a 4-buffer staging ring with 3 buffers consumed per
  * expert, served by a reader pool hardcoded to 2 threads, with sub-read splitting
  * deliberately disabled inside those threads. Measured effect: prefill reads hold
@@ -707,9 +743,12 @@ static uint64_t g_model_stage_bytes;
  *   DS4_CUDA_EXPERT_READERS expert reader threads (default 2 = unchanged) */
 #define DS4_STAGE_RING_MAX 24
 #define DS4_EXPERT_READERS_MAX 24
-static void *g_stream_selected_stage_raw[DS4_STAGE_RING_MAX];
-static void *g_stream_selected_stage[DS4_STAGE_RING_MAX];
-static cudaEvent_t g_stream_selected_stage_event[DS4_STAGE_RING_MAX];
+static void * g_stream_selected_stage_raw_pt[DS4_MAX_GPUS][DS4_STAGE_RING_MAX];
+#define g_stream_selected_stage_raw (g_stream_selected_stage_raw_pt[g_stream_tier])
+static void * g_stream_selected_stage_pt[DS4_MAX_GPUS][DS4_STAGE_RING_MAX];
+#define g_stream_selected_stage (g_stream_selected_stage_pt[g_stream_tier])
+static cudaEvent_t g_stream_selected_stage_event_pt[DS4_MAX_GPUS][DS4_STAGE_RING_MAX];
+#define g_stream_selected_stage_event (g_stream_selected_stage_event_pt[g_stream_tier])
 static uint32_t cuda_stage_ring(void) {
     static uint32_t n = 0;
     if (!n) {
@@ -732,13 +771,17 @@ static uint32_t cuda_expert_readers(void) {
     }
     return n;
 }
-static uint64_t g_stream_selected_stage_bytes;
-static cudaStream_t g_stream_selected_upload_stream;
+static ds4_per_tier<uint64_t> g_stream_selected_stage_bytes_pt;
+#define g_stream_selected_stage_bytes (g_stream_selected_stage_bytes_pt.v[g_stream_tier])
+static ds4_per_tier<cudaStream_t> g_stream_selected_upload_stream_pt;
+#define g_stream_selected_upload_stream (g_stream_selected_upload_stream_pt.v[g_stream_tier])
 /* DS4_CUDA_UPLOAD_STREAMS=N (1..4): spread the three component copies of an expert over
  * N non-blocking streams so the copy engines run them in parallel instead of serially on
  * one stream. Stream 0 is the primary upload stream; the batch finish syncs all of them. */
-static cudaStream_t g_upload_streams_extra[3];
-static uint32_t g_upload_streams_n = 0;
+static cudaStream_t g_upload_streams_extra_pt[DS4_MAX_GPUS][3];
+#define g_upload_streams_extra (g_upload_streams_extra_pt[g_stream_tier])
+static ds4_per_tier<uint32_t> g_upload_streams_n_pt;
+#define g_upload_streams_n (g_upload_streams_n_pt.v[g_stream_tier])
 static uint32_t cuda_upload_streams_wanted(void) {
     static uint32_t n = 0;
     if (!n) { const char *e = getenv("DS4_CUDA_UPLOAD_STREAMS"); long v = (e && e[0]) ? strtol(e, NULL, 10) : 1; n = v < 1 ? 1u : (v > 4 ? 4u : (uint32_t)v); }
@@ -1465,12 +1508,16 @@ static int cuda_use_mmq(void) {
     if (!init) {
         init = 1;
         const char *s = getenv("DS4_CUDA_MMQ");
-        const int off = (s && s[0] == '0') || g_quality_mode || g_n_gpus > 1;
+        /* S3: with the layers split for SSD streaming each card runs the same integer prompt-pass matmuls as one
+         * card does (MMQ resolves the active device on every call); other multi-GPU placements keep it off. */
+        const int off = (s && s[0] == '0') || g_quality_mode || (g_n_gpus > 1 && !g_stream_split_on);
+        int mmq_device = 0;
+        if (g_n_gpus > 1 && cudaGetDevice(&mmq_device) != cudaSuccess) mmq_device = 0;   /* init must not move the caller */
         if (off) {
             if (s && s[0] == '0') {
                 fprintf(stderr, "ds4: DS4_CUDA_MMQ=0 - mmq prefill tier disabled\n");
             }
-        } else if (ds4_mmq_init(0) == 0) {
+        } else if (ds4_mmq_init(mmq_device) == 0) {
             use = 1;
         } else {
             fprintf(stderr, "ds4: ds4_mmq_init failed - mmq prefill tier disabled\n");
@@ -3117,6 +3164,7 @@ struct cuda_tensor_read_job {
     cudaStream_t up_stream;
     cudaEvent_t up_event;
     int uploaded;
+    int device;           /* S3: the card these streams and destinations belong to */
 };
 static int cuda_upload_on_ready(void) {
     static int on = -1;
@@ -3185,22 +3233,22 @@ static void *cuda_tensor_reader_main(void *arg) {
     /* Inner splitting is pointless here (md already stripes) and would
      * contend on the sub-read pool's lock, so suppress it on this thread. */
     t_in_expert_read = 1;
-    int device_set = 0;
+    int device_set = 0, device_cur = -1;
     for (;;) {
         sem_wait(&w->start);
         if (w->stop) break;
         cuda_tensor_read_job *j = w->job;
+        if ((j->dst || (j->dev && j->up_stream)) && device_cur != j->device) {
+            /* A worker thread starts with no current device; the copies and the event must be issued against the card
+             * that owns the job's streams (S3: one of two when the layers are split). */
+            if (cudaSetDevice(j->device) == cudaSuccess) { device_set = 1; device_cur = j->device; }
+            else { (void)cudaGetLastError(); device_set = 0; device_cur = -1; }
+        }
         j->ok = j->dst ? cuda_stage_read_chunked(j)
                        : cuda_model_stage_read(j->stage, j->stage_bytes, j->offset,
                                                j->bytes, &j->payload);
         j->uploaded = 0;
         if (j->ok && j->dev && j->up_stream) {
-            /* A worker thread starts with no current device; the copy and the event
-             * must be issued against this process's device. */
-            if (!device_set) {
-                if (cudaSetDevice(g_gpu[0].device_id) == cudaSuccess) device_set = 1;
-                else (void)cudaGetLastError();
-            }
             if (device_set &&
                 cudaMemcpyAsync(j->dev, j->payload, (size_t)j->dev_bytes,
                                 cudaMemcpyHostToDevice, j->up_stream) == cudaSuccess &&
@@ -3526,6 +3574,7 @@ static int cuda_model_copy_expert_parallel(
         jobs[i].dev_bytes = lens[i];
         jobs[i].up_stream = ready ? cuda_upload_stream_for((uint32_t)i) : NULL;
         jobs[i].up_event = ready ? g_stream_selected_stage_event[bi[i]] : NULL;
+        jobs[i].device = g_gpu[g_stream_tier].device_id;
     }
 
     pthread_mutex_lock(&g_tensor_readers_lock);
@@ -4068,6 +4117,9 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
             int can = 0;
             (void)cudaDeviceCanAccessPeer(&can, g_gpu[i].device_id,
                                           g_gpu[j].device_id);
+            /* DS4_CUDA_NO_PEER_ACCESS=1 (diagnostic): no peer mapping, so a pointer used on the wrong card faults
+             * instead of being served across the link; cross-card copies take the pinned-host path. */
+            if (getenv("DS4_CUDA_NO_PEER_ACCESS") != NULL) can = 0;
             if (!can) { g_gpu_peer_ok[i][j] = 0; continue; }
             (void)cudaSetDevice(g_gpu[i].device_id);
             cudaError_t e = cudaDeviceEnablePeerAccess(g_gpu[j].device_id, 0);
@@ -4228,11 +4280,13 @@ extern "C" void ds4_gpu_cleanup(void) {
             c->scratch = NULL;
             c->scratch_bytes = 0;
         }
-        if (g_tt_scratch && g_tt_scratch_device == c->device_id) {
-            (void)cudaFree(g_tt_scratch);
-            g_tt_scratch = NULL;
-            g_tt_scratch_bytes = 0;
-            g_tt_scratch_device = -1;
+        for (int t = 0; t < DS4_MAX_GPUS; t++) {   /* S3: every card's token-tile scratch */
+            if (g_tt_scratch_pt.v[t] && g_tt_scratch_device_pt.v[t] == c->device_id) {
+                (void)cudaFree(g_tt_scratch_pt.v[t]);
+                g_tt_scratch_pt.v[t] = NULL;
+                g_tt_scratch_bytes_pt.v[t] = 0;
+                g_tt_scratch_device_pt.v[t] = -1;
+            }
         }
 #ifdef DS4_CUDA_HAVE_MXF4
         if (g_indexer_mxf4_scratch &&
@@ -4518,6 +4572,19 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint6
     t->bytes = bytes;
     t->owner = 0;
     t->device_id = base->device_id;  /* inherit owning device */
+    return t;
+}
+
+/* S3: `base` named again with another card as its home. A managed (host-written) tensor is one allocation that both
+ * cards' sets of a V4.1 graph use; each set's operations on it have to be issued on that set's card. */
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view_on(const ds4_gpu_tensor *base, int tier) {
+    if (!base || tier < 0 || tier >= g_n_gpus) return NULL;
+    ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
+    if (!t) return NULL;
+    t->ptr = base->ptr;
+    t->bytes = base->bytes;
+    t->owner = 0;
+    t->device_id = tier;
     return t;
 }
 
@@ -5486,10 +5553,12 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
 extern "C" int ds4_gpu_set_current_device(int logical_tier) {
     if (logical_tier < 0 || logical_tier >= g_n_gpus) return -1;
     if (!g_cuda_no_setdevice_cache && g_current_logical_tier == logical_tier) {
+        g_stream_tier = logical_tier;   /* S1: the streaming state of this tier */
         return 0;
     }
     if (cudaSetDevice(g_gpu[logical_tier].device_id) == cudaSuccess) {
         g_current_logical_tier = logical_tier;
+        g_stream_tier = logical_tier;
         return 0;
     }
     g_current_logical_tier = -1;
@@ -5517,7 +5586,7 @@ extern "C" int ds4_gpu_set_current_device_fenced(int logical_tier) {
         fprintf(stderr, "ds4: fenced switch %d -> %d\n", prev, logical_tier);
     }
     if (prev == logical_tier) {
-        g_current_logical_tier = logical_tier;
+        g_current_logical_tier = logical_tier; g_stream_tier = logical_tier;
         return 0;
     }
     if (prev >= 0 && prev < g_n_gpus && prev != logical_tier) {
@@ -5534,7 +5603,7 @@ extern "C" int ds4_gpu_set_current_device_fenced(int logical_tier) {
             g_current_logical_tier = -1;
             return -1;
         }
-        g_current_logical_tier = logical_tier;
+        g_current_logical_tier = logical_tier; g_stream_tier = logical_tier;
         if (fence_ev[prev]) {
             (void)cudaStreamWaitEvent(0, fence_ev[prev], 0);
         }
@@ -5570,6 +5639,10 @@ extern "C" int ds4_gpu_device_cache_tensors(int device_id,
      * that overflow or extend past the mapped region. Done in a
      * separate pass before any allocation so a bad input doesn't
      * partially grow the slab. */
+    /* S3: one card serves every tensor from a range that starts on a 256-byte boundary at least; packed back to back a
+     * matrix can start on a 4-byte boundary, where cuBLAS sums in another order. The streaming split keeps the
+     * boundary, so both cards compute what one card computes. */
+    const uint64_t slot_align = g_stream_split_on ? 256u : 1u;
     uint64_t want_bytes = 0;
     for (int i = 0; i < n_ranges; i++) {
         if (ranges[i].target_device != device_id) continue;
@@ -5581,8 +5654,8 @@ extern "C" int ds4_gpu_device_cache_tensors(int device_id,
         if (off > g_model_registered_size) return 8;
         if (nb > g_model_registered_size - off) return 9;
         /* Accumulate into want_bytes with overflow check. */
-        if (want_bytes > UINT64_MAX - nb) return 10;
-        want_bytes += nb;
+        if (want_bytes > UINT64_MAX - nb - slot_align) return 10;
+        want_bytes += (nb + slot_align - 1u) / slot_align * slot_align;
     }
     if (want_bytes == 0) return 0;
 
@@ -5692,7 +5765,7 @@ extern "C" int ds4_gpu_device_cache_tensors(int device_id,
         ent.device_id     = device_id;
         ent.device_ptr    = dev_ptr;
         g_cache_ranges.push_back(ent);
-        write_off += ranges[i].bytes;
+        write_off += (size_t)((ranges[i].bytes + slot_align - 1u) / slot_align * slot_align);
     }
 
     /* Keep sorted by source_offset for binary-search lookup. */
@@ -21262,7 +21335,7 @@ static int attention_decode_batch_launch(
     const float *sinks = (const float *)cuda_resolve_weight_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), logical_tier, "attn_sinks");
     if (!sinks) return 0;
-    if (g_n_gpus == 1 && !use_comp_mask &&
+    if ((g_n_gpus == 1 || g_stream_split_on) && !use_comp_mask &&
         n_tokens >= 128u && head_dim == kTTHeadDim && n_head == 64u &&
         window == kTTRawWindow && ratio != 0u && n_comp <= 32768u &&
         n_raw >= n_tokens &&
@@ -21537,7 +21610,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), logical_tier, "attn_sinks");
     if (!sinks) return 0;
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
-    if (g_n_gpus == 1 && n_tokens >= 128u && head_dim == kTTHeadDim &&
+    if ((g_n_gpus == 1 || g_stream_split_on) && n_tokens >= 128u && head_dim == kTTHeadDim &&
         n_head == 64u && top_k == 512u && window == kTTRawWindow &&
         ratio != 0u && n_comp <= 32768u &&
         n_raw >= n_tokens &&
@@ -21797,7 +21870,7 @@ static int attention_prefill_mixed_launch(
     const float *sinks = (const float *)cuda_resolve_weight_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), logical_tier, "attn_sinks");
     if (!sinks) return 0;
-    if (!use_comp_mask && g_n_gpus == 1 && n_tokens >= 128u &&
+    if (!use_comp_mask && (g_n_gpus == 1 || g_stream_split_on) && n_tokens >= 128u &&
         head_dim == kTTHeadDim && n_head == 64u &&
         window == kTTRawWindow && ratio != 0u && n_comp <= 32768u &&
         !g_cuda_no_window_attention && ds4_cuda_attn_tokentile_arch_ok()) {
@@ -31199,9 +31272,14 @@ static int cuda_async_upload_wait(void) {
     if (!checked) { const char *e = getenv("DS4_CUDA_ASYNC_UPLOAD_WAIT"); on = e && strcmp(e, "0") != 0; checked = 1; }
     return on;
 }
-static cudaEvent_t g_upload_done_event = NULL;
-static int g_upload_async_pending = 0;
-static int32_t *g_remap_pinned = NULL; static uint64_t g_remap_pinned_cap = 0;
+static ds4_per_tier<cudaEvent_t> g_upload_done_event_pt;
+#define g_upload_done_event (g_upload_done_event_pt.v[g_stream_tier])
+static ds4_per_tier<int> g_upload_async_pending_pt;
+#define g_upload_async_pending (g_upload_async_pending_pt.v[g_stream_tier])
+static ds4_per_tier<int32_t *> g_remap_pinned_pt;
+#define g_remap_pinned (g_remap_pinned_pt.v[g_stream_tier])
+static ds4_per_tier<uint64_t> g_remap_pinned_cap_pt;
+#define g_remap_pinned_cap (g_remap_pinned_cap_pt.v[g_stream_tier])
 struct cuda_stream_upload_batch {
     uint64_t chunks = 0;
     bool active = false;
@@ -31301,8 +31379,10 @@ static uint64_t g_flag_ids_fallbacks = 0, g_flag_ids_polls = 0;
  * 11.06 the Metal build reports with the same model and a similar cache size. Filling the
  * cache in rank order at startup is the same fix that took the host tier from a 3.4% hit
  * rate to 37.6%. File format matches the host tier: "gate up down misses" per line. */
-static bool g_vram_seed_pending = false;
-static uint64_t g_vram_seeded = 0;
+static ds4_per_tier<bool> g_vram_seed_pending_pt;
+#define g_vram_seed_pending (g_vram_seed_pending_pt.v[g_stream_tier])
+static ds4_per_tier<uint64_t> g_vram_seeded_pt;
+#define g_vram_seeded (g_vram_seeded_pt.v[g_stream_tier])
 static double g_ph_hits_ms = 0, g_ph_victim_ms = 0, g_ph_remap_ms = 0, g_ph_upload_ms = 0;
 static uint64_t g_ph_layers = 0, g_ph_victim_iters = 0, g_ph_misses = 0;
 static uint64_t g_pf_calls = 0, g_pf_started = 0, g_pf_gate = 0, g_pf_throw = 0, g_pf_empty = 0;
@@ -31677,9 +31757,14 @@ static pthread_cond_t g_spec_cv_work = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t g_spec_cv_done = PTHREAD_COND_INITIALIZER;
 static std::deque<cuda_spec_part> g_spec_queue;
 static int g_spec_stop = 0;
-static std::vector<uint8_t> g_spec_parts_left;   /* per VRAM slot; guarded by g_spec_mu */
-static std::vector<uint8_t> g_spec_slot_fail;
-static std::vector<uint32_t> g_spec_inflight;    /* foreground list of pending slots */
+/* per VRAM slot; guarded by g_spec_mu */
+static ds4_per_tier<std::vector<uint8_t>> g_spec_parts_left_pt;
+#define g_spec_parts_left (g_spec_parts_left_pt.v[g_stream_tier])
+static ds4_per_tier<std::vector<uint8_t>> g_spec_slot_fail_pt;
+#define g_spec_slot_fail (g_spec_slot_fail_pt.v[g_stream_tier])
+/* foreground list of pending slots */
+static ds4_per_tier<std::vector<uint32_t>> g_spec_inflight_pt;
+#define g_spec_inflight (g_spec_inflight_pt.v[g_stream_tier])
 static ds4_gpu_stream_expert_table g_spec_next_table;
 static const ds4_gpu_tensor *g_spec_pred_tensor = NULL, *g_spec_predw_tensor = NULL;
 static int g_spec_armed = 0;
@@ -31688,8 +31773,10 @@ static float g_spec_predw[16];
 static uint32_t g_spec_pred_n = 0, g_spec_pred_layer = UINT32_MAX;
 static int g_spec_have_pred = 0;      /* prediction held for scoring */
 static int g_spec_issue_pending = 0;  /* prediction not yet fetched */
-static cudaEvent_t g_spec_upload_event = NULL;
-static int g_spec_upload_pending = 0;
+static ds4_per_tier<cudaEvent_t> g_spec_upload_event_pt;
+#define g_spec_upload_event (g_spec_upload_event_pt.v[g_stream_tier])
+static ds4_per_tier<int> g_spec_upload_pending_pt;
+#define g_spec_upload_pending (g_spec_upload_pending_pt.v[g_stream_tier])
 /* stats */
 static uint64_t g_spec_layers, g_spec_hits, g_spec_hist[8];
 static uint64_t g_spec_layer_n[DS4_SPEC_MAX_LAYER], g_spec_layer_hits[DS4_SPEC_MAX_LAYER];
@@ -31717,7 +31804,7 @@ static int cuda_spec_slot_recent(uint32_t slot) {
 static int cuda_decode_ahead_enabled(void) {
     static int checked = 0, on = 0;
     if (!checked) { const char *e = getenv("DS4_CUDA_DECODE_AHEAD"); on = e && strcmp(e, "0") != 0; checked = 1; }
-    return on;
+    return on && g_n_gpus == 1;   /* S3: the read-ahead workers are one card's; left off when the layers are split */
 }
 static int cuda_lookahead_probe_enabled(void) {
     static int checked = 0, on = 0;
@@ -32092,7 +32179,7 @@ static int cuda_stream_selected_cache_begin_load(
         fprintf(stderr, "ds4: begin_load: invalid ranges/ids (layer %u, mode %d, ids %p, count %u)\n", table->layer, g_wave_mode, (const void *)selected_ids, slot_count);
         return 0;
     }
-    if (g_n_gpus != 1) {
+    if (g_n_gpus != 1 && !g_stream_split_on) {
         fprintf(stderr, "ds4: CUDA SSD streaming requires single-GPU placement\n");
         return 0;
     }
@@ -32129,7 +32216,7 @@ static int cuda_stream_selected_cache_begin_load(
             cache.down_expert_bytes != table->down_expert_bytes ||
             g_stream_expert_slots.size() < unique.size()) {
             cuda_stream_selected_cache_release();
-            if (ds4_gpu_set_current_device(0) != 0) return 0;
+            if (ds4_gpu_set_current_device(g_stream_tier) != 0) return 0;   /* S3: this tier's card (0 on one card) */
             if (table->gate_expert_bytes > (UINT64_MAX - table->down_expert_bytes) / 2u)
                 return 0;
             const uint64_t expert_bytes = 2u * table->gate_expert_bytes + table->down_expert_bytes;
@@ -32141,7 +32228,7 @@ static int cuda_stream_selected_cache_begin_load(
                 return 0;
             int integrated = 0;
             uint64_t host_available = 0;
-            if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, g_gpu[0].device_id) == cudaSuccess &&
+            if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, g_gpu[g_stream_tier].device_id) == cudaSuccess &&
                 integrated && ds4_linux_nonmovable_memory(&host_available))
                 free_bytes = (size_t)std::min(host_available, (uint64_t)total_bytes);
             /* The 8 GiB reserve costs ~420 expert slots on a 96 GiB card, and decode
@@ -32178,7 +32265,11 @@ static int cuda_stream_selected_cache_begin_load(
             cache.model_map = table->model_map;
             cache.gate_expert_bytes = table->gate_expert_bytes;
             cache.down_expert_bytes = table->down_expert_bytes;
-            cache.logical_tier = 0;
+            cache.logical_tier = g_stream_tier;
+            if (g_stream_split_on)
+                fprintf(stderr, "ds4: CUDA SSD expert cache on tier %d: %llu slots, %.2f GiB\n", g_stream_tier,
+                        (unsigned long long)capacity, (double)(capacity * expert_bytes) / 1073741824.0);
+            else
             fprintf(stderr, "ds4: CUDA SSD expert cache: %llu slots, %.2f GiB\n",
                     (unsigned long long)capacity,
                     (double)(capacity * expert_bytes) / 1073741824.0);
@@ -32317,7 +32408,7 @@ static int cuda_stream_selected_cache_begin_load(
                 cache.slot_selected_tensor.ptr = cache.slot_selected_ptr;
                 cache.slot_selected_tensor.bytes = (uint64_t)slot_count * sizeof(int32_t);
                 cache.slot_selected_tensor.owner = 0;
-                cache.slot_selected_tensor.device_id = 0;
+                cache.slot_selected_tensor.device_id = g_stream_tier;
                 cache.valid = 1;
                 g_wave_layers++; g_wave_hit_pairs += hit_pairs; g_wave_pairs += slot_count;
                 if (g_wave_layers % 400u == 0u)
@@ -32658,7 +32749,7 @@ static int cuda_stream_selected_cache_begin_load(
         cache.slot_selected_tensor.ptr = cache.slot_selected_ptr;
         cache.slot_selected_tensor.bytes = (uint64_t)slot_count * sizeof(int32_t);
         cache.slot_selected_tensor.owner = 0;
-        cache.slot_selected_tensor.device_id = 0;
+        cache.slot_selected_tensor.device_id = g_stream_tier;
         cache.valid = 1;
         if (g_spec_upload_pending) {
             /* Speculative host-tier DMAs ride the upload stream; the MoE on the
@@ -39323,6 +39414,8 @@ extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     cuda_stream_selected_cache_invalidate();
     if (!g_ssd_streaming_mode) cuda_stream_selected_cache_release();
 }
+
+extern "C" void ds4_gpu_set_stream_split(int on) { g_stream_split_on = on ? 1 : 0; }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
     if (experts != g_stream_expert_budget) cuda_stream_selected_cache_release();
