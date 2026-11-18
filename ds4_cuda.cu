@@ -154,7 +154,8 @@ static int g_cuda_exact_score_split_vec4_plain;
 static int g_cuda_exact_score_split_dim2;
 static int g_cuda_exact_score_split_fuse_inv_rope;
 static int g_cuda_moe_decode_graph;
-static int g_current_logical_tier = -1;
+/* The tier this thread last made current: CUDA's current device is per thread, so the note is too. */
+static thread_local int g_current_logical_tier = -1;
 static int g_ssd_streaming_mode;
 
 typedef struct ds4_gpu_stream_expert_table {
@@ -205,6 +206,7 @@ static ds4_per_tier<uint64_t> g_stream_expert_bytes_pt;
 struct cuda_stream_expert_slot {
     uint64_t gate, up, down, used;
     uint8_t in_pool; /* filled from the host pool: a re-miss costs a DMA, not an NVMe read */
+    uint8_t layer = 0xffu; /* the layer of the expert, once a load has named it (DS4_CUDA_PREFILL_LAYER_SHARE) */
 };
 /* DS4_CUDA_POOL_EVICT_BIAS=<tokens>: pool-backed slots are treated as that many tokens
  * older than their stamp, so VRAM prefers holding experts the pool cannot serve.
@@ -224,6 +226,38 @@ static inline uint64_t cuda_slot_eff_age(const cuda_stream_expert_slot &s) {
  * flushing it. DS4_CUDA_PREFILL_COLD_AGE=N sets the stamp they are demoted to (default 2, the
  * oldest a live slot can be): a larger value keeps them in VRAM longer, which is what a follow-up
  * turn on the same conversation needs, at the cost of the decode working set's residency. */
+/* DS4_CUDA_PREFILL_LAYER_SHARE=1: a prompt pass keeps to each layer's share of the cache. A pass visits the layers
+ * in order and one layer's batch needs more experts than the layer's share, so with oldest-first eviction each layer
+ * evicts what a layer a few steps on is about to load, and the next prompt finds none of it. With the switch a
+ * prompt-pass batch takes free and demoted rows, then its own layer's oldest rows, before another layer's; and what
+ * it then holds above the share is demoted once its kernels have run, the rows the fewest of its tokens used first.
+ * The experts loaded and their bytes are the same; only what stays cached differs. */
+static int cuda_prefill_layer_share(void) {
+    /* on with the layers split over two cards (each card then holds most of what a prompt asks of a layer);
+     * DS4_CUDA_PREFILL_LAYER_SHARE=0 turns it off, =1 turns it on for one card too */
+    static int checked = 0, on = 0;
+    if (!checked) {
+        const char *e = getenv("DS4_CUDA_PREFILL_LAYER_SHARE");
+        on = e && *e ? strcmp(e, "0") != 0 : g_stream_split_on != 0;
+        checked = 1;
+    }
+    return on;
+}
+struct cuda_prefill_share_state {
+    uint32_t layers = 0;                                 /* layers this card serves (0: those seen so far) */
+    uint64_t seen = 0;
+    std::vector<std::pair<uint32_t, uint64_t>> trim;     /* (slot, its stamp when chosen): demote at the next load */
+    uint64_t pass_base = 0;                              /* stamp of the first batch of the pass in progress */
+    uint64_t batch_stamp = 0;                            /* the last prompt-pass batch: its rows get pass_base next */
+    uint32_t last_layer = 0;
+    bool pass_open = false;
+    uint32_t hand = 0;                                   /* the victim search starts after the last victim */
+    uint64_t kept = 0, trimmed = 0, same_layer = 0, other_layer = 0, batches = 0;
+};
+static ds4_per_tier<cuda_prefill_share_state> g_pf_share_pt;
+#define g_pf_share (g_pf_share_pt.v[g_stream_tier])
+static uint64_t g_pf_misses = 0, g_pf_hits = 0;   /* prompt-pass batches since the last report, either read path */
+
 static int cuda_prefill_cold(void) {
     static int checked = 0, on = 0;
     if (!checked) { const char *e = getenv("DS4_CUDA_PREFILL_COLD"); on = e && strcmp(e, "0") != 0; checked = 1; }
@@ -302,8 +336,12 @@ static void cuda_prefill_sweep_report(void) {
             (unsigned long long)g_pf_layers, (double)g_pf_tokens / (double)g_pf_layers, (double)g_pf_unique / (double)g_pf_layers,
             (double)(g_pf_pool + g_pf_nvme) / (double)g_pf_layers, (double)g_pf_pool / (double)g_pf_layers, (double)g_pf_nvme / (double)g_pf_layers,
             g_pf_load_ms / (double)g_pf_layers);
+    if (cuda_prefill_layer_share())
+        fprintf(stderr, "ds4: prefill sweep cache: %.1f experts per layer already in VRAM, %.1f loaded\n",
+                (double)g_pf_hits / (double)g_pf_layers, (double)g_pf_misses / (double)g_pf_layers);
     (void)fflush(stderr);
     g_pf_layers = g_pf_tokens = g_pf_unique = g_pf_pool = g_pf_nvme = 0; g_pf_load_ms = 0;
+    g_pf_hits = g_pf_misses = 0;
 }
 static void cuda_decode_partition_report(void) {
     if (!g_pd_layers) return;
@@ -381,6 +419,7 @@ static void cuda_stream_selected_cache_invalidate(void) {
 
 static void cuda_spec_quiesce(void);
 static void cuda_spec_reap(int wait);
+static void cuda_stream_release_every_tier(int stages);
 static void cuda_stream_selected_cache_release(void) {
     ds4_gpu_stream_expert_cache_prefetch_finish(true);
     cuda_spec_quiesce();
@@ -4246,6 +4285,24 @@ extern "C" int ds4_gpu_init(void) {
     return ds4_gpu_init_multi(&cfg);
 }
 
+/* S3: with a cache per card, "the" streaming cache is every card's. stages: the staging buffers and upload streams
+ * too. One card, or several without the split: the calling card's, as before. */
+static void cuda_stream_selected_stage_release(void);
+static void cuda_stream_release_every_tier(int stages) {
+    if (!g_stream_split_on || g_n_gpus <= 1) {
+        cuda_stream_selected_cache_release();
+        if (stages) cuda_stream_selected_stage_release();
+        return;
+    }
+    const int saved = g_stream_tier;
+    for (int t = 0; t < g_n_gpus; t++) {
+        if (ds4_gpu_set_current_device(t) != 0) continue;
+        cuda_stream_selected_cache_release();
+        if (stages) cuda_stream_selected_stage_release();
+    }
+    (void)ds4_gpu_set_current_device(saved);
+}
+
 extern "C" void ds4_gpu_cleanup(void) {
     ds4_gpu_stream_expert_cache_prefetch_finish(true);
     ds4_gpu_tp_shutdown();
@@ -4307,8 +4364,7 @@ extern "C" void ds4_gpu_cleanup(void) {
             }
         }
     }
-    cuda_stream_selected_cache_release();
-    cuda_stream_selected_stage_release();
+    cuda_stream_release_every_tier(1);
     g_n_gpus = 0;
     g_device_is_spark = false;
     g_cublas_ready = 0;
@@ -5299,7 +5355,7 @@ extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
-    cuda_stream_selected_cache_release();
+    cuda_stream_release_every_tier(0);
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -5476,7 +5532,7 @@ static int cuda_register_model_map(const void *model_map, uint64_t model_size,
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
 
-    cuda_stream_selected_cache_release();
+    cuda_stream_release_every_tier(0);
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -32346,7 +32402,34 @@ static int cuda_stream_selected_cache_begin_load(
                 }
             }
         }
+        if (!g_begin_load_skip_sync && (!g_pf_share.trim.empty() || g_pf_share.batch_stamp)) {
+            /* The stream was drained on entry, so the batch that held these rows has run. A row touched since
+             * then keeps its stamp. What the batch keeps takes the stamp of its pass's first batch (never a
+             * younger one): the layers of a pass are then equally old, and neither decode nor the next pass
+             * empties the layer that happened to come first. */
+            auto &sh = g_pf_share;
+            for (const auto &t : sh.trim)
+                if (t.first < g_stream_expert_slots.size() && g_stream_expert_slots[t.first].used == t.second)
+                    g_stream_expert_slots[t.first].used = 2u;
+            sh.trim.clear();
+            if (sh.batch_stamp > sh.pass_base && sh.pass_base >= 3u)
+                for (auto &sl : g_stream_expert_slots) if (sl.used == sh.batch_stamp) sl.used = sh.pass_base;
+            sh.batch_stamp = 0;
+        }
+        const bool share_on = cuda_prefill_layer_share() != 0;
+        const bool share_batch = slot_count > 6u && g_wave_mode == 0 && share_on;
+        const uint8_t share_layer = (uint8_t)(table->layer < 0xffu ? table->layer : 0xfeu);
+        /* 0 is empty, 1 unread read-ahead, 2 demoted: with the layer share a live row is never stamped 2 */
+        if (share_on && g_stream_expert_clock < 2u) g_stream_expert_clock = 2u;
         const uint64_t stamp = ++g_stream_expert_clock;
+        if (share_batch) {
+            auto &sh = g_pf_share;
+            if (!sh.pass_open || table->layer < sh.last_layer) { sh.pass_base = stamp; sh.pass_open = true; }
+            sh.last_layer = table->layer;
+            sh.batch_stamp = stamp;
+        } else if (share_on && slot_count <= 6u) {
+            g_pf_share.pass_open = false;
+        }
         const double t_ph0 = cuda_now_ms();
         std::vector<int32_t> slots(unique.size(), -1);
         /* Protect every hit first: a miss must not evict a later request's hit. */
@@ -32375,6 +32458,8 @@ static int cuda_stream_selected_cache_begin_load(
             } else if (slot.used == 1) g_spec_useful_landed++;
             slots[i] = (int32_t)found->second;
             slot.used = stamp;
+            slot.layer = share_layer;
+            if (slot_count > 6u) g_pf_hits++;
         }
         g_ph_hits_ms += cuda_now_ms() - t_ph0;
         g_ph_layers++;
@@ -32498,14 +32583,23 @@ static int cuda_stream_selected_cache_begin_load(
             if (slots[i] >= 0) continue;
             g_ph_misses++;
             const double t_v0 = cuda_now_ms();
-            uint32_t victim = UINT32_MAX;
-            uint64_t oldest = stamp;
-            for (uint32_t j = 0; j < g_stream_expert_slots.size(); j++) {
+            uint32_t victim = UINT32_MAX, victim_same = UINT32_MAX;
+            uint64_t oldest = stamp, oldest_same = stamp;
+            const uint32_t n_scan = (uint32_t)g_stream_expert_slots.size();
+            const uint32_t j_first = share_on && n_scan ? g_pf_share.hand % n_scan : 0u;
+            for (uint32_t k_scan = 0; k_scan < n_scan; k_scan++) {
+                const uint32_t j = j_first + k_scan < n_scan ? j_first + k_scan : j_first + k_scan - n_scan;
                 /* A slot stamped by this call (hit or fill) is never a victim, whatever
                  * its pool bias makes its effective age. */
                 if (g_stream_expert_slots[j].used == stamp) continue;
                 if (j == 0u && cuda_moe_defer_enabled()) continue; /* slot 0 is the deferred path's dummy */
                 const uint64_t age_j = cuda_slot_eff_age(g_stream_expert_slots[j]);
+                if (share_batch && g_stream_expert_slots[j].layer == share_layer && age_j < oldest_same &&
+                    !cuda_stream_prefetch_protects(g_stream_expert_slots[j]) &&
+                    !cuda_spec_slot_pending(j) && !cuda_spec_slot_recent(j)) {
+                    oldest_same = age_j;
+                    victim_same = j;
+                }
                 if (!cuda_stream_prefetch_protects(g_stream_expert_slots[j]) &&
                     age_j < oldest &&
                     !cuda_spec_slot_pending(j) && !cuda_spec_slot_recent(j)) {
@@ -32514,6 +32608,13 @@ static int cuda_stream_selected_cache_begin_load(
                     if (!oldest) break;
                 }
             }
+            if (slot_count > 6u) g_pf_misses++;
+            if (share_batch && victim != UINT32_MAX && oldest > 2u) {
+                /* no free or demoted row: this layer's own oldest row before another layer's */
+                if (victim_same != UINT32_MAX) { victim = victim_same; g_pf_share.same_layer++; }
+                else g_pf_share.other_layer++;
+            }
+            if (share_on && victim != UINT32_MAX) g_pf_share.hand = victim + 1u;
             t_vic += cuda_now_ms() - t_v0;
             g_ph_victim_iters += g_stream_expert_slots.size();
             if (victim == UINT32_MAX) {
@@ -32550,7 +32651,7 @@ static int cuda_stream_selected_cache_begin_load(
                 if (htier < 0 && batch_max > 1u) {
                     /* Claim the slot now so the next victim search cannot pick it again, then
                      * read it as part of the batch. */
-                    slot = {gate, up, down, stamp, 0};
+                    slot = {gate, up, down, stamp, 0, share_layer};
                     g_stream_expert_by_gate[gate] = victim;
                     cuda_slot_table_note(gate, (int32_t)victim);
                     slots[i] = (int32_t)victim;
@@ -32584,7 +32685,7 @@ static int cuda_stream_selected_cache_begin_load(
                         table->model_map, table->model_size, down, table->down_expert_bytes, "stream down", uploads.chunks)))
                     return 0;
             }
-            slot = {gate, up, down, stamp, (uint8_t)(htier > 0 ? 1 : 0)};
+            slot = {gate, up, down, stamp, (uint8_t)(htier > 0 ? 1 : 0), share_layer};
             /* Ordered copies are still pending. Protect their slots, but do
              * not advertise a cache hit until every upload has completed. */
             if (!ordered) {
@@ -32657,6 +32758,43 @@ static int cuda_stream_selected_cache_begin_load(
         if (slot_count > 6u && g_wave_mode != 1) {
             g_pf_layers++; g_pf_tokens += slot_count / 6u; g_pf_unique += unique.size(); g_pf_load_ms += t_ld + t_up;
             if (table->layer + 1u >= 40u) cuda_prefill_sweep_report();
+        }
+        if (share_batch) {
+            auto &sh = g_pf_share;
+            sh.seen |= UINT64_C(1) << (table->layer & 63u);
+            const uint32_t layers = sh.layers ? sh.layers : (uint32_t)__builtin_popcountll(sh.seen);
+            const uint64_t share = g_stream_expert_slots.size() / (layers ? layers : 1u);
+            /* the batch's last 32 tokens count first: the decode that follows asks for their experts again */
+            std::vector<uint32_t> uses(unique.size(), 0);
+            const uint32_t recent_from = slot_count > 32u * 6u ? slot_count - 32u * 6u : 0u;
+            for (uint32_t p2 = 0; p2 < slot_count; p2++) uses[(size_t)remap[p2]] += p2 >= recent_from ? slot_count : 1u;
+            std::unordered_map<uint32_t, uint32_t> uses_of_slot;
+            uses_of_slot.reserve(unique.size() * 2u);
+            for (size_t i = 0; i < unique.size(); i++)
+                if (slots[i] >= 0) uses_of_slot[(uint32_t)slots[i]] = uses[i];
+            std::vector<std::pair<uint32_t, uint32_t>> held;   /* (weight of this batch's use, slot) */
+            for (uint32_t j = 0; j < g_stream_expert_slots.size(); j++) {
+                const auto &sl = g_stream_expert_slots[j];
+                if (sl.used < 3u || sl.layer != share_layer) continue;
+                const auto it = uses_of_slot.find(j);
+                held.push_back({it == uses_of_slot.end() ? 0u : it->second, j});
+            }
+            sh.trim.clear();
+            if (held.size() > share) {
+                const size_t drop = held.size() - (size_t)share;
+                std::nth_element(held.begin(), held.begin() + (ptrdiff_t)drop, held.end());
+                for (size_t i = 0; i < drop; i++)
+                    sh.trim.push_back({held[i].second, g_stream_expert_slots[held[i].second].used});
+            }
+            sh.batches++; sh.kept += held.size() - sh.trim.size(); sh.trimmed += sh.trim.size();
+            if (table->layer + 1u >= 40u && getenv("DS4_CUDA_PREFILL_LAYER_SHARE_STATS") != NULL) {
+                fprintf(stderr, "ds4: prefill layer share (tier %d, %u layers, %llu rows each): %llu batches, kept %.1f and "
+                        "handed back %.1f per batch; victims from the same layer %llu, from another layer %llu\n",
+                        g_stream_tier, layers, (unsigned long long)share, (unsigned long long)sh.batches,
+                        (double)sh.kept / (double)sh.batches, (double)sh.trimmed / (double)sh.batches,
+                        (unsigned long long)sh.same_layer, (unsigned long long)sh.other_layer);
+                sh.kept = sh.trimmed = sh.same_layer = sh.other_layer = sh.batches = 0;
+            }
         }
         if (slot_count > 6u && cuda_prefill_cold()) {
             /* Never raise a slot's stamp: the demotion must not look like a fresh touch. */
@@ -39411,11 +39549,15 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
 
 extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_ssd_streaming_mode = enabled ? 1 : 0;
-    cuda_stream_selected_cache_invalidate();
-    if (!g_ssd_streaming_mode) cuda_stream_selected_cache_release();
+    for (int t = 0; t < DS4_MAX_GPUS; t++) g_stream_selected_cache_pt.v[t].valid = 0;   /* every card's */
+    if (!g_ssd_streaming_mode) cuda_stream_release_every_tier(0);
 }
 
 extern "C" void ds4_gpu_set_stream_split(int on) { g_stream_split_on = on ? 1 : 0; }
+
+/* The number of layers the calling card serves: a layer's share of that card's expert cache
+ * (DS4_CUDA_PREFILL_LAYER_SHARE). 0: the layers seen so far. */
+extern "C" void ds4_gpu_set_streaming_expert_cache_layers(uint32_t layers) { g_pf_share.layers = layers; }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
     if (experts != g_stream_expert_budget) cuda_stream_selected_cache_release();
@@ -39439,7 +39581,7 @@ extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
 }
 
 extern "C" void ds4_gpu_stream_expert_cache_release_resident(void) {
-    cuda_stream_selected_cache_release();
+    cuda_stream_release_every_tier(0);
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_selected(

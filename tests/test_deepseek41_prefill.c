@@ -249,6 +249,22 @@ static int check_mixed(const char *model, const char *prompt_path,
         .ssd_streaming_cache_bytes = tp_opt || resident ? 0 : UINT64_C(64) << 30};
     if (tp_opt) opt.tp = *tp_opt;
     CHECK(imatrix_read_text_file(prompt_path, &prompt, &bytes));
+    /* DS4_TEST_GPU_DEVICES=0,1 (with DS4_CUDA_STREAM_SPLIT): the same checks with the layers on two cards. */
+#ifndef __APPLE__
+    const char *test_gpus = cuda && !tp_opt ? getenv("DS4_TEST_GPU_DEVICES") : NULL;
+    if (test_gpus && *test_gpus) {
+        ds4_gpu_config gpu_cfg = {0};
+        const char *vram = getenv("DS4_TEST_GPU_VRAM_GB");
+        const size_t budget = (size_t)(vram && *vram ? atoi(vram) : 90) << 30;
+        for (const char *p = test_gpus; *p && gpu_cfg.n_gpus < DS4_MAX_GPUS; ) {
+            gpu_cfg.device_indices[gpu_cfg.n_gpus] = atoi(p);
+            gpu_cfg.vram_bytes[gpu_cfg.n_gpus++] = budget;
+            while (*p && *p != ',') p++;
+            if (*p == ',') p++;
+        }
+        CHECK(ds4_engine_create_with_gpu_config(&engine, &opt, &gpu_cfg) == 0);
+    } else
+#endif
     CHECK(ds4_engine_open(&engine, &opt) == 0);
     if (tp_opt) {
         ds4_tp_identity id = {

@@ -79892,8 +79892,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 const int cut = engine_stream_split_cut(e, gpu_cfg);
                 uint64_t slab_expert_bytes = 0;
                 if (cut > 0 && ds4_streaming_routed_expert_bytes(&e->weights, &slab_expert_bytes)) {
-                    const uint32_t total = e->ssd_streaming_cache_experts ? e->ssd_streaming_cache_experts : 1000000u;
-                    ds4_gpu_set_stream_split(1);
+                    /* a count, a size in bytes (500GB), or nothing: then each card takes what its VRAM holds */
+                    const uint64_t asked = e->ssd_streaming_cache_experts ? e->ssd_streaming_cache_experts :
+                        e->ssd_streaming_cache_bytes ? e->ssd_streaming_cache_bytes / slab_expert_bytes : 1000000u;
+                    const uint32_t total = asked > 1000000u ? 1000000u : (uint32_t)asked;
 #ifdef DS4_HAS_DEEPSEEK41_GPU
                     g_ds41_split_cut = cut;   /* the session graphs build a set of working tensors per card */
 #endif
@@ -79904,6 +79906,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         if (ds4_gpu_set_current_device(tier) != 0) { ds4_engine_close(e); *out = NULL; return 1; }
                         ds4_gpu_set_streaming_expert_cache_budget(share);
                         ds4_gpu_set_streaming_expert_cache_expert_bytes(slab_expert_bytes);
+                        ds4_gpu_set_streaming_expert_cache_layers((uint32_t)(tier == 0 ? cut : (int)DS4_N_LAYER - cut));
                         fprintf(stderr, "ds4: SSD streaming split: GPU%d may cache up to %u experts of %.2f MiB\n",
                                 gpu_cfg->device_indices[tier], share, (double)slab_expert_bytes / 1048576.0);
                     }
