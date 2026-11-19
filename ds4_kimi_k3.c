@@ -219,7 +219,8 @@ static int k3_open_expert(uint32_t layer, uint32_t expert) {
     if (fd < 0) return -1;
     if (g_file_bytes != 0) {
         struct stat st;
-        if (fstat(fd, &st) != 0 || (uint64_t)st.st_size != g_file_bytes) {
+        if (fstat(fd, &st) != 0 || ((uint64_t)st.st_size != g_file_bytes &&
+                                    !(g_file_bytes == 17547264ull && (uint64_t)st.st_size == 16785408ull))) {   /* step 154: or the recoded form (step 132) */
             close(fd); errno = EIO; return -1;
         }
     }
@@ -383,8 +384,19 @@ int ds4_k3_expert_source_read(uint64_t offset, uint64_t bytes, void *out) {
         uint8_t *scale = malloc((size_t)nrows * scale_row);
         uint8_t *rowbuf = malloc(row_bytes);
         if (!packed || !scale || !rowbuf) { free(packed); free(scale); free(rowbuf); close(fd); errno = ENOMEM; return 0; }
-        int ok = k3_pread_full(fd, packed, (uint64_t)nrows * packed_row, c->src_packed + (uint64_t)row0 * packed_row) &&
-                 k3_pread_full(fd, scale, (uint64_t)nrows * scale_row, c->src_scale + (uint64_t)row0 * scale_row);
+        int ok;
+        if (k3_fd_is_v2(fd)) {   /* step 154: a recoded file: the packed rows at their place in the smaller file, the scale rows expanded */
+            const int pi = (int)(c->src_packed / (K3_V2_PACKED + K3_V2_SCALE));
+            const uint64_t sec2 = (uint64_t)pi * (K3_V2_PACKED + K3_V2_COMPACT);
+            uint8_t *comp = malloc((size_t)K3_V2_COMPACT);
+            ok = comp != NULL && pi >= 0 && pi < 3 &&
+                 k3_pread_full(fd, packed, (uint64_t)nrows * packed_row, sec2 + (uint64_t)row0 * packed_row) &&
+                 k3_pread_full(fd, comp, K3_V2_COMPACT, sec2 + K3_V2_PACKED);
+            if (ok) k3_v2_expand(comp, pi, (uint64_t)row0 * scale_row, (uint64_t)(row0 + nrows) * scale_row, scale);
+            free(comp);
+        } else
+        ok = k3_pread_full(fd, packed, (uint64_t)nrows * packed_row, c->src_packed + (uint64_t)row0 * packed_row) &&
+             k3_pread_full(fd, scale, (uint64_t)nrows * scale_row, c->src_scale + (uint64_t)row0 * scale_row);
         close(fd);
         if (!ok) { free(packed); free(scale); free(rowbuf); return 0; }
         uint64_t produced = 0;
