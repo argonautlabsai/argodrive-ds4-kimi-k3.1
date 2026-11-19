@@ -494,27 +494,32 @@ the same build on the same day with no new switch.
     DS4_CUDA_STREAM_SPLIT=46 ./ds4 -m k3-spine.gguf --cuda --gpu-devices 0,1 --gpu-vram auto --ssd-streaming \
           --ssd-streaming-cold --ssd-streaming-cache-experts 16 --temp 0 -c 2048 -p "..."
 
-| test | one card | two cards |
+| setup | 512-token prompt: prefill tok/s | decode tok/s | 1,512-token prompt: prefill tok/s | decode tok/s | 6-token prompt: decode tok/s |
+|---|---|---|---|---|---|
+| one card | 16.0 | 1.60 | 39.5 | 1.74 | 2.04 |
+| two cards | 16.1 | 2.05 | 39.7 | 2.26 | 2.97 |
+| **with the Qwen drafter** | | | | | |
+| one card | 16.0 | 3.95 | 39.6 | 3.01 | 3.87 |
+| two cards | 15.9 | 4.56 | 39.3 | 3.57 | 5.52 |
+
+Prefill is how fast the prompt is read, decode how fast the answer is generated: 200 tokens after the 512-token
+prompt, 128 after the 1,512-token one, 512 after the 6-token one. Every cell has
+the logits of the one-card reference runs. One card runs with no new switch. On two cards the plain rows run with `DS4_K3_CACHE_POLICY=decay-device DS4_K3_CACHE_DECAY=0.95` and the drafter
+rows with `DS4_K3_VERIFY_RANK=1 DS4_K3_VERIFY_PF_SCALE=8`; both are off by default and described below. The 512-token
+prompt is `prompt-512-tokens.txt`, the 6-token one the record prompt.
+
+| more tests on two cards | prefill tok/s | decode tok/s |
 |---|---|---|
-| record prompt, 512 generated, Qwen | – | 5.50–5.53 tok/s |
-| record prompt, 200 generated, Qwen | 3.35 tok/s | 4.53 |
-| record prompt, 128 generated, Qwen | – | 3.69 |
-| record prompt, 256 generated, plain | – | 3.04–3.05 |
-| record prompt, 128 generated, plain | 2.13 | – |
-| "The capital of France is", 17 generated, Qwen | 2.20 | 2.45–2.53 |
-| `prompt-512-tokens.txt`, 64 generated, Qwen: prompt pass, then decode | – | 32.1 s, 3.92 |
-| 1,512-token prompt, 64 generated, Qwen: prompt pass, then decode | 38.0 s, 2.33 | 38.8 s, 2.63 |
-| 13,087-token prompt at a 16k cache, 48 generated: prompt pass, then plain / Qwen decode | 133 s, 1.54 / – (10 November release) | 123 s, 1.93 / 2.23 |
-| a 53-token chat prompt, chat settings, Qwen | 2.25 (64 generated) | 2.93 (256 generated) |
+| 13,087-token prompt at a 16k cache, 48 generated | 106 | 1.93, with the drafter 2.23 |
+| the same prompt on one card, 10 November release | 98 | 1.54 |
+| a 53-token chat prompt, 256 generated, chat settings, drafter | 4.3 | 2.93 |
+| "The capital of France is", 17 generated, drafter | – | 2.45–2.53 |
+| record prompt, 128 and 200 generated, drafter | – | 3.69 and 4.53 |
 
-The two-card Qwen rows run with `DS4_K3_VERIFY_RANK=1 DS4_K3_VERIFY_PF_SCALE=8` and the two-card plain rows with
-`DS4_K3_CACHE_POLICY=decay-device DS4_K3_CACHE_DECAY=0.95`; both are off by default and described below. Through the chat
-endpoint at a 16k cache, three requests of 36, 185 and 1,543 prompt tokens took 52, 28 and 75 s on two cards against
-62, 33 and 89 s on one, with the same three answers.
-
-The drafter figure depends on the text, as on one card. The record prompt is the one Qwen predicts best (89 % of its
-drafts kept); two other continuations of 383 tokens decoded at 2.98 and 3.11 tok/s with the same settings, and the chat
-prompt above, where half of the tokens are single steps, at 2.93.
+Through the chat endpoint at a 16k cache, three requests of 36, 185 and 1,543 prompt tokens took 52, 28 and 75 s on two
+cards against 62, 33 and 89 s on one, with the same three answers. The drafter figure depends on the text, as on one card:
+the record prompt is the one Qwen predicts best (89 % of its drafts kept), and two other continuations of 383 tokens
+decoded at 2.98 and 3.11 tok/s with the same settings.
 
 What changed:
 

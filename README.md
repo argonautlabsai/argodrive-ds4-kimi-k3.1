@@ -22,7 +22,7 @@ The following tables and footprint describe **Kimi K3.1 Pro**. DeepSeek V4.1 Fla
 | Hardware | Workload | Measured speed | Version and scope |
 |---|---|---:|---|
 | **Two RTX PRO 6000** (2 x 96 GB, Linux, CUDA) | Raw financial text: 6 prompt / 512 output tokens | **5.50–5.53 tok/s decode** | 19 November, layers split over both cards, Qwen drafter |
-| **Two RTX PRO 6000** (2 x 96 GB, Linux, CUDA) | The same text, no drafter: 6 prompt / 256 output tokens | **3.04–3.05 tok/s decode** | 19 November, layers split over both cards |
+| **Two RTX PRO 6000** (2 x 96 GB, Linux, CUDA) | The same text, no drafter: 6 prompt / 512 output tokens | **2.97 tok/s decode** | 19 November, layers split over both cards |
 | **RTX PRO 6000** (96 GB, Linux, CUDA) | Short-prompt chat: 286 prompt / 200 output tokens | **2.01–2.02 tok/s decode** | 11 November, chat drafter settings |
 | **RTX PRO 6000** (96 GB, Linux, CUDA) | Raw financial text: 6 prompt / 512 output tokens | **3.77–3.79 tok/s decode** | 11 November, Qwen drafter, fp32 activations |
 | **RTX PRO 6000** (96 GB, Linux, CUDA) | Long raw prompt: 512 prompt / 200 output tokens | **3.88–3.89 tok/s decode** | 11 November, Qwen drafter |
@@ -96,30 +96,22 @@ the text is. The 512-token prompt is `prompt-512-tokens.txt` from the deltafin K
 
 ### Kimi K3.1 Pro on two RTX PRO 6000 (Linux, CUDA)
 
-With two cards the layers are split between them (`DS4_CUDA_STREAM_SPLIT=46` with `--gpu-devices 0,1`): layers 0 to 45 run
-on the first card and 46 to 92 on the second, each card holds the spine of its own layers, and what is left of both is one
-expert cache of 7,239 slabs, against 1,536 on one card. Measured on 19 November at commit d29ddcb on two
-RTX PRO 6000 Blackwell cards (96 GB each) in an 80 GiB VM with a 56 GiB pinned expert pool, the experts on the four NVMe
-devices of 11 November, one fresh process per run, greedy, raw prompts, three runs where a range is given:
+Measured on 19 November at commit d29ddcb, one fresh process per run, greedy:
 
-| test | prefill | decode, Qwen drafter | decode, plain |
-|---|---|---|---|
-| "The three main financial statements are" (6 tokens), 512 generated | — | 5.50–5.53 tok/s | — |
-| the same prompt, 256 generated | — | — | 3.04–3.05 tok/s |
-| the same prompt, 128 / 200 generated | — | 3.69 / 4.53 | — |
-| 512-token prompt, 64 generated | 15.9 tok/s | 3.92 | — |
-| 1,512-token prompt, 64 generated | 39.0 tok/s | 2.63 | — |
-| 13,087-token prompt at a 16k cache, 48 generated | 106 tok/s | 2.23 | 1.93 |
+| setup | 512-token prompt: prefill tok/s | decode tok/s | 1,512-token prompt: prefill tok/s | decode tok/s | 6-token prompt: decode tok/s |
+|---|---|---|---|---|---|
+| one card | 16.0 | 1.60 | 39.5 | 1.74 | 2.04 |
+| two cards | 16.1 | 2.05 | 39.7 | 2.26 | 2.97 |
+| **with the Qwen drafter** | | | | | |
+| one card | 16.0 | 3.95 | 39.6 | 3.01 | 3.87 |
+| two cards | 15.9 | 4.56 | 39.3 | 3.57 | **5.52** |
 
-On one card the same build decoded the record prompt at 3.35 tok/s with the drafter (200 generated) and at
-2.13 plain. The drafter rows above use two switches that are off by default (`DS4_K3_VERIFY_RANK=1
-DS4_K3_VERIFY_PF_SCALE=8`) and the plain row a third (`DS4_K3_CACHE_POLICY=decay-device`). How fast the drafter rows are
-depends on the text: two other continuations decoded at 2.98 and 3.11 tok/s and a chat prompt at 2.93.
-
-Every row has the logits of the one-card reference runs: 4,316 positions compared by hash in this release's
-qualification, across one card, the second card as a cache and the split. Decode is still bound by the drives: 85 % of the
-512-token run is spent waiting for expert reads, at the full rate the drives give. The switches, what changed, what was
-tried without gain and the limits: [two cards](tools/kimi-k3/README.md#two-cards-19-november-2026).
+Prefill is how fast the prompt is read, decode how fast the answer is generated: 200 tokens after the 512-token
+prompt, 128 after the 1,512-token one, 512 after the 6-token one. Every cell has the logits of the
+one-card reference runs. Two cards: the layers split between them
+(`DS4_CUDA_STREAM_SPLIT=46`), an 80 GiB VM with a 56 GiB expert pool, four NVMe devices. The 512-token prompt is
+`prompt-512-tokens.txt`, the 6-token one "The three main financial statements are". Prefill is bound by the drives on
+either setup. Switches, what changed and the limits: [two cards](tools/kimi-k3/README.md#two-cards-19-november-2026).
 
 ### Standard benchmarks on a MacBook Pro M5 Max (macOS, Metal)
 
