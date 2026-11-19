@@ -67184,6 +67184,355 @@ static const k3_ckpt *k3_ckpt_find(const int *ids, int n_ids, uint32_t cache_cap
     }
     return best;
 }
+/* step 163 (19 Nov 2026): saved prefixes outlive the process. DS4_K3_CKPT_DIR=<directory> (unset: off). Every prefix the
+   engine saves in host memory (step 39) is also written there, and a request whose prompt starts with a prefix found
+   there restores it exactly as it would one from memory, so the first request after a restart does not read the system
+   prompt again, and a prefix that left the memory table for a newer one comes back from the drive instead of a pass.
+   A file holds the bytes of the memory checkpoint, nothing recomputed. It is used only by the build, the model file and
+   the settings that wrote it (a fingerprint in its header: the executable's contents, the model file's identity, the
+   layer cut and every DS4_* variable except those that only move work between caches, drives and logs), and only if
+   its checksum holds. DS4_K3_CKPT_DISK_GB (16) bounds the directory; the least recently used files go first.
+   The files hold prompt tokens: the directory is made 0700 and the files 0600. */
+#if defined(__linux__)
+#include <dirent.h>
+extern char **environ;
+static uint64_t k3_sum64(uint64_t h, const void *p, size_t len) {   /* a checksum, 8 bytes a step */
+    const uint8_t *b = p; size_t i = 0;
+    for (; i + 8u <= len; i += 8u) { uint64_t w; memcpy(&w, b + i, 8); h = (h ^ w) * 0x9e3779b97f4a7c15ull; h ^= h >> 29; }
+    for (; i < len; i++) h = (h ^ b[i]) * 0x100000001b3ull;
+    return h;
+}
+#define K3_CKD_SEED 0x4b33434b50543031ull
+typedef struct { char magic[8]; uint64_t fp, tok_hash, bytes, sum, size; uint32_t n, cache_cap, n_layer, n_img, n_lch, flags; } k3_ckd_hdr;   /* 72 bytes; flags: 1 latent rows, 2 index keys */
+typedef struct { char *path; uint64_t tok_hash; uint32_t n, cache_cap, flags; ds4_k3_image_span *img; int n_img; } k3_ckd_ent;
+typedef struct { int fd; bool ok; uint64_t sum, since; } k3_ckd_io;
+static k3_ckd_ent *g_k3_ckd = NULL;
+static int g_k3_ckd_n = 0, g_k3_ckd_state = 0;   /* state: 0 not tried, 1 ready, -1 off */
+static bool g_k3_ckd_scanned = false;
+static uint64_t g_k3_ckd_fp = 0;
+static const char *k3_ckpt_dir(void) {
+    static const char *d = NULL; static int asked = 0;
+    if (!asked) { d = getenv("DS4_K3_CKPT_DIR"); if (d && !d[0]) d = NULL; asked = 1; }
+    return d;
+}
+static uint64_t k3_ckpt_disk_budget(void) { const char *e = getenv("DS4_K3_CKPT_DISK_GB"); const double g = e ? atof(e) : 16.0; return (uint64_t)((g < 0.0 ? 0.0 : g) * 1e9); }
+static bool k3_ckd_is_file(const char *name) { const size_t l = strlen(name); return l > 7u && !strcmp(name + l - 7u, ".k3ckpt"); }
+static int k3_ckd_cmp(const void *a, const void *b) { return strcmp(*(const char *const *)a, *(const char *const *)b); }
+static bool k3_ckd_harmless(const char *kv) {   /* variables that do not reach the arithmetic of a prompt pass */
+    static const char *const pre[] = {"DS4_K3_TRACE", "DS4_K3_CKPT_", "DS4_K3_CACHE_RAM", "DS4_K3_CACHE_VRAM", "DS4_K3_CACHE_POLICY", "DS4_K3_CACHE_DECAY",
+                                      "DS4_K3_QWEN", "DS4_K3_COPY", "DS4_K3_REFUTE", "DS4_K3_VERIFY_", "DS4_K3_SPLIT_ETA_GBPS", "DS4_K3_SPLIT_STREAM_GBPS",
+                                      "DS4_K3_SPINE_THREADS", NULL};
+    for (int i = 0; pre[i]; i++) if (!strncmp(kv, pre[i], strlen(pre[i]))) return true;
+    return false;
+}
+static bool k3_ckpt_disk_init(const ds4_model *model) {
+    if (g_k3_ckd_state) return g_k3_ckd_state > 0;
+    g_k3_ckd_state = -1;
+    const char *dir = k3_ckpt_dir();
+    if (!dir) return false;
+    uint64_t h = k3_sum64(K3_CKD_SEED, "K3CKPT1", 8);
+    FILE *f = fopen("/proc/self/exe", "rb");
+    struct stat st;
+    if (!f || !model || fstat(model->fd, &st) != 0) {
+        if (f) fclose(f);
+        fprintf(stderr, "ds4: K3 checkpoint files: the build or the model file cannot be identified here; saved prefixes stay in memory only\n");
+        return false;
+    }
+    { uint8_t *buf = xmalloc(1u << 20); size_t r; while ((r = fread(buf, 1, 1u << 20, f)) > 0) h = k3_sum64(h, buf, r); free(buf); fclose(f); }
+    const uint64_t mid[4] = {(uint64_t)st.st_size, (uint64_t)st.st_mtime, (uint64_t)st.st_ino, (uint64_t)(g_k3_split_cut > 0 ? g_k3_split_cut : 0)};
+    h = k3_sum64(h, mid, sizeof(mid));
+    size_t ne = 0;
+    for (char **e = environ; e && *e; e++) if (!strncmp(*e, "DS4_", 4) && !k3_ckd_harmless(*e)) ne++;
+    const char **v = xmalloc(sizeof(char *) * (ne + 1u));
+    ne = 0;
+    for (char **e = environ; e && *e; e++) if (!strncmp(*e, "DS4_", 4) && !k3_ckd_harmless(*e)) v[ne++] = *e;
+    qsort(v, ne, sizeof(char *), k3_ckd_cmp);
+    for (size_t i = 0; i < ne; i++) h = k3_sum64(h, v[i], strlen(v[i]) + 1u);
+    free(v);
+    if (mkdir(dir, 0700) != 0 && errno != EEXIST) { fprintf(stderr, "ds4: K3 checkpoint files: cannot make %s (%s); saved prefixes stay in memory only\n", dir, strerror(errno)); return false; }
+    g_k3_ckd_fp = h; g_k3_ckd_state = 1;
+    fprintf(stderr, "ds4: K3 checkpoint files (step 163): saved prefixes are kept in %s, up to %.0f GB; fingerprint %016llx (this build, the model file, %zu settings)\n",
+            dir, (double)k3_ckpt_disk_budget() / 1e9, (unsigned long long)h, ne);
+    return true;
+}
+static bool k3_ckd_read_head(const char *path, k3_ckd_hdr *h, ds4_k3_image_span **img) {
+    *img = NULL;
+    const int fd = open(path, O_RDONLY);
+    if (fd < 0) return false;
+    struct stat st;
+    bool ok = read(fd, h, sizeof(*h)) == (ssize_t)sizeof(*h) && !memcmp(h->magic, "K3CKPT1", 8) && h->n > 0u && h->n < (1u << 22) && h->n_img < 4096u && h->n_lch < (1u << 20) &&
+              fstat(fd, &st) == 0 && (uint64_t)st.st_size == h->size;
+    if (ok && h->n_img) {
+        uint64_t *raw = xmalloc(16u * (size_t)h->n_img);
+        ok = read(fd, raw, 16u * (size_t)h->n_img) == (ssize_t)(16u * (size_t)h->n_img);
+        if (ok) {
+            *img = xcalloc(h->n_img, sizeof(ds4_k3_image_span));
+            for (uint32_t i = 0; i < h->n_img; i++) { (*img)[i].pos = (uint32_t)(raw[2u * i] & 0xffffffffu); (*img)[i].n = (uint32_t)(raw[2u * i] >> 32); (*img)[i].hash = raw[2u * i + 1u]; }
+        }
+        free(raw);
+    }
+    close(fd);
+    return ok;
+}
+static void k3_ckd_add(const char *path, const k3_ckd_hdr *h, ds4_k3_image_span *img) {
+    g_k3_ckd = xrealloc(g_k3_ckd, sizeof(*g_k3_ckd) * (size_t)(g_k3_ckd_n + 1));
+    k3_ckd_ent *e = &g_k3_ckd[g_k3_ckd_n++];
+    e->path = xmalloc(strlen(path) + 1u); strcpy(e->path, path);
+    e->tok_hash = h->tok_hash; e->n = h->n; e->cache_cap = h->cache_cap; e->flags = h->flags; e->img = img; e->n_img = (int)h->n_img;
+}
+static void k3_ckd_drop(int i) {
+    free(g_k3_ckd[i].path); free(g_k3_ckd[i].img);
+    g_k3_ckd[i] = g_k3_ckd[--g_k3_ckd_n];
+}
+static void k3_ckpt_disk_scan(void) {
+    if (g_k3_ckd_scanned) return;
+    g_k3_ckd_scanned = true;
+    const char *dir = k3_ckpt_dir();
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *de; int other = 0;
+    while ((de = readdir(d))) {
+        if (!k3_ckd_is_file(de->d_name)) continue;
+        char path[1280]; snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
+        k3_ckd_hdr h; ds4_k3_image_span *img = NULL;
+        if (k3_ckd_read_head(path, &h, &img) && h.fp == g_k3_ckd_fp && h.n_layer == DS4_N_LAYER) k3_ckd_add(path, &h, img);
+        else { free(img); other++; }
+    }
+    closedir(d);
+    fprintf(stderr, "ds4: K3 checkpoint files: %d saved prefixes of this build and model found, %d other files left alone\n", g_k3_ckd_n, other);
+}
+/* the directory stays under its budget: the least recently used file goes, never the one just written */
+static void k3_ckpt_disk_trim(const char *keep) {
+    const char *dir = k3_ckpt_dir();
+    const uint64_t budget = k3_ckpt_disk_budget();
+    for (int guard = 0; guard < 4096; guard++) {
+        DIR *d = opendir(dir);
+        if (!d) return;
+        struct dirent *de; uint64_t total = 0; char oldest[1280]; oldest[0] = 0; struct timespec ot = {0, 0};
+        while ((de = readdir(d))) {
+            if (!k3_ckd_is_file(de->d_name)) continue;
+            char path[1280]; snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
+            struct stat st;
+            if (stat(path, &st) != 0) continue;
+            total += (uint64_t)st.st_size;
+            if (keep && !strcmp(path, keep)) continue;
+            if (!oldest[0] || st.st_mtim.tv_sec < ot.tv_sec || (st.st_mtim.tv_sec == ot.tv_sec && st.st_mtim.tv_nsec < ot.tv_nsec)) { strcpy(oldest, path); ot = st.st_mtim; }
+        }
+        closedir(d);
+        if (total <= budget || !oldest[0]) return;
+        if (unlink(oldest) != 0) return;
+        for (int i = 0; i < g_k3_ckd_n; i++) if (!strcmp(g_k3_ckd[i].path, oldest)) { k3_ckd_drop(i); break; }
+        fprintf(stderr, "ds4: K3 checkpoint files: %s removed to stay under %.0f GB\n", oldest, (double)budget / 1e9);
+    }
+}
+static void k3_ckd_w(k3_ckd_io *io, const void *p, uint64_t len) {
+    if (!io->ok || len == 0u) return;
+    if (!p) { io->ok = false; return; }
+    const uint8_t *b = p; uint64_t left = len;
+    while (left) {
+        const size_t want = left > (16u << 20) ? (16u << 20) : (size_t)left;
+        const ssize_t w = write(io->fd, b, want);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) { io->ok = false; return; }
+        b += w; left -= (uint64_t)w; io->since += (uint64_t)w;
+        if (io->since >= (64u << 20)) {   /* written through, then dropped from the page cache: the VM's memory belongs to the expert pool */
+            (void)fdatasync(io->fd);
+            (void)posix_fadvise(io->fd, 0, 0, POSIX_FADV_DONTNEED);
+            io->since = 0;
+        }
+    }
+    io->sum = k3_sum64(io->sum, p, (size_t)len);
+}
+static void k3_ckd_r(k3_ckd_io *io, void *p, uint64_t len) {
+    if (!io->ok || len == 0u) return;
+    uint8_t *b = p; uint64_t left = len;
+    while (left) {
+        const size_t want = left > (16u << 20) ? (16u << 20) : (size_t)left;
+        const ssize_t r = read(io->fd, b, want);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) { io->ok = false; return; }
+        b += r; left -= (uint64_t)r; io->since += (uint64_t)r;
+        if (io->since >= (64u << 20)) { (void)posix_fadvise(io->fd, 0, 0, POSIX_FADV_DONTNEED); io->since = 0; }
+    }
+    io->sum = k3_sum64(io->sum, p, (size_t)len);
+}
+/* called by k3_ckpt_save once the prefix is in the memory table */
+static void k3_ckpt_disk_write(const k3_ckpt *c) {
+    const char *dir = k3_ckpt_dir();
+    if (!dir || g_k3_ckd_state <= 0 || !c->tokens || c->n <= 0) return;
+    k3_ckpt_disk_scan();
+    const uint64_t th = k3_fnv(c->tokens, sizeof(int) * (size_t)c->n);
+    for (int i = 0; i < g_k3_ckd_n; i++) {
+        const k3_ckd_ent *e = &g_k3_ckd[i];
+        if (e->n != (uint32_t)c->n || e->tok_hash != th || e->cache_cap != c->cache_cap || e->n_img != c->n_img) continue;
+        bool same = true;
+        for (int j = 0; j < c->n_img && same; j++) same = e->img[j].pos == c->img[j].pos && e->img[j].n == c->img[j].n && e->img[j].hash == c->img[j].hash;
+        if (same) { (void)utimensat(AT_FDCWD, e->path, NULL, 0); return; }   /* already there: only its age is renewed */
+    }
+    const double t0 = now_sec();
+    const uint32_t L = c->n_layer, n = (uint32_t)c->n;
+    uint64_t ih = 0;
+    for (int j = 0; j < c->n_img; j++) { const uint64_t t[3] = {c->img[j].pos, c->img[j].n, c->img[j].hash}; ih = k3_sum64(ih ^ 0x9e3779b97f4a7c15ull, t, sizeof(t)); }
+    char path[1280], tmp[1280];
+    snprintf(path, sizeof(path), "%s/%016llx-%u-%016llx.k3ckpt", dir, (unsigned long long)th, n, (unsigned long long)(g_k3_ckd_fp ^ ih));
+    snprintf(tmp, sizeof(tmp), "%s/.writing-%016llx-%u-%d", dir, (unsigned long long)th, n, (int)getpid());
+    const int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) { fprintf(stderr, "ds4: K3 checkpoint files: cannot write in %s (%s)\n", dir, strerror(errno)); return; }
+    k3_ckd_hdr h; memset(&h, 0, sizeof(h));
+    memcpy(h.magic, "K3CKPT1", 8);
+    h.fp = g_k3_ckd_fp; h.tok_hash = th; h.bytes = c->bytes; h.n = n; h.cache_cap = c->cache_cap; h.n_layer = L;
+    h.n_img = (uint32_t)c->n_img; h.n_lch = c->latent ? c->n_lch : 0u; h.flags = (c->latent ? 1u : 0u) | (c->idx ? 2u : 0u);
+    k3_ckd_io io = {fd, true, K3_CKD_SEED, 0};
+    io.ok = write(fd, &h, sizeof(h)) == (ssize_t)sizeof(h);
+    for (int j = 0; j < c->n_img; j++) { const uint64_t t[2] = {(uint64_t)c->img[j].pos | ((uint64_t)c->img[j].n << 32), c->img[j].hash}; k3_ckd_w(&io, t, sizeof(t)); }
+    k3_ckd_w(&io, c->tokens, sizeof(int) * (uint64_t)n);
+    k3_ckd_w(&io, c->conv_b, sizeof(uint64_t) * L); k3_ckd_w(&io, c->state_b, sizeof(uint64_t) * L);
+    k3_ckd_w(&io, c->key_row_b, sizeof(uint64_t) * L); k3_ckd_w(&io, c->val_row_b, sizeof(uint64_t) * L);
+    for (uint32_t il = 0; il < L && io.ok; il++) {
+        if (ds4_k3_layer_is_kda(il)) { k3_ckd_w(&io, c->conv[il], c->conv_b[il]); k3_ckd_w(&io, c->state[il], c->state_b[il]); }
+        else if (c->latent) { k3_ckd_w(&io, c->lraw[il], (uint64_t)n * 576u * 4u); k3_ckd_w(&io, c->lnorm[il], (uint64_t)n * 512u * 4u); }
+        else { k3_ckd_w(&io, c->key[il], c->key_row_b[il] * (uint64_t)n); k3_ckd_w(&io, c->value[il], c->val_row_b[il] * (uint64_t)n); }
+        if (c->idx && !ds4_k3_layer_is_kda(il)) k3_ckd_w(&io, c->idx[il], 512u * (uint64_t)n);
+    }
+    if (c->latent) {
+        k3_ckd_w(&io, c->owner, sizeof(int32_t) * (uint64_t)n);
+        for (uint32_t i = 0; i < c->n_lch && io.ok; i++) { const uint32_t t[4] = {c->lch[i].start, c->lch[i].len, c->lch[i].alive, c->lch[i].in ? 1u : 0u}; k3_ckd_w(&io, t, sizeof(t)); }
+        for (uint32_t i = 0; i < c->n_lch && io.ok; i++) {
+            if (!c->lch[i].in) continue;
+            for (uint32_t il = 0; il < L && io.ok; il++) if (!ds4_k3_layer_is_kda(il)) k3_ckd_w(&io, c->lch[i].in[il], (uint64_t)c->lch[i].len * 512u * 4u);
+        }
+    }
+    const off_t end = io.ok ? lseek(fd, 0, SEEK_CUR) : (off_t)-1;
+    h.sum = io.sum; h.size = end > 0 ? (uint64_t)end : 0u;
+    const bool ok = io.ok && end > 0 && pwrite(fd, &h, sizeof(h), 0) == (ssize_t)sizeof(h) && fdatasync(fd) == 0;
+    (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    close(fd);
+    if (!ok || rename(tmp, path) != 0) {
+        fprintf(stderr, "ds4: K3 checkpoint files: writing the %u-token prefix failed (%s); it stays in memory only\n", n, strerror(errno));
+        (void)unlink(tmp);
+        return;
+    }
+    int n_img = 0; ds4_k3_image_span *img = NULL;
+    if (c->n_img) { img = xcalloc((size_t)c->n_img, sizeof(*img)); memcpy(img, c->img, sizeof(*img) * (size_t)c->n_img); n_img = c->n_img; for (int j = 0; j < n_img; j++) img[j].embeds = NULL; }
+    k3_ckd_add(path, &h, img);
+    fprintf(stderr, "ds4: K3 checkpoint files: the %u-token prefix written (%.0f MB in %.2f s)\n", n, (double)h.size / 1e6, now_sec() - t0);
+    k3_ckpt_disk_trim(path);
+}
+/* the longest saved prefix on the drive that this prompt starts with and that is longer than the one memory holds
+   (have_n tokens; 0: none): read into the memory table and returned, NULL when there is none or it does not verify */
+static const k3_ckpt *k3_ckpt_disk_load(const k3_gpu_buffers *b, const ds4_model *model, const int *ids, int n_ids, uint32_t cache_cap, int have_n) {
+    if (!k3_ckpt_dir() || k3_ckpt_max() == 0 || !k3_ckpt_disk_init(model)) return NULL;
+    k3_ckpt_disk_scan();
+    int best = -1;
+    for (int i = 0; i < g_k3_ckd_n; i++) {
+        const k3_ckd_ent *e = &g_k3_ckd[i];
+        if ((int)e->n <= have_n || (int)e->n >= n_ids || e->cache_cap != cache_cap) continue;
+        if (((e->flags & 1u) != 0u) != k3_lat_on() || ((e->flags & 2u) != 0u) != (b->idx_cache != NULL)) continue;
+        if (best >= 0 && e->n <= g_k3_ckd[best].n) continue;
+        if (k3_fnv(ids, sizeof(int) * (size_t)e->n) != e->tok_hash || !k3_images_match(e->img, e->n_img, e->n)) continue;
+        best = i;
+    }
+    if (best < 0) return NULL;
+    const double t0 = now_sec();
+    char path[1280]; snprintf(path, sizeof(path), "%s", g_k3_ckd[best].path);
+    const int fd = open(path, O_RDONLY);
+    k3_ckd_hdr h; memset(&h, 0, sizeof(h));
+    struct stat st;
+    const uint32_t L = DS4_N_LAYER;
+    bool ok = fd >= 0 && read(fd, &h, sizeof(h)) == (ssize_t)sizeof(h) && !memcmp(h.magic, "K3CKPT1", 8) && h.fp == g_k3_ckd_fp && h.n == g_k3_ckd[best].n &&
+              h.n_layer == L && h.cache_cap == cache_cap && h.bytes <= k3_ckpt_budget() && fstat(fd, &st) == 0 && (uint64_t)st.st_size == h.size && h.n_lch < (1u << 20);
+    k3_ckpt t; memset(&t, 0, sizeof(t));
+    k3_ckd_io io = {fd, ok, K3_CKD_SEED, 0};
+    const uint32_t n = h.n;
+    if (ok) {
+        t.n_layer = L; t.n = (int)n; t.cache_cap = cache_cap; t.latent = (h.flags & 1u) != 0u;
+        t.tokens = xmalloc(sizeof(int) * (size_t)n);
+        t.conv = xcalloc(L, sizeof(float *)); t.state = xcalloc(L, sizeof(float *)); t.key = xcalloc(L, sizeof(float *)); t.value = xcalloc(L, sizeof(float *));
+        t.conv_b = xcalloc(L, sizeof(uint64_t)); t.state_b = xcalloc(L, sizeof(uint64_t)); t.key_row_b = xcalloc(L, sizeof(uint64_t)); t.val_row_b = xcalloc(L, sizeof(uint64_t));
+        if (h.flags & 2u) t.idx = xcalloc(L, sizeof(float *));
+        if (t.latent) { t.lraw = xcalloc(L, sizeof(float *)); t.lnorm = xcalloc(L, sizeof(float *)); }
+        if (h.n_img) {
+            t.img = xcalloc(h.n_img, sizeof(ds4_k3_image_span)); t.n_img = (int)h.n_img;
+            for (uint32_t j = 0; j < h.n_img; j++) { uint64_t v[2] = {0, 0}; k3_ckd_r(&io, v, sizeof(v)); t.img[j].pos = (uint32_t)(v[0] & 0xffffffffu); t.img[j].n = (uint32_t)(v[0] >> 32); t.img[j].hash = v[1]; }
+        }
+        k3_ckd_r(&io, t.tokens, sizeof(int) * (uint64_t)n);
+        k3_ckd_r(&io, t.conv_b, sizeof(uint64_t) * L); k3_ckd_r(&io, t.state_b, sizeof(uint64_t) * L);
+        k3_ckd_r(&io, t.key_row_b, sizeof(uint64_t) * L); k3_ckd_r(&io, t.val_row_b, sizeof(uint64_t) * L);
+        if (io.ok && memcmp(t.tokens, ids, sizeof(int) * (size_t)n) != 0) io.ok = false;   /* the same hash, other tokens */
+        for (uint32_t il = 0; il < L && io.ok; il++) {   /* the sizes must be this engine's */
+            if (ds4_k3_layer_is_kda(il)) io.ok = t.conv_b[il] == ds4_gpu_tensor_bytes(b->kda_conv[il]) && t.state_b[il] == ds4_gpu_tensor_bytes(b->kda_state[il]);
+            else if (!t.latent) io.ok = t.key_row_b[il] == ds4_gpu_tensor_bytes(b->key_cache[il]) / b->cache_cap && t.val_row_b[il] == ds4_gpu_tensor_bytes(b->value_cache[il]) / b->cache_cap;
+        }
+        for (uint32_t il = 0; il < L && io.ok; il++) {
+            if (ds4_k3_layer_is_kda(il)) {
+                t.conv[il] = xmalloc(t.conv_b[il]); t.state[il] = xmalloc(t.state_b[il]);
+                k3_ckd_r(&io, t.conv[il], t.conv_b[il]); k3_ckd_r(&io, t.state[il], t.state_b[il]);
+            } else if (t.latent) {
+                t.lraw[il] = xmalloc((size_t)n * 576u * 4u); t.lnorm[il] = xmalloc((size_t)n * 512u * 4u);
+                k3_ckd_r(&io, t.lraw[il], (uint64_t)n * 576u * 4u); k3_ckd_r(&io, t.lnorm[il], (uint64_t)n * 512u * 4u);
+            } else {
+                t.key[il] = xmalloc(t.key_row_b[il] * (size_t)n); t.value[il] = xmalloc(t.val_row_b[il] * (size_t)n);
+                k3_ckd_r(&io, t.key[il], t.key_row_b[il] * (uint64_t)n); k3_ckd_r(&io, t.value[il], t.val_row_b[il] * (uint64_t)n);
+            }
+            if (t.idx && !ds4_k3_layer_is_kda(il)) { t.idx[il] = xmalloc(512u * (size_t)n); k3_ckd_r(&io, t.idx[il], 512u * (uint64_t)n); }
+        }
+        if (t.latent && io.ok) {
+            t.owner = xmalloc(sizeof(int32_t) * (size_t)n);
+            k3_ckd_r(&io, t.owner, sizeof(int32_t) * (uint64_t)n);
+            t.lch = xcalloc(h.n_lch ? h.n_lch : 1u, sizeof(k3_ckpt_chunk)); t.n_lch = h.n_lch;
+            for (uint32_t i = 0; i < h.n_lch && io.ok; i++) {
+                uint32_t v[4] = {0, 0, 0, 0}; k3_ckd_r(&io, v, sizeof(v));
+                t.lch[i].start = v[0]; t.lch[i].len = v[1]; t.lch[i].alive = v[2];
+                if (v[3]) { if (v[1] == 0u || v[1] > (1u << 22)) io.ok = false; else t.lch[i].in = xcalloc(L, sizeof(float *)); }
+            }
+            for (uint32_t i = 0; i < h.n_lch && io.ok; i++) {
+                if (!t.lch[i].in) continue;
+                for (uint32_t il = 0; il < L && io.ok; il++) {
+                    if (ds4_k3_layer_is_kda(il)) continue;
+                    t.lch[i].in[il] = xmalloc((size_t)t.lch[i].len * 512u * 4u);
+                    k3_ckd_r(&io, t.lch[i].in[il], (uint64_t)t.lch[i].len * 512u * 4u);
+                }
+            }
+            for (uint32_t q = 0; q < n && io.ok; q++) if (t.owner[q] >= 0 && !k3_lat_sel_on() && (uint32_t)t.owner[q] >= h.n_lch) io.ok = false;   /* without step 107 the restore indexes the chunk table with it (with it, 0 only marks a prompt batch) */
+        }
+        if (io.ok) io.ok = lseek(fd, 0, SEEK_CUR) == (off_t)h.size && io.sum == h.sum;
+    }
+    if (fd >= 0) { (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); close(fd); }
+    if (!io.ok) {
+        fprintf(stderr, "ds4: K3 checkpoint files: %s does not verify (size, tokens or checksum); removed, the prompt is read as usual\n", path);
+        if (t.tokens) k3_ckpt_free(&t);   /* t.bytes is 0: the table's count is not touched */
+        (void)unlink(path);
+        k3_ckd_drop(best);
+        return NULL;
+    }
+    /* into the memory table, as k3_ckpt_save places one: the least recently used leave until it fits */
+    const int cap = k3_ckpt_max();
+    int slot = -1;
+    for (;;) {
+        int victim = -1, empty = -1;
+        for (int i = 0; i < cap; i++) {
+            if (!g_k3_ckpt[i].tokens) { if (empty < 0) empty = i; continue; }
+            if (victim < 0 || g_k3_ckpt[i].last_use < g_k3_ckpt[victim].last_use) victim = i;
+        }
+        if (empty >= 0 && g_k3_ckpt_bytes + h.bytes <= k3_ckpt_budget()) { slot = empty; break; }
+        if (victim < 0) break;   /* cannot happen: h.bytes is within the budget */
+        k3_ckpt_free(&g_k3_ckpt[victim]);
+    }
+    if (slot < 0) { k3_ckpt_free(&t); return NULL; }
+    t.bytes = h.bytes; t.last_use = ++g_k3_ckpt_clock; g_k3_ckpt_bytes += h.bytes;
+    g_k3_ckpt[slot] = t;
+    (void)utimensat(AT_FDCWD, path, NULL, 0);
+    fprintf(stderr, "ds4: K3 checkpoint files: the %u-token prefix read from the drive (%.0f MB in %.2f s)\n", n, (double)h.size / 1e6, now_sec() - t0);
+    return &g_k3_ckpt[slot];
+}
+#else   /* builds without /proc and posix_fadvise: saved prefixes stay in memory */
+static void k3_ckpt_disk_write(const k3_ckpt *c) { (void)c; }
+static const k3_ckpt *k3_ckpt_disk_load(const k3_gpu_buffers *b, const ds4_model *model, const int *ids, int n_ids, uint32_t cache_cap, int have_n) {
+    (void)b; (void)model; (void)ids; (void)n_ids; (void)cache_cap; (void)have_n;
+    return NULL;
+}
+#endif
+
 static float **g_k3_ckpt_host_conv = NULL, **g_k3_ckpt_host_state = NULL;   /* step 56: states read out during the pass */
 static bool k3_ckpt_save(const k3_gpu_buffers *b, const int *ids, int n) {
     const int cap = k3_ckpt_max();
@@ -67274,6 +67623,7 @@ static bool k3_ckpt_save(const k3_gpu_buffers *b, const int *ids, int n) {
         c->bytes = bytes; c->last_use = ++g_k3_ckpt_clock; g_k3_ckpt_bytes += bytes;
         if (!ok) { fprintf(stderr, "ds4: K3 checkpoint save failed\n"); k3_ckpt_free(c); return false; }
         fprintf(stderr, "ds4: K3 checkpoint: saved the state after %d shared prompt tokens (%.0f MB, %llu MB in use)\n", n, (double)bytes / 1e6, (unsigned long long)(g_k3_ckpt_bytes / 1000000ull));
+        k3_ckpt_disk_write(c);   /* step 163 */
         return true;
     }
 }
@@ -67745,6 +68095,10 @@ static void k3_hash_row(const char *what, uint32_t pos, uint32_t il, const ds4_g
     free(h);
 }
 extern char **environ;
+#include "ds4_k3_copy.h"   /* steps 160-162 */
+static k3_copy g_k3_copy;
+static bool g_k3_copy_block = false;   /* the block running holds copied drafts: its counts are not the draft model's */
+static uint32_t g_k3_block_acc = 0;    /* the drafts the last block kept */
 #define K3_QWEN_MAX_ROWS 256u   /* step 120: the widest verification block (anchor + drafts); step 128: 64, the default since 11 Nov 2026; step 147: up to 256 on request */
 static struct {
     bool tried, on, active;
@@ -68089,7 +68443,7 @@ static bool k3_qwen_block(k3_gpu_buffers *b, const ds4_model *model, const ds4_v
         if (!ds4_k3_layer_is_kda(il)) continue;
         ok = ds4_gpu_tensor_copy(g_k3_qwen.snap_state[il], 0, b->kda_state[il], 0, state_bytes) != 0 && ds4_gpu_tensor_copy(g_k3_qwen.snap_conv[il], 0, b->kda_conv[il], 0, conv_bytes) != 0;
     }
-    g_k3_qwen.t_snap += now_sec() - ts0;
+    if (!g_k3_copy_block) g_k3_qwen.t_snap += now_sec() - ts0;
     if (!ok) { fprintf(stderr, "ds4: K3 Qwen: KDA snapshot failed\n"); return false; }
     ds4_gpu_k3_set_verify(1);
     g_k3_verify_on = 1;
@@ -68126,7 +68480,7 @@ static bool k3_qwen_block(k3_gpu_buffers *b, const ds4_model *model, const ds4_v
     if (!ok) { g_k3_verify_on = 0; ds4_gpu_k3_set_verify(0); fprintf(stderr, "ds4: K3 Qwen: block forward failed at pos %u\n", pos); return false; }
     const double dt = now_sec() - t0;
     if (btr) { g_k3_trace_on = false; g_k3_trace_rows = 0; }
-    g_k3_qwen.t_fwd += dt;
+    if (!g_k3_copy_block) g_k3_qwen.t_fwd += dt;
     for (uint32_t i = 0; i < nb; i++) am[i] = sample_argmax(g_k3_qwen.vlog + (size_t)i * DS4_N_VOCAB, DS4_N_VOCAB);
     if (getenv("DS4_K3_QWEN_TRACE_TOP")) {   /* diagnostics: each row's two best tokens */
         for (uint32_t i = 0; i < nb; i++) {
@@ -68138,6 +68492,7 @@ static bool k3_qwen_block(k3_gpu_buffers *b, const ds4_model *model, const ds4_v
     }
     uint32_t acc = 0;
     while (acc + 1u < nb && am[acc] == blk[acc + 1u]) acc++;
+    g_k3_block_acc = acc;   /* step 160 */
     const uint32_t commit = acc + 1u;   /* the anchor and the accepted drafts */
     if (commit < nb) {
         /* the KDA states go back to the snapshot and forward over the committed rows; the MLA caches follow the position */
@@ -68159,10 +68514,10 @@ static bool k3_qwen_block(k3_gpu_buffers *b, const ds4_model *model, const ds4_v
                      DS4_N_KDA_HEAD, DS4_KDA_GATE_LOWER_BOUND, DS4_RMS_EPS, g_ds4_shape.kda_a_log_per_channel ? 1 : 0, commit) != 0;
         }
         if (g_k3_split_cut > 0) (void)ds4_gpu_set_current_device(0);   /* step 146 */
-        g_k3_qwen.t_replay += now_sec() - tr0;
+        if (!g_k3_copy_block) g_k3_qwen.t_replay += now_sec() - tr0;
         if (!ok) { g_k3_verify_on = 0; ds4_gpu_k3_set_verify(0); fprintf(stderr, "ds4: K3 Qwen: KDA replay failed at pos %u\n", pos); return false; }
-        if (acc == 0u) g_k3_qwen.n_zero++; else g_k3_qwen.n_partial++;
-    } else g_k3_qwen.n_full++;
+        if (!g_k3_copy_block) { if (acc == 0u) g_k3_qwen.n_zero++; else g_k3_qwen.n_partial++; }
+    } else if (!g_k3_copy_block) g_k3_qwen.n_full++;
     g_k3_verify_on = 0;
     ds4_gpu_k3_set_verify(0);
     if (k3_hash_on()) for (uint32_t i = 0; i < commit; i++) fprintf(stderr, "ds4: K3 hash logits pos %u %016llx\n", pos + i, (unsigned long long)k3_fnv(g_k3_qwen.vlog + (size_t)i * DS4_N_VOCAB, (size_t)DS4_N_VOCAB * sizeof(float)));
@@ -68184,17 +68539,18 @@ static bool k3_qwen_block(k3_gpu_buffers *b, const ds4_model *model, const ds4_v
         }
         produced++;
         k3_qwen_push(nx);
+        k3_copy_push(&g_k3_copy, nx);   /* step 160 */
         if (g_k3_rec) { fprintf(g_k3_rec, "%d\n", nx); fflush(g_k3_rec); }
         if (produced - *produced_io >= n_left) stop = true;
     }
-    g_k3_qwen.n_blocks++; g_k3_qwen.n_drafts += nd; g_k3_qwen.n_acc += acc; g_k3_qwen.n_blk_tokens += (uint64_t)(produced - *produced_io); g_k3_qwen.by_rows[nb]++;
+    if (!g_k3_copy_block) { g_k3_qwen.n_blocks++; g_k3_qwen.n_drafts += nd; g_k3_qwen.n_acc += acc; g_k3_qwen.n_blk_tokens += (uint64_t)(produced - *produced_io); g_k3_qwen.by_rows[nb]++; }
     *produced_io = produced; *stop_io = stop; *pos_io = pos + commit; *token_io = bonus;
-    g_k3_qwen.t_block += now_sec() - t0;
+    if (!g_k3_copy_block) g_k3_qwen.t_block += now_sec() - t0;
     if (getenv("DS4_K3_TRACE_TIMING") || getenv("DS4_K3_QWEN_BLOCK_LOG")) {   /* DS4_K3_QWEN_BLOCK_LOG: the line without the timing marks */
         double wait1 = 0.0; uint64_t bytes1 = 0, cd1 = 0, ch1 = 0, cm1 = 0;
         ds4_gpu_k3_moe_raw_stats(&wait1, &bytes1); ds4_gpu_k3_cache_stats(&cd1, &ch1, &cm1);
-        fprintf(stderr, "ds4: K3 Qwen block %llu: %u rows at pos %u, accepted %u of %u, %.3f s (forward %.3f), waited %.3f s for %.2f GB; expert cache device %llu, host %llu, disk %llu; phases attn %.3f route %.3f moe %.3f\n",
-                (unsigned long long)g_k3_qwen.n_blocks, nb, pos, acc, nd, now_sec() - t0, dt, wait1 - wait0, (double)(bytes1 - bytes0) / 1e9,
+        fprintf(stderr, "ds4: K3 %s block %llu: %u rows at pos %u, accepted %u of %u, %.3f s (forward %.3f), waited %.3f s for %.2f GB; expert cache device %llu, host %llu, disk %llu; phases attn %.3f route %.3f moe %.3f\n",
+                g_k3_copy_block ? "copy" : "Qwen", g_k3_copy_block ? (unsigned long long)g_k3_copy.st_blocks + 1ull : (unsigned long long)g_k3_qwen.n_blocks, nb, pos, acc, nd, now_sec() - t0, dt, wait1 - wait0, (double)(bytes1 - bytes0) / 1e9,
                 (unsigned long long)(cd1 - cd0), (unsigned long long)(ch1 - ch0), (unsigned long long)(cm1 - cm0),
                 g_k3_pf_attn - pa0, g_k3_pf_route - pr0, g_k3_pf_moe - pm0);
     }
@@ -68489,6 +68845,10 @@ static int generate_k3_cuda_argmax(
     int ckpt_split = 0;
     if (k3_ckpt_max() > 0 && pos0 == 0 && !getenv("DS4_K3_NO_SESSION")) {
         const k3_ckpt *c = k3_ckpt_find(ids, n_ids, cache_cap);
+        if (k3_ckpt_dir()) {   /* step 163: a longer prefix saved on the drive, by this process or an earlier one */
+            const k3_ckpt *cd = k3_ckpt_disk_load(&b, model, ids, n_ids, cache_cap, c ? c->n : 0);
+            c = cd ? cd : k3_ckpt_find(ids, n_ids, cache_cap);   /* the load may have made room by dropping the one found */
+        }
         if (c) {
             if (k3_ckpt_restore(&b, c)) {
                 for (int i = 0; i < c->n; i++) k3_session_push(c->tokens[i]);
@@ -68525,6 +68885,21 @@ static int generate_k3_cuda_argmax(
         else fprintf(stderr, "ds4: K3 drafter: sidecar holds %u rows, the request starts at %u: drafting off for this request\n", g_k3_draft.len, pos0);
     }
     k3_qwen_begin(vocab, ids, n_ids);   /* step 79 */
+    {   /* step 160: the copy index starts from this prompt; image positions (one placeholder id each) are left out */
+        static int copy_set = 0;
+        if (!copy_set) {
+            copy_set = 1; k3_copy_settings(&g_k3_copy);
+            if (g_k3_copy.mode) fprintf(stderr, "ds4: K3 copy (steps 160-162): %s, blocks of up to %u rows, a draft must save %.2f plain steps%s\n",
+                                        g_k3_copy.mode == 2 ? "scored only (shadow), no blocks" : "drafts copied from the context", g_k3_copy.max_d + 1u, g_k3_copy.margin,
+                                        g_k3_copy.cut_qwen ? "; the draft model's proposals are cut where the model turned a token down before" : "");
+        }
+        uint32_t *sp = NULL, *sn = NULL;
+        if (g_k3_img_n > 0) { sp = xmalloc(sizeof(uint32_t) * (size_t)g_k3_img_n); sn = xmalloc(sizeof(uint32_t) * (size_t)g_k3_img_n); }
+        for (int j = 0; j < g_k3_img_n; j++) { sp[j] = g_k3_img[j].pos; sn[j] = g_k3_img[j].n; }
+        k3_copy_begin(&g_k3_copy, ids, (uint32_t)n_ids, special_base, sp, sn, (uint32_t)(g_k3_img_n > 0 ? g_k3_img_n : 0));
+        free(sp); free(sn);
+        if (g_k3_copy.active && g_k3_sampling.temperature > 0.0f) { fprintf(stderr, "ds4: K3 copy: greedy decoding only; off for this request\n"); g_k3_copy.active = false; }
+    }
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     uint32_t pos = 0;
     int token = ids[0];
@@ -68724,7 +69099,7 @@ static int generate_k3_cuda_argmax(
             token = ids[pos];
             continue;
         }
-        if (g_k3_qwen.active && !k3_qwen_bufs()) g_k3_qwen.active = false;   /* step 120b: block buffers first, the cache grows around them */
+        if ((g_k3_qwen.active || (g_k3_copy.active && g_k3_copy.mode == 1)) && !k3_qwen_bufs()) { g_k3_qwen.active = false; g_k3_copy.active = false; }   /* step 120b: block buffers first, the cache grows around them */
         ds4_gpu_k3_cache_grow();   /* the spine is fully staged by now: size the device expert cache (once) */
         if (g_k3_split_cut > 0) (void)ds4_gpu_k3_g1_restore();   /* step 155: the second card's slabs, if a prompt pass borrowed them */
         /* generation */
@@ -68743,17 +69118,46 @@ static int generate_k3_cuda_argmax(
         token = next;
         if (oracle && oracle_width >= 1u) break;   /* step 44: the rest of the answer goes through the block verifier */
         if (g_k3_draft.active) break;              /* step 45: the rest of the answer is drafted and verified in blocks */
-        if (g_k3_qwen.active) {                    /* step 79: blocks while the gate passes; otherwise the next plain step, as ever */
-            k3_qwen_push(next);
+        if (g_k3_copy.active) {                    /* step 160: the copy index and the plain step's time */
+            k3_copy_push(&g_k3_copy, next);
+            if (produced > 1) k3_copy_plain(&g_k3_copy, now_sec() - t0);
+        }
+        if (g_k3_qwen.active || g_k3_copy.active) {   /* step 79: blocks while the gate passes; step 160: or while a copy is likely enough; otherwise the next plain step, as ever */
+            if (g_k3_qwen.active) k3_qwen_push(next);
+            else g_k3_qwen.n_pending = 0;          /* no sidecar reads the history this request */
             bool qstop = false;
-            while (g_k3_qwen.active && !qstop && n_predict - produced >= 2 && pos + 2u < cache_cap && !g_k3_cancel) {
+            while ((g_k3_qwen.active || g_k3_copy.active) && !qstop && n_predict - produced >= 2 && pos + 2u < cache_cap && !g_k3_cancel) {
                 int prop[K3_QWEN_MAX_ROWS - 1u]; uint32_t nd = 0, want = (uint32_t)(n_predict - produced - 1);   /* step 120 */
                 if (want > k3_qwen_rows() - 1u) want = k3_qwen_rows() - 1u;   /* step 92b */
                 if (pos + want + 1u >= cache_cap) want = cache_cap - pos - 2u;
-                if (g_k3_qwen.hs_wait && !k3_qwen_ready()) { if (g_k3_qwen.active) g_k3_qwen.n_early++; break; }   /* step 94b: plain steps while the sidecar loads */
-                if (!k3_qwen_bufs()) { g_k3_qwen.active = false; break; }   /* step 120b */
-                if (!k3_qwen_propose(prop, want, &nd) || nd == 0u) break;
-                if (!k3_qwen_block(&b, model, vocab, weights, &pos, &token, prop, nd, n_predict - produced, emit, emit_ud, special_base, &produced, &qstop)) { ok_session_keep = false; qstop = true; }
+                /* step 160: this position's copy candidate; one expected to give DS4_K3_COPY_FIRST tokens or more is drafted without
+                   asking the draft model, a weaker one only when the draft model has nothing */
+                int cp[K3_COPY_MAXD]; const uint32_t ncopy = g_k3_copy.active ? k3_copy_propose(&g_k3_copy, cp, want) : 0u;
+                bool from_copy = false;
+                uint32_t cut = 0;
+                if (ncopy && (k3_copy_sure(&g_k3_copy) || !g_k3_qwen.active)) { memcpy(prop, cp, sizeof(int) * ncopy); nd = ncopy; from_copy = true; }
+                else if (g_k3_qwen.active && g_k3_qwen.hs_wait && !k3_qwen_ready()) {   /* step 94b: plain steps while the sidecar loads */
+                    if (g_k3_qwen.active) g_k3_qwen.n_early++;
+                    if (ncopy) { memcpy(prop, cp, sizeof(int) * ncopy); nd = ncopy; from_copy = true; }
+                } else if (g_k3_qwen.active) {
+                    int qp[K3_QWEN_MAX_ROWS - 1u]; uint32_t qn = 0;
+                    if (!k3_qwen_propose(qp, want, &qn)) qn = 0;
+                    if (qn) {
+                        memcpy(prop, qp, sizeof(int) * qn); nd = qn;
+                        cut = g_k3_copy.active ? k3_copy_cut(&g_k3_copy, prop, nd) : nd;   /* step 161: where the record says a token is turned down */
+                        if (g_k3_copy.cut_qwen && cut < nd) nd = cut;
+                    }
+                    if (nd == 0u && ncopy) { memcpy(prop, cp, sizeof(int) * ncopy); nd = ncopy; from_copy = true; }
+                }
+                if (nd == 0u) break;
+                if (!k3_qwen_bufs()) { g_k3_qwen.active = false; g_k3_copy.active = false; break; }   /* step 120b */
+                if (from_copy) k3_copy_drafted(&g_k3_copy);
+                g_k3_copy_block = from_copy;
+                const double tb0 = now_sec();
+                const bool bok = k3_qwen_block(&b, model, vocab, weights, &pos, &token, prop, nd, n_predict - produced, emit, emit_ud, special_base, &produced, &qstop);
+                g_k3_copy_block = false;
+                if (!bok) { ok_session_keep = false; qstop = true; }
+                else if (g_k3_copy.active) k3_copy_result(&g_k3_copy, prop, nd, g_k3_block_acc, from_copy, from_copy ? nd : cut, now_sec() - tb0);
                 if (produced >= n_predict) qstop = true;
             }
             if (qstop || g_k3_cancel) break;
@@ -68766,6 +69170,7 @@ static int generate_k3_cuda_argmax(
         produced += k3_oracle_verify_run(&b, model, vocab, weights, &pos, &token, oracle, n_oracle, oracle_width,
                                          n_predict - produced, emit, emit_ud, special_base);
     }
+    k3_copy_report(&g_k3_copy); g_k3_copy.active = false;   /* step 160 */
     k3_qwen_end();   /* step 79 */
     if (oracle_rec) fclose(oracle_rec);
     g_k3_rec = NULL;
