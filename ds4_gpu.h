@@ -3947,6 +3947,8 @@ void ds4_gpu_set_streaming_expert_cache_layers(uint32_t layers);   /* CUDA: laye
 void ds4_gpu_set_streaming_expert_cache_span(uint64_t lo, uint64_t hi);   /* CUDA: file range of that card's routed experts */
 int ds4_gpu_stream_expert_host_tier_prime(const ds4_gpu_stream_expert_table *table);   /* CUDA: build the RAM tier now */
 void ds4_gpu_k3_g1_report(void);   /* step 140: one line about the second card (DS4_K3_GPU1), nothing without one */
+uint64_t ds4_gpu_k3_g1_lend(void);   /* step 155: the second card's slabs make room for a prompt pass; bytes freed */
+int ds4_gpu_k3_g1_restore(void);     /* step 155: and are made again when generation starts */
 void ds4_gpu_k3_split_second_card(int cuda_device, uint32_t reserve_mb);   /* step 146: the spine split's second card and what its expert cache leaves free */
 void ds4_gpu_k3_set_f32_act(int on);   /* step 106: K3 spine and prompt-pass expert matmuls with fp32 activations */
 int ds4_gpu_k3_kvb_chain_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset,

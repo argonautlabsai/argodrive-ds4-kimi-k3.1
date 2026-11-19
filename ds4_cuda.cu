@@ -1716,6 +1716,10 @@ extern "C" int ds4_gpu_register_support_map(const void *map, uint64_t size, uint
     return 1;
 }
 
+/* step 155: weights that are not in the model file (Kimi's DSA indexer) with a copy on every card; see
+ * ds4_gpu_k3_register_aux_weights. With one card they are a range of the model cache, as before. */
+struct k3_aux_range { const void *host; uint64_t bytes; char *dev[DS4_MAX_GPUS]; };
+static std::vector<k3_aux_range> g_k3_aux;
 static const char *cuda_resolve_weight_ptr(const void *model_map,
                                             uint64_t offset,
                                             uint64_t bytes,
@@ -1723,6 +1727,11 @@ static const char *cuda_resolve_weight_ptr(const void *model_map,
                                             const char *label) {
     if (g_n_gpus <= 1) {
         return cuda_model_range_ptr(model_map, offset, bytes, label);
+    }
+    for (const k3_aux_range &a : g_k3_aux) {   /* step 155 */
+        if (a.host != model_map) continue;
+        if (logical_tier < 0 || logical_tier >= g_n_gpus || offset > a.bytes || bytes > a.bytes - offset) return NULL;
+        return a.dev[logical_tier] + offset;
     }
     if (g_support_host_base && model_map == g_support_host_base) {
         offset += g_support_offset_bias;
@@ -40965,7 +40974,19 @@ extern "C" uint32_t ds4_gpu_k3_attn_max_pos(void) {
     return m > 8192u ? m : 8192u;
 }
 static bool k3_attn_smem(const void *fn, uint8_t *raised, size_t bytes) {
-    if (bytes <= ((size_t)48 << 10) || *raised) return true;
+    if (bytes <= ((size_t)48 << 10)) return true;
+    if (g_n_gpus > 1) {   /* step 155: the allowance belongs to a card's context: once per card and kernel */
+        static std::vector<const void *> done[DS4_MAX_GPUS];
+        std::vector<const void *> &v = done[g_stream_tier];
+        for (const void *f : v) if (f == fn) return true;
+        if (cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, k3_attn_optin() - 1024) != cudaSuccess) {
+            fprintf(stderr, "ds4: K3 attention: cannot raise the shared memory limit (%s)\n", cudaGetErrorString(cudaGetLastError()));
+            return false;
+        }
+        v.push_back(fn);
+        return true;
+    }
+    if (*raised) return true;
     if (cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, k3_attn_optin() - 1024) != cudaSuccess) {
         fprintf(stderr, "ds4: K3 attention: cannot raise the shared memory limit (%s)\n", cudaGetErrorString(cudaGetLastError()));
         return false;
@@ -41583,6 +41604,7 @@ struct k3_raw_pool {
     int g1_dev = -1, g1_mode = 1;                     /* the card; 1 = plain decode steps compute there, 0 = every use copies the slab over */
     uint32_t g1_base = 0, g1_n = 0;
     uint8_t *g1_region = nullptr;
+    bool g1_lent = false;                             /* step 155: its slabs were given up for a prompt pass (ds4_gpu_k3_g1_lend) */
     cudaStream_t g1_stream = nullptr, g1_cp = nullptr;   /* that card's kernels and slab reads; its copy-downs */
     cudaStream_t g1_up[8] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}; uint32_t g1_n_up = 0;   /* uploads into its slabs */
     std::vector<cudaEvent_t> host_free1;              /* host slab -> its last use by a stream of that card */
@@ -43690,6 +43712,50 @@ extern "C" uint64_t ds4_gpu_k3_cache_lend(void) {
             n1 - n0, (double)bytes / 1e9, held, k3_now_sec() - t0);
     return bytes;
 }
+/* step 155 (spine split): a long prompt pass needs its second set of batch buffers on the second card. That card's expert
+   slabs are given up for the pass, as the first card lends its grown region: the pool quiesces, the slabs are dropped and
+   stay out of use, their region is freed. ds4_gpu_k3_g1_restore (the driver calls it when generation starts) makes the
+   region again from what is free then, less DS4_K3_GPU1_RESTORE_RESERVE_MB (2560). Returns the bytes freed. */
+extern "C" uint64_t ds4_gpu_k3_g1_lend(void) {
+    k3_raw_pool &p = k3_raw_get();
+    if (!p.ready || !p.g1_n || !p.g1_region || p.g1_lent) return 0;
+    const double t0 = k3_now_sec();
+    if (!k3_raw_quiesce(p)) return 0;
+    bool ok = cudaSetDevice(p.g1_dev) == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess;
+    ok = cudaSetDevice(p.device) == cudaSuccess && ok && cudaDeviceSynchronize() == cudaSuccess;
+    if (!ok) { fprintf(stderr, "ds4: kimi-k3 second card: cannot lend its slabs (%s)\n", cudaGetErrorString(cudaGetLastError())); return 0; }
+    uint32_t held = 0;
+    for (uint32_t s = p.g1_base; s < p.g1_base + p.g1_n; s++) { held += p.dc.key[s] != K3_NOKEY; p.dc.drop(s); p.dc.pinned[s] = 1; }
+    (void)cudaSetDevice(p.g1_dev);
+    cudaFree(p.g1_region);
+    (void)cudaSetDevice(p.device);
+    p.g1_region = nullptr; p.g1_lent = true;
+    const uint64_t bytes = (uint64_t)p.g1_n * p.file_bytes;
+    fprintf(stderr, "ds4: kimi-k3 second card lends its %u slabs (%.1f GB, %u experts dropped) to the prompt pass in %.2f s; they are made again when generation starts\n",
+            p.g1_n, (double)bytes / 1e9, held, k3_now_sec() - t0);
+    return bytes;
+}
+extern "C" int ds4_gpu_k3_g1_restore(void) {
+    k3_raw_pool &p = k3_raw_get();
+    if (!p.ready || !p.g1_n || !p.g1_lent) return 1;
+    if (!k3_raw_quiesce(p)) return 1;   /* the next generation start tries again */
+    size_t free_b = 0, total_b = 0; uint8_t *region = nullptr; uint32_t n = 0;
+    bool ok = cudaSetDevice(p.g1_dev) == cudaSuccess && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess;
+    if (ok) {
+        const uint64_t reserve = (uint64_t)k3_env_u32("DS4_K3_GPU1_RESTORE_RESERVE_MB", 2560u) << 20;
+        const uint64_t fit = free_b > reserve ? (free_b - reserve) / p.file_bytes : 0u;
+        n = fit > p.g1_n ? p.g1_n : (uint32_t)fit;
+        while (n >= 16u && cudaMalloc(&region, p.file_bytes * (size_t)n) != cudaSuccess) { (void)cudaGetLastError(); n /= 2u; region = nullptr; }
+        if (!region) n = 0;
+    }
+    (void)cudaSetDevice(p.device);
+    if (!region) { fprintf(stderr, "ds4: kimi-k3 second card: its slabs could not be made again yet (%.1f GB free there)\n", (double)free_b / 1e9); return 1; }
+    for (uint32_t s = 0; s < n; s++) { p.dev_ptr[p.g1_base + s] = region + (size_t)s * p.file_bytes; p.dc.pinned[p.g1_base + s] = 0; }
+    p.g1_region = region; p.g1_lent = false;
+    fprintf(stderr, "ds4: kimi-k3 second card: %u of its %u slabs made again (%.1f GB; %.1f GB was free there)\n", n, p.g1_n,
+            (double)n * p.file_bytes / 1e9, (double)free_b / 1e9);
+    return 1;
+}
 /* step 97: what a prompt pass of n_tok rows would add to the pool's scratch, which grows on demand and is kept: the compact
    partials, the expert GEMM scratch, the mid rows and the token lists (each is freed before it is made larger) */
 extern "C" uint64_t ds4_gpu_k3_pass_scratch_need(uint32_t n_tok, uint32_t n_used, uint32_t ff, uint32_t latent) {
@@ -44007,6 +44073,21 @@ extern "C" int ds4_gpu_k3_mla_attend_batch_tensor(ds4_gpu_tensor *heads_out, con
    selected they do exactly what k3_mla_attend_kernel and k3_mla_attend_batch_kernel do. */
 extern "C" int ds4_gpu_k3_register_aux_weights(const void *host, uint64_t bytes) {
     if (!host || bytes == 0u) return 0;
+    if (g_n_gpus > 1) {   /* step 155: a copy on every card, found by cuda_resolve_weight_ptr */
+        for (const k3_aux_range &a : g_k3_aux) if (a.host == host) return 1;
+        k3_aux_range a = {host, bytes, {}};
+        for (int t = 0; t < g_n_gpus; t++) {
+            void *dev = NULL; int ok = 0;
+            WITH_DEVICE(g_gpu[t].device_id) {
+                ok = cuda_ok(cudaMalloc(&dev, bytes), "K3 DSA weights alloc") &&
+                     cuda_ok(cudaMemcpy(dev, host, bytes, cudaMemcpyHostToDevice), "K3 DSA weights upload");
+            }
+            if (!ok) return 0;
+            a.dev[t] = (char *)dev;
+        }
+        g_k3_aux.push_back(a);
+        return 1;
+    }
     for (const cuda_model_range &r : g_model_ranges) if (r.host_base == host) return 1;
     void *dev = NULL;
     if (!cuda_ok(cudaMalloc(&dev, bytes), "K3 DSA weights alloc")) return 0;
