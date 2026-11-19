@@ -10,6 +10,10 @@
 #include <sys/stat.h>
 #include <sys/uio.h>   /* step 132 */
 #include <unistd.h>
+#include <dirent.h>
+#if defined(__x86_64__)
+#include <nmmintrin.h>
+#endif
 #ifdef __APPLE__
 /* macOS has no O_DIRECT and no posix_fadvise: a private flag asks for F_NOCACHE after open (uncached reads, no alignment rules) */
 #define K3_O_DIRECT_MAC 0x40000000
@@ -58,6 +62,91 @@ static char g_dir_d[4096];   /* step 67: tier D (DS4_K3_EXPERT_DIR_D), a fourth 
 static uint64_t g_file_bytes;
 static bool g_active;
 static atomic_uint_fast64_t g_stat_reads, g_stat_bytes, g_stat_opens;
+
+/* ---- step 153: checksums ---- */
+#if defined(__x86_64__)
+__attribute__((target("sse4.2")))
+static uint32_t k3_crc32c_hw(uint32_t crc, const uint8_t *p, size_t n) {
+    uint64_t c = crc;
+    while (n >= 8u) { uint64_t v; memcpy(&v, p, 8); c = _mm_crc32_u64(c, v); p += 8; n -= 8u; }
+    while (n--) c = _mm_crc32_u8((uint32_t)c, *p++);
+    return (uint32_t)c;
+}
+#endif
+static uint32_t k3_crc32c_sw(uint32_t crc, const uint8_t *p, size_t n) {
+    static uint32_t tab[256]; static atomic_int ready;
+    if (!atomic_load(&ready)) {
+        for (uint32_t i = 0; i < 256u; i++) { uint32_t c = i; for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0x82F63B78u & (0u - (c & 1u))); tab[i] = c; }
+        atomic_store(&ready, 1);
+    }
+    while (n--) crc = (crc >> 8) ^ tab[(crc ^ *p++) & 255u];
+    return crc;
+}
+uint32_t ds4_k3_crc32c(const void *data, size_t len) {
+#if defined(__x86_64__)
+    static int hw = -1;
+    if (hw < 0) hw = __builtin_cpu_supports("sse4.2") ? 1 : 0;
+    if (hw) return ~k3_crc32c_hw(0xFFFFFFFFu, (const uint8_t *)data, len);
+#endif
+    return ~k3_crc32c_sw(0xFFFFFFFFu, (const uint8_t *)data, len);
+}
+/* the table: "K3SUMS1\n", u64 file bytes, u64 first half's bytes, u32 experts, u32 0, then per expert u32 layer, expert, sum, sum */
+int ds4_k3_expert_sums_read(const char *path, uint32_t *sums2, uint8_t *has, uint32_t n_keys, uint64_t *file_bytes, uint64_t *half_bytes) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    char magic[8]; uint64_t fb = 0, half = 0; uint32_t n = 0, zero = 0; int got = 0;
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "K3SUMS1\n", 8) != 0 || fread(&fb, 8, 1, f) != 1 || fread(&half, 8, 1, f) != 1 ||
+        fread(&n, 4, 1, f) != 1 || fread(&zero, 4, 1, f) != 1) { fclose(f); return -1; }
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t r[4];
+        if (fread(r, 4, 4, f) != 4) { fclose(f); return -1; }
+        const uint32_t key = (r[0] << 10) | r[1];
+        if (r[1] >= 1024u || key >= n_keys) continue;
+        sums2[2u * key] = r[2]; sums2[2u * key + 1u] = r[3]; has[key] = 1; got++;
+    }
+    fclose(f);
+    if (file_bytes) *file_bytes = fb;
+    if (half_bytes) *half_bytes = half;
+    return got;
+}
+int ds4_k3_expert_sums_write(const char *path, const uint32_t *sums2, const uint8_t *has, uint32_t n_keys, uint64_t file_bytes, uint64_t half_bytes) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+    uint32_t n = 0, zero = 0;
+    for (uint32_t k = 0; k < n_keys; k++) n += has[k] ? 1u : 0u;
+    int ok = fwrite("K3SUMS1\n", 1, 8, f) == 8 && fwrite(&file_bytes, 8, 1, f) == 1 && fwrite(&half_bytes, 8, 1, f) == 1 &&
+             fwrite(&n, 4, 1, f) == 1 && fwrite(&zero, 4, 1, f) == 1;
+    for (uint32_t k = 0; ok && k < n_keys; k++) {
+        if (!has[k]) continue;
+        const uint32_t r[4] = {k >> 10, k & 1023u, sums2[2u * k], sums2[2u * k + 1u]};
+        ok = fwrite(r, 4, 4, f) == 4;
+    }
+    return fclose(f) == 0 && ok;
+}
+static uint32_t *g_dird_sums; static uint8_t *g_dird_has; static uint64_t g_dird_half;   /* tier D's table; NULL: not checked */
+static atomic_uint_fast64_t g_dird_checked, g_dird_wrong, g_dird_n;
+static atomic_int g_dird_off;        /* 1 once three reads were wrong */
+static uint32_t g_dird_fault;        /* test fixture DS4_K3_EXPERT_DIR_D_FAULT=<n>: every n-th read from tier D comes back as zeros */
+void ds4_k3_expert_source_dird_stats(uint64_t *checked, uint64_t *wrong, int *off) {
+    if (checked) *checked = atomic_load(&g_dird_checked);
+    if (wrong) *wrong = atomic_load(&g_dird_wrong);
+    if (off) *off = atomic_load(&g_dird_off);
+}
+static void k3_dird_report(void) {
+    fprintf(stderr, "ds4: kimi-k3 tier D: %llu reads checked against their checksums, %llu wrong and served from another home%s\n",
+            (unsigned long long)atomic_load(&g_dird_checked), (unsigned long long)atomic_load(&g_dird_wrong),
+            atomic_load(&g_dird_off) ? "; tier D was then left alone" : "");
+}
+/* 1 the bytes match, 0 they do not, -1 the table cannot check this range (not whole halves) */
+static int k3_dird_check(uint32_t layer, uint32_t expert, const uint8_t *base, uint64_t off, uint64_t len) {
+    const uint32_t key = (layer << 10) | expert;
+    if (!g_dird_sums || layer >= 128u || expert >= 1024u || !g_dird_has[key]) return -1;
+    const uint64_t H = g_dird_half, F = g_file_bytes; const uint32_t *s = g_dird_sums + 2u * (size_t)key;
+    if (off == 0 && len == H) return ds4_k3_crc32c(base, (size_t)H) == s[0];
+    if (off == H && len == F - H) return ds4_k3_crc32c(base + H, (size_t)(F - H)) == s[1];
+    if (off == 0 && len == F) return ds4_k3_crc32c(base, (size_t)H) == s[0] && ds4_k3_crc32c(base + H, (size_t)(F - H)) == s[1];
+    return -1;
+}
 static atomic_uint_fast64_t g_stat_reads_tier[4], g_stat_ns_tier[4];   /* per tier: primary (0) / dir_b (1) / dir_c (2) / dir_d (3) */
 
 /* step M1: experts read straight from the downloaded checkpoint (DS4_K3_EXPERT_CKPT_INDEX), for those missing from the directories */
@@ -139,11 +228,40 @@ void ds4_k3_expert_source_configure(const char *primary_dir, const char *dir_b, 
         char probe[4600];
         struct stat st;
         snprintf(probe, sizeof(probe), "%s/L1-E0.bin", dd);
-        if (stat(probe, &st) == 0 && (uint64_t)st.st_size == file_bytes) {
+        bool found = stat(probe, &st) == 0 && (uint64_t)st.st_size == file_bytes;
+        if (!found) {   /* step 153: a home that holds a part of the experts need not hold the first one */
+            DIR *d = opendir(dd); struct dirent *de;
+            while (d && !found && (de = readdir(d)) != NULL) {
+                unsigned l = 0, e = 0;
+                if (sscanf(de->d_name, "L%u-E%u.bin", &l, &e) != 2) continue;
+                snprintf(probe, sizeof(probe), "%s/%s", dd, de->d_name);
+                found = stat(probe, &st) == 0 && (uint64_t)st.st_size == file_bytes;
+            }
+            if (d) closedir(d);
+        }
+        const char *sums = getenv("DS4_K3_EXPERT_DIR_D_SUMS"), *unv = getenv("DS4_K3_EXPERT_DIR_D_UNVERIFIED");
+        if (!found) {
+            fprintf(stderr, "ds4: kimi-k3 expert tier D ignored: no expert file of %llu bytes in %s\n", (unsigned long long)file_bytes, dd);
+        } else if (sums && sums[0]) {   /* step 153: every read from this home is checked */
+            g_dird_sums = calloc((size_t)128u * 1024u * 2u, sizeof(uint32_t)); g_dird_has = calloc((size_t)128u * 1024u, 1u);
+            uint64_t fb = 0;
+            const int n = g_dird_sums && g_dird_has ? ds4_k3_expert_sums_read(sums, g_dird_sums, g_dird_has, 128u * 1024u, &fb, &g_dird_half) : -1;
+            if (n > 0 && fb == file_bytes && g_dird_half > 0 && g_dird_half < file_bytes) {
+                snprintf(g_dir_d, sizeof(g_dir_d), "%s", dd);
+                { const char *fx = getenv("DS4_K3_EXPERT_DIR_D_FAULT"); g_dird_fault = fx ? (uint32_t)atoi(fx) : 0u; }
+                fprintf(stderr, "ds4: kimi-k3 expert tier D (fourth home): %s; every read is checked against %s (%d experts)%s\n", dd, sums, n,
+                        g_dird_fault ? "; TEST FIXTURE: some reads are zeroed" : "");
+                atexit(k3_dird_report);
+            } else {
+                free(g_dird_sums); free(g_dird_has); g_dird_sums = NULL; g_dird_has = NULL;
+                fprintf(stderr, "ds4: kimi-k3 expert tier D ignored: %s is not a checksum table for these files\n", sums);
+            }
+        } else if (unv && unv[0] && strcmp(unv, "0") != 0) {
             snprintf(g_dir_d, sizeof(g_dir_d), "%s", dd);
-            fprintf(stderr, "ds4: kimi-k3 expert tier D (fourth home): %s\n", dd);
+            fprintf(stderr, "ds4: kimi-k3 expert tier D (fourth home): %s, reads NOT checked (DS4_K3_EXPERT_DIR_D_UNVERIFIED)\n", dd);
         } else {
-            fprintf(stderr, "ds4: kimi-k3 expert tier D ignored: %s/L1-E0.bin missing or not %llu bytes\n", dd, (unsigned long long)file_bytes);
+            fprintf(stderr, "ds4: kimi-k3 expert tier D ignored: no checksum table (DS4_K3_EXPERT_DIR_D_SUMS, written by tools/kimi-k3/k3_expert_sums.c); "
+                            "DS4_K3_EXPERT_DIR_D_UNVERIFIED=1 reads it unchecked\n");
         }
     }
 }
@@ -530,8 +648,9 @@ static void k3_dirb_bitmap_build(void) {
 int ds4_k3_expert_source_has_tier(uint32_t layer, uint32_t expert, int tier) {
     if (tier == 0) return ds4_k3_expert_source_is_primary(layer, expert);
     if (tier == 3) {   /* step 67 */
-        if (g_dir_d[0] == '\0') return 0;
+        if (g_dir_d[0] == '\0' || atomic_load(&g_dird_off)) return 0;   /* step 153 */
         if (!g_dird_listed) k3_dird_bitmap_build();
+        if (g_dird_sums && (layer >= 128u || expert >= 1024u || !g_dird_has[(layer << 10) | expert])) return 0;   /* step 153: only what the table can check */
         if (!g_dird_bits || layer >= 128u || expert >= 1024u) return 1;
         const size_t bit = (size_t)layer * 1024u + expert;
         return (g_dird_bits[bit >> 3] >> (bit & 7u)) & 1u;
@@ -644,6 +763,20 @@ int ds4_k3_expert_source_read_range_tier(uint32_t layer, uint32_t expert, void *
            leave its pages in the guest page cache beside the pinned arena: drop them, they are never read twice here */
         if (ok && attempt == 1) (void)posix_fadvise(fd, (off_t)off, (off_t)len, POSIX_FADV_DONTNEED);
         close(fd);
+        if (ok && tier == 3 && g_dird_sums) {   /* step 153: what tier D returned against the table */
+            if (g_dird_fault && (atomic_fetch_add(&g_dird_n, 1) + 1u) % g_dird_fault == 0u) memset(out, 0, (size_t)len);
+            atomic_fetch_add(&g_dird_checked, 1);
+            if (k3_dird_check(layer, expert, (const uint8_t *)base, off, len) != 1) {
+                const uint64_t bad = atomic_fetch_add(&g_dird_wrong, 1) + 1u;
+                if (bad <= 3u) fprintf(stderr, "ds4: kimi-k3 tier D: L%u-E%u, bytes %llu..%llu do not match their checksum; read again from another home\n",
+                                       layer, expert, (unsigned long long)off, (unsigned long long)(off + len));
+                if (bad == 3u && !g_dird_fault) {
+                    atomic_store(&g_dird_off, 1);
+                    fprintf(stderr, "ds4: kimi-k3 tier D is left alone for the rest of this process: three reads returned wrong data\n");
+                }
+                return ds4_k3_expert_source_read_range_tier(layer, expert, base, off, len, direct, -1, tier_used);
+            }
+        }
         if (ok) {
             if (tier_used) *tier_used = tier;
             atomic_fetch_add(&g_stat_reads, 1);

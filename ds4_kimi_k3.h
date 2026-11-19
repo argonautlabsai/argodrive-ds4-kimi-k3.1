@@ -36,6 +36,14 @@ void ds4_k3_expert_source_v2_stats(uint64_t *reads, uint64_t *expand_ns);   /* s
 int  ds4_k3_expert_source_read_range_tier(uint32_t layer, uint32_t expert, void *base, uint64_t off, uint64_t len,
                                           int direct, int want_tier, int *tier_used);   /* step 38: chunk read from one tier (-1 chain) */
 void ds4_k3_expert_source_tier_stat(int tier, uint64_t *reads, uint64_t *ns);   /* 0 primary, 1 dir_b (Samsung), 2 dir_c */
+/* step 153: checksums of the expert files. A table holds, per expert, the CRC32C of the two halves of its raw-v1 image
+ * (tools/kimi-k3/k3_expert_sums.c writes it from a trusted copy). With DS4_K3_EXPERT_DIR_D_SUMS=<table> every read from
+ * tier D is checked; a read that does not match is served from another home, and after three of them tier D is left alone
+ * for the rest of the process. */
+uint32_t ds4_k3_crc32c(const void *data, size_t len);
+int  ds4_k3_expert_sums_read(const char *path, uint32_t *sums2, uint8_t *has, uint32_t n_keys, uint64_t *file_bytes, uint64_t *half_bytes);   /* experts read, -1 on error; key = layer << 10 | expert */
+int  ds4_k3_expert_sums_write(const char *path, const uint32_t *sums2, const uint8_t *has, uint32_t n_keys, uint64_t file_bytes, uint64_t half_bytes);
+void ds4_k3_expert_source_dird_stats(uint64_t *checked, uint64_t *wrong, int *off);
 #ifdef __cplusplus
 }
 #endif
