@@ -332,6 +332,7 @@ int ds4_gpu_device_cache_support_tensors(int device_id,
                                          int n_ranges,
                                          int from_main_map);
 uint64_t ds4_gpu_tier_free_vram(int logical_tier);
+int ds4_gpu_tier_device_id(int logical_tier);   /* the CUDA device of a tier (-1: no such tier) */
 int ds4_gpu_lookup_cache(uint64_t source_offset, uint64_t bytes,
                          int *out_device_id, void **out_device_ptr);
 int ds4_gpu_lookup_cache_device(uint64_t source_offset, uint64_t bytes);

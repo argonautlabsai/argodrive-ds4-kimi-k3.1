@@ -1794,6 +1794,12 @@ extern "C" uint64_t ds4_gpu_tier_free_vram(int logical_tier) {
     if (prev >= 0) (void)cudaSetDevice(prev);
     return out;
 }
+/* K3.1 vision on two cards (19 Nov 2026): the CUDA device of a tier, so the tower can select the card that holds the
+   embedding (-1: no such tier) */
+extern "C" int ds4_gpu_tier_device_id(int logical_tier) {
+    if (logical_tier < 0 || logical_tier >= g_n_gpus) return -1;
+    return g_gpu[logical_tier].device_id;
+}
 
 extern "C" int ds4_gpu_register_support_map(const void *map, uint64_t size, uint64_t bias) {
     if (!map || size == 0 || bias == 0) return 0;

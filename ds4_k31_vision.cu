@@ -4,10 +4,15 @@
  * VRAM: the tower's 0.9 GB of BF16 weights stay on the GPU after the first image. Its scratch (86 KB per 14x14 patch, plus at
  * most 512 MB of attention scores: about 1.4 GB for a 1920x1080 photo, 6 GB at the 65,536-patch limit) is freed after every
  * image, so decode gets it back. When the free VRAM is short, the expert cache lends its grown region, as it does for a long
- * prompt pass, and grows again when generation starts. */
+ * prompt pass, and grows again when generation starts.
+ *
+ * Two cards (19 Nov 2026): the tower lives on the first card, the one with the embedding, where the engine writes the image
+ * rows. The entry point selects that card and puts the caller's device back, so the weights, the scratch, the free-VRAM
+ * check and the lend all concern the same card. */
 #include "ds4_k31_vision_gpu.cuh"
 
 extern "C" uint64_t ds4_gpu_k3_cache_lend(void);
+extern "C" int ds4_gpu_tier_device_id(int logical_tier);
 
 static void k31v_free_scratch(k31v_model &M) {
     if (M.stream) cudaStreamSynchronize(M.stream);
@@ -27,7 +32,7 @@ static uint64_t k31v_scratch_bytes(uint64_t n) {
     return n * per_patch + (uint64_t)K31V_HEADS * qc * n * 4u;
 }
 
-extern "C" int ds4_gpu_k31_vision_encode(const char *dir, const float *patches, uint32_t gh, uint32_t gw, float *out) {
+static int k31v_encode_here(const char *dir, const float *patches, uint32_t gh, uint32_t gw, float *out) {
     k31v_model &M = g_k31v;
     const uint64_t weights = M.ready ? 0 : (uint64_t)960 << 20;   /* 887 MB of weights, cuBLAS workspace */
     const uint64_t need = weights + k31v_scratch_bytes((uint64_t)gh * gw) + ((uint64_t)256 << 20);
@@ -43,5 +48,18 @@ extern "C" int ds4_gpu_k31_vision_encode(const char *dir, const float *patches, 
     const int ok = k31v_encode(patches, gh, gw, out);
     k31v_free_scratch(M);
     cudaGetLastError();
+    return ok;
+}
+
+extern "C" int ds4_gpu_k31_vision_encode(const char *dir, const float *patches, uint32_t gh, uint32_t gw, float *out) {
+    const int dev = ds4_gpu_tier_device_id(0);
+    int prev = -1;
+    if (cudaGetDevice(&prev) != cudaSuccess) { cudaGetLastError(); prev = -1; }
+    if (dev >= 0 && dev != prev && cudaSetDevice(dev) != cudaSuccess) {
+        fprintf(stderr, "ds4: K3.1 vision: cannot select the first card (%s)\n", cudaGetErrorString(cudaGetLastError()));
+        return 0;
+    }
+    const int ok = k31v_encode_here(dir, patches, gh, gw, out);
+    if (dev >= 0 && prev >= 0 && dev != prev) (void)cudaSetDevice(prev);
     return ok;
 }
