@@ -44,8 +44,18 @@ static int k31v_encode_here(const char *dir, const float *patches, uint32_t gh, 
                 (double)free_b / 1e9);
         return 0;
     }
-    if (!k31v_load(dir)) return 0;
-    const int ok = k31v_encode(patches, gh, gw, out);
+    int ok = k31v_load(dir) && k31v_encode(patches, gh, gw, out);
+    if (!ok) {
+        /* 19 Nov 2026: the estimate can pass and an allocation still fail, when another process takes memory on this card
+           in between (the drafter loads at the first request) and the reserve is small. The cache then lends its grown
+           region, as it would have for a larger image, and the image is encoded again. Nothing to lend: the failure stands. */
+        k31v_free_scratch(M);
+        cudaGetLastError();
+        if (ds4_gpu_k3_cache_lend() > 0) {
+            fprintf(stderr, "ds4: K3.1 vision: encoding again with the VRAM the expert cache lent\n");
+            ok = k31v_load(dir) && k31v_encode(patches, gh, gw, out);
+        }
+    }
     k31v_free_scratch(M);
     cudaGetLastError();
     return ok;
