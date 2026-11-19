@@ -41443,7 +41443,11 @@ struct k3_lru {
         /* a prompt pass (hot = false) recycles transient slabs first so that it never pushes out the decode working
            set beyond what it needs for its own in-flight fills; decode inserts take the coldest unpinned slab */
         int victim = -1;
-        if (decay_mode) {
+        /* step 159: the decayed-count rule decides for decode (hot) insertions only. A prompt pass recycles its own slabs
+           within one layer call whenever the layer needs more experts than there are slabs (192 before the first forward),
+           and the rule passes over every slab of the call in progress (step 144): it then found no victim and the pass
+           failed with "no slab free". The list order below is what a prompt pass has always used. */
+        if (decay_mode && hot) {
             /* lowest score among 64 sampled unpinned slabs (transients carry -1e30, so they go first) */
             float best = 3e38f, best_any = 3e38f;
             bool any_in_call = false;   /* step 144: the lowest score of the sample belongs to a slab of this call */
