@@ -12,6 +12,7 @@ This is a **source release**. Model weights, NVIDIA drivers, CUDA build tools (o
 
 - **Kimi K3.1 Pro:** [installation guide](https://argonautlabs.ai/guides/install-kimi-k31.html) · [CUDA and Metal configuration](tools/kimi-k3/README.md)
 - **DeepSeek V4.1 Flash 1017:** [setup, model file and streaming settings](tools/deepseek-v41/README.md) · [one-, two- and three-drive M5 Max results](#deepseek-v41-flash-on-the-same-macbook-pro-macos-metal)
+- **Kimi K3.1 Pro on two NVIDIA GPUs:** [results on two RTX PRO 6000](#kimi-k31-pro-on-two-rtx-pro-6000-linux-cuda) · [switches and what changed](tools/kimi-k3/README.md#two-cards-19-november-2026)
 - **DeepSeek V4.1 Flash 1017 on two NVIDIA GPUs:** [results on two RTX PRO 6000](#deepseek-v41-flash-on-two-rtx-pro-6000-linux-cuda) · [switches and preload lists](tools/deepseek-v41/README.md#cuda-two-gpus-the-layers-split-between-them)
 
 ### Measured results at a glance
@@ -20,6 +21,8 @@ The following tables and footprint describe **Kimi K3.1 Pro**. DeepSeek V4.1 Fla
 
 | Hardware | Workload | Measured speed | Version and scope |
 |---|---|---:|---|
+| **Two RTX PRO 6000** (2 x 96 GB, Linux, CUDA) | Raw financial text: 6 prompt / 512 output tokens | **5.50–5.53 tok/s decode** | 19 November, layers split over both cards, Qwen drafter |
+| **Two RTX PRO 6000** (2 x 96 GB, Linux, CUDA) | The same text, no drafter: 6 prompt / 256 output tokens | **3.04–3.05 tok/s decode** | 19 November, layers split over both cards |
 | **RTX PRO 6000** (96 GB, Linux, CUDA) | Short-prompt chat: 286 prompt / 200 output tokens | **2.01–2.02 tok/s decode** | 11 November, chat drafter settings |
 | **RTX PRO 6000** (96 GB, Linux, CUDA) | Raw financial text: 6 prompt / 512 output tokens | **3.77–3.79 tok/s decode** | 11 November, Qwen drafter, fp32 activations |
 | **RTX PRO 6000** (96 GB, Linux, CUDA) | Long raw prompt: 512 prompt / 200 output tokens | **3.88–3.89 tok/s decode** | 11 November, Qwen drafter |
@@ -30,6 +33,7 @@ The following tables and footprint describe **Kimi K3.1 Pro**. DeepSeek V4.1 Fla
 
 **Tested hardware, not minimum requirements:**
 - **RTX PRO 6000 (Linux, CUDA):** one RTX PRO 6000 Blackwell GPU with **96 GB VRAM**, **70 GiB RAM** assigned to the Ubuntu VM and **five physical NVMe devices** in three storage tiers (**four** in two tiers for the 10 and 11 November results). Context caches measured up to **16,384 tokens** using sparse attention.
+- **Two RTX PRO 6000 (Linux, CUDA):** both cards (96 GB each), **80 GiB RAM** assigned to the Ubuntu VM with a 56 GiB pinned expert pool, and **four physical NVMe devices** in two storage tiers. Contexts measured up to **16,384 tokens**.
 - **MacBook Pro (macOS, Metal):** a MacBook Pro with an **M5 Max and 128 GB** of unified memory, its internal SSD and **two Thunderbolt 5 NVMe drives**. Contexts measured up to **2,048 tokens**.
 - Both run the same engine on the same **1.45 TB of unique MXFP4 experts**, plus spine, checkpoint and replicas. **Equivalence to Moonshot’s reference implementation remains unvalidated.**
 
@@ -89,6 +93,33 @@ The drafter gives the same tokens as plain decoding: a block's rows run the same
 bit (4,747 positions: the tests above, the failure fixtures, long context and the server). Decode depends on how predictable
 the text is. The 512-token prompt is `prompt-512-tokens.txt` from the deltafin Kimi K3 benchmark.
 [What changed](tools/kimi-k3/README.md#wider-drafter-blocks-and-long-prompt-read-ahead-11-november-2026)
+
+### Kimi K3.1 Pro on two RTX PRO 6000 (Linux, CUDA)
+
+With two cards the layers are split between them (`DS4_CUDA_STREAM_SPLIT=46` with `--gpu-devices 0,1`): layers 0 to 45 run
+on the first card and 46 to 92 on the second, each card holds the spine of its own layers, and what is left of both is one
+expert cache of 7,239 slabs, against 1,536 on one card. Measured on 19 November at commit d29ddcb on two
+RTX PRO 6000 Blackwell cards (96 GB each) in an 80 GiB VM with a 56 GiB pinned expert pool, the experts on the four NVMe
+devices of 11 November, one fresh process per run, greedy, raw prompts, three runs where a range is given:
+
+| test | prefill | decode, Qwen drafter | decode, plain |
+|---|---|---|---|
+| "The three main financial statements are" (6 tokens), 512 generated | — | 5.50–5.53 tok/s | — |
+| the same prompt, 256 generated | — | — | 3.04–3.05 tok/s |
+| the same prompt, 128 / 200 generated | — | 3.69 / 4.53 | — |
+| 512-token prompt, 64 generated | 15.9 tok/s | 3.92 | — |
+| 1,512-token prompt, 64 generated | 39.0 tok/s | 2.63 | — |
+| 13,087-token prompt at a 16k cache, 48 generated | 106 tok/s | 2.23 | 1.93 |
+
+On one card the same build decoded the record prompt at 3.35 tok/s with the drafter (200 generated) and at
+2.13 plain. The drafter rows above use two switches that are off by default (`DS4_K3_VERIFY_RANK=1
+DS4_K3_VERIFY_PF_SCALE=8`) and the plain row a third (`DS4_K3_CACHE_POLICY=decay-device`). How fast the drafter rows are
+depends on the text: two other continuations decoded at 2.98 and 3.11 tok/s and a chat prompt at 2.93.
+
+Every row has the logits of the one-card reference runs: 4,316 positions compared by hash in this release's
+qualification, across one card, the second card as a cache and the split. Decode is still bound by the drives: 85 % of the
+512-token run is spent waiting for expert reads, at the full rate the drives give. The switches, what changed, what was
+tried without gain and the limits: [two cards](tools/kimi-k3/README.md#two-cards-19-november-2026).
 
 ### Standard benchmarks on a MacBook Pro M5 Max (macOS, Metal)
 
@@ -171,7 +202,7 @@ through a VRAM cache and a pinned RAM pool; on a Mac the spine and one expert ca
 ([setup](tools/kimi-k3/README.md#the-optional-qwen-drafter)).
 
 <p align="center"><img src="tools/kimi-k3/images/workstation.jpg" width="760" alt="Inside the workstation: two NVIDIA RTX PRO 6000 Blackwell cards above a Hyper M.2 x16 Gen5 card"></p>
-<p align="center"><em>The workstation. The port runs on one of its two RTX PRO 6000 Blackwell cards (96 GB).</em></p>
+<p align="center"><em>The workstation. The port runs on one of its two RTX PRO 6000 Blackwell cards (96 GB), or on both.</em></p>
 
 The CUDA results come from one RTX PRO 6000 Blackwell (96 GB) in a 70 GiB VM. A RAID0 of three NVMe drives (19 GB/s) has the 79,365
 hottest experts, a second NVMe (6.2 GB/s) has the rest plus some copies, and a Thunderbolt NVMe (3.7 GB/s) has another 74,000

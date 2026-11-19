@@ -38,8 +38,19 @@ row's scale bytes as a base and two bits per block; the 4-bit weights are untouc
 17,547,264 bytes, which the tool checks for every file before it replaces it (`convert`, reversible with `--reverse`). The
 engine tells the two forms apart by size and expands the scales on the reader thread. Through the engine 192 recoded files
 gave the same logits. Our stores are not converted, so every number in this document is from the original files. Releases up
-to 10 November cannot read the smaller form, and directories given by `DS4_K3_EXPERT_DIR_C` / `_D` are still checked against
-the original size at start, so keep those unconverted.
+to 10 November cannot read the smaller form. Since 19 November every reader of the engine takes it (before, the reader behind
+the CPU reference and staged ranges refused it), and a directory given by `DS4_K3_EXPERT_DIR_C` / `_D` may hold files of
+either size.
+
+Reads from a directory you cannot fully trust can be checked. `tools/kimi-k3/k3_expert_sums.c` writes a table with the CRC32C
+of the two halves of every expert, read through the engine's own reader from a trusted copy (`k3_expert_sums make <table>
+<dir> [<dir_b>]`), and checks any directory against it (`k3_expert_sums check <table> <dir>`; a recoded file is expanded
+first, so the table is also an independent check of a converted store). With `DS4_K3_EXPERT_DIR_C_SUMS=<table>` or
+`DS4_K3_EXPERT_DIR_D_SUMS=<table>` every read from that directory is compared with the table before it is used. A read that
+is wrong or fails is served from another directory, and after three the directory is left alone for the rest of the process.
+A fourth directory is no longer read without a table: set `DS4_K3_EXPERT_DIR_D_UNVERIFIED=1` to read it unchecked as
+before. The third is read unchecked when it has no table. We built this after a drive behind an external link went on
+answering reads with zeros and no error.
 
 ### Kimi K3.1 Pro
 
@@ -210,6 +221,13 @@ earlier runs, which is not part of this repository.
 | `DS4_K3_SPLIT_ETA_GBPS`, `DS4_K3_SPLIT_STREAM_GBPS` | 27,6.8,3.6[,3.6] / 6,6.7,3.6[,3.6] | aggregate and per-stream GB/s the balancer assumes per directory (measure yours) |
 | `DS4_K3_COLD_INFLIGHT`, `DS4_K3_GREEN_INFLIGHT`, `DS4_K3_DIRD_INFLIGHT` | 8, 16, 16 | in-flight caps for `dir_b`, tier C and tier D |
 | `DS4_K3_EXPERT_DIR_C`, `DS4_K3_EXPERT_DIR_D` | unset | paths of further expert copies (tier C, tier D) |
+| `DS4_K3_EXPERT_DIR_C_SUMS`, `DS4_K3_EXPERT_DIR_D_SUMS`, `DS4_K3_EXPERT_DIR_D_UNVERIFIED` | unset | a checksum table from `k3_expert_sums` for tier C / tier D: every read from that directory is checked, a wrong or failed one is served elsewhere, and after three the directory is dropped. Tier D is ignored without a table unless `_UNVERIFIED=1` ([weight layout](#weight-layout)) |
+| `DS4_CUDA_STREAM_SPLIT` (with `--gpu-devices 0,1 --gpu-vram auto`) | unset | two cards: the first layer that runs on the second card (`1` or `auto`: the middle, 46). Each card holds the spine of its own layers and half of the expert cache ([two cards](#two-cards-19-november-2026)) |
+| `DS4_K3_SPLIT_PASS_ROWS` | the context, at most 2,048 | with the split: the longest prompt pass the second card keeps buffers free for; a longer pass borrows that card's expert slabs and gives them back when generation starts |
+| `DS4_K3_GPU1`, `DS4_K3_GPU1_SLABS`, `DS4_K3_GPU1_RESERVE_MB`, `DS4_K3_GPU1_MODE` | unset, all that fits, 2048, in place | without the split: a second card (its CUDA device number) as an expert cache only; experts cached there are computed there. `_MODE=copy` copies each slab to the first card instead |
+| `DS4_K3_VERIFY_RANK`, `DS4_K3_VERIFY_PF_SCALE` | unset, 0 | drafter blocks keep their most used experts per layer, as many as the caches hold, and both caches evict by use count instead of age; `_PF_SCALE=8` lets a block read ahead one plain step's quota per 8 rows. Off by default; the two-card drafter numbers use `1` and `8` |
+| `DS4_K3_CACHE_POLICY`, `DS4_K3_CACHE_DECAY` | unset, 0.9 | `decay-device`: the device cache evicts by a decayed use count instead of age (the host pool keeps its order). For plain decode; the two-card plain numbers use it with 0.95 |
+| `DS4_K3_READ_STATS` | unset | a file that gets, per expert, how many decode calls were served from VRAM, host RAM and a drive read, and the bytes each directory read for it (diagnostic) |
 | `DS4_K3_UPLOAD_STREAMS` | 8 | CUDA streams for slab uploads |
 | `DS4_K3_POOL_FIRST` | 1 | decode: the layer's experts already on the device or in the host pool are visited before the ones needing a disk read (+2 % measured; from the argodrive V4.1 fork) |
 | `DS4_K3_POOL_KEEP`, `DS4_K3_POOL_EVICT_BIAS` | 0, 0 | a host hit keeps its host copy; prefer evicting a slab the pool still holds (neutral to negative on this rig; kept for other cache geometries) |
@@ -235,7 +253,7 @@ earlier runs, which is not part of this repository.
 | `DS4_K3_QWEN_GRACE_MS` | 300 | the first drafter proposal waits at most this long for the sidecar; plain steps run until it is ready |
 | `DS4_K3_QWEN`, `DS4_K3_QWEN_PY`, `DS4_K3_QWEN_SCRIPT`, `DS4_K3_QWEN_DIR`, `DS4_K3_QWEN_META`, `DS4_K3_QWEN_CONF` | off, -, -, -, -, 0.6 | the optional Qwen drafter ([below](#the-optional-qwen-drafter)) |
 | `DS4_K3_QWEN_CHAT` | unset | allow the drafter on chat prompts; use it with the chat settings [below](#the-optional-qwen-drafter) |
-| `DS4_K3_QWEN_ROWS`, `DS4_K3_QWEN_KMIN` | 64, 2 | the most rows a verification block may take (2 to 64; 32 before 11 November, 16 on a Mac), and the fewest drafts worth a block |
+| `DS4_K3_QWEN_ROWS`, `DS4_K3_QWEN_KMIN` | 64, 2 | the most rows a verification block may take (2 to 256 since 19 November; the default was 32 before 11 November and is 16 on a Mac), and the fewest drafts worth a block |
 | `DS4_K3_QWEN_WIDE` | 32,0.5 | `rows,theta`: a proposal goes past `rows` rows only when the product of Qwen's confidences over the drafts before that point is at least `theta`; `0` lets every proposal fill the block |
 | `DS4_K3_QWEN_KEEP` | 1 | the sidecar keeps the rows it computed past a prefix that agrees with everything consumed, so rows prepared while Kimi worked are answered without a forward; 0 recomputes them |
 | `DS4_K3_QWEN_SPEC`, `DS4_K3_QWEN_SPEC_MIN` | 2 x rows + 3,3 and 16 | rows the sidecar prepares past the text while Kimi works, after a block and after a plain step (`17,3` with `DS4_K3_QWEN_KEEP=0`); after a proposal of fewer than `_SPEC_MIN` drafts it prepares 17 rows only (0: always the deep rows); `0,0` turns it off |
@@ -466,6 +484,90 @@ the fixtures, long context at 4k, 8k and 16k with and without the drafter, and t
 drafter at 64 and at 16 rows), and 2,639 positions of runs with blocks against plain decoding, including forced rejections,
 a sidecar that dies, answers garbage or takes all the free VRAM, and end of text inside a 32-row and a 64-row block.
 
+### Two cards (19 November 2026)
+
+At commit d29ddcb, two RTX PRO 6000 Blackwell cards (96 GB each) in an 80 GiB VM, a 56 GiB pinned expert pool
+(`DS4_K3_CACHE_RAM_GB=56`), the experts on the four NVMe devices of 11 November (73,993 on the RAID0, 44,413 on the fourth
+drive, 35,974 of those second copies). One fresh process per run, greedy, raw prompts unless noted. The one-card column is
+the same build on the same day with no new switch.
+
+    DS4_CUDA_STREAM_SPLIT=46 ./ds4 -m k3-spine.gguf --cuda --gpu-devices 0,1 --gpu-vram auto --ssd-streaming \
+          --ssd-streaming-cold --ssd-streaming-cache-experts 16 --temp 0 -c 2048 -p "..."
+
+| test | one card | two cards |
+|---|---|---|
+| record prompt, 512 generated, Qwen | – | 5.50–5.53 tok/s |
+| record prompt, 200 generated, Qwen | 3.35 tok/s | 4.53 |
+| record prompt, 128 generated, Qwen | – | 3.69 |
+| record prompt, 256 generated, plain | – | 3.04–3.05 |
+| record prompt, 128 generated, plain | 2.13 | – |
+| "The capital of France is", 17 generated, Qwen | 2.20 | 2.45–2.53 |
+| `prompt-512-tokens.txt`, 64 generated, Qwen: prompt pass, then decode | – | 32.1 s, 3.92 |
+| 1,512-token prompt, 64 generated, Qwen: prompt pass, then decode | 38.0 s, 2.33 | 38.8 s, 2.63 |
+| 13,087-token prompt at a 16k cache, 48 generated: prompt pass, then plain / Qwen decode | 133 s, 1.54 / – (10 November release) | 123 s, 1.93 / 2.23 |
+| a 53-token chat prompt, chat settings, Qwen | 2.25 (64 generated) | 2.93 (256 generated) |
+
+The two-card Qwen rows run with `DS4_K3_VERIFY_RANK=1 DS4_K3_VERIFY_PF_SCALE=8` and the two-card plain rows with
+`DS4_K3_CACHE_POLICY=decay-device DS4_K3_CACHE_DECAY=0.95`; both are off by default and described below. Through the chat
+endpoint at a 16k cache, three requests of 36, 185 and 1,543 prompt tokens took 52, 28 and 75 s on two cards against
+62, 33 and 89 s on one, with the same three answers.
+
+The drafter figure depends on the text, as on one card. The record prompt is the one Qwen predicts best (89 % of its
+drafts kept); two other continuations of 383 tokens decoded at 2.98 and 3.11 tok/s with the same settings, and the chat
+prompt above, where half of the tokens are single steps, at 2.93.
+
+What changed:
+
+- **The layers split over two cards** (`DS4_CUDA_STREAM_SPLIT=<cut>` with `--gpu-devices 0,1 --gpu-vram auto`; `1` or
+  `auto` takes the middle, layer 46). Layers below the cut, the embedding and the output head stay on the first card; the
+  others run on the second, which holds their spine weights, attention caches, KDA states and a second set of working
+  tensors. The residual stream crosses before the cut and comes back after the last layer, by direct copies between the
+  cards. What is left of both cards is one expert cache: 7,239 slabs here (127 GB) against 1,536 on one card, and
+  the uploads split about evenly between the two cards. Contexts above 2,048 positions and the chat endpoint run split as well:
+  each card holds the latent rows and the indexer weights its own layers need, and a long prompt pass borrows the second
+  card's expert slabs for its buffers and gives them back when generation starts.
+- **A second card as an expert cache only** (`DS4_K3_GPU1=<device>`, without the split). The spine stays on the first card
+  and the second holds expert slabs; an expert cached there is computed there and only activation rows cross, through
+  pinned host memory. On this machine the split was 3 % faster on the 512-token run (5.13 against 4.96 tok/s with the
+  drafter, 48 GiB pool) and the two are level over 200 tokens (4.53 and 4.56).
+- **Blocks of up to 256 rows** (`DS4_K3_QWEN_ROWS`; the default stays 64). A block reads each expert once for all its rows:
+  on a recorded 512-token continuation a row needs 1,456 distinct experts alone, 347 in a 64-row block, 216 at 128 rows
+  and 136 at 256. With drafts that are always right the two cards reach 6.4 tok/s at 64 rows, 9.1 at 128 and 12.7 at 256.
+  The Qwen drafter does not get there on this text: its blocks end where it disagrees with Kimi, at 23 of 531 positions.
+- **Rank admission** (`DS4_K3_VERIFY_RANK=1`, off by default). A block ranks each layer's experts by the rows that use
+  them; the first ones stay in the device cache, the next in the host pool, the rest pass through slabs that are recycled
+  first, and both caches evict by use count instead of age. The experts a 64-row block needs are covered 96 % by the
+  previous block's 76 most used per layer, so nearly every slab kept is a read saved. Beside a deeper read-ahead inside
+  blocks (`DS4_K3_VERIFY_PF_SCALE=8`) it took the 512-token run from 5.04 to 5.30 tok/s.
+- **An eviction rule for plain decode** (`DS4_K3_CACHE_POLICY=decay-device`): the device cache gives up the entry with the
+  lowest decayed use count. Plain decode of 256 tokens went from 2.65 to 2.76 tok/s with it (48 GiB pool).
+- **Checked reads** for a third and fourth directory, and recoded files in every reader ([weight layout](#weight-layout)).
+
+Two faults were fixed on the way. A device slab that was filled by read-ahead and never used could be copied down to the
+host pool while its upload was still running, so the pool kept a half-written expert. Eviction by age never takes a slab
+that fresh; eviction by use count (`DS4_K3_CACHE_POLICY=decay`, an undocumented switch of the earlier releases) does, and
+with a deep read-ahead it showed as logits that differed in their last bits. The copy now waits for the upload. The
+second fault never left our tree: with either use-count rule on, a prompt pass that needed more experts in a layer than
+the device cache had slabs failed with "no slab free"; the rule now decides for decode steps and blocks only.
+
+Where the time goes. In the 512-token run, 85 % of the time is spent waiting for expert reads, and the drives deliver
+about 36 GB/s whenever a layer waits, which is what they have. The uploads from host memory to the cards that are still
+under way when a layer's reads have finished cost 1.2 %, activation rows between the cards 1.2 %, and the expert kernels
+themselves 0.5 %; on the chat prompt the same four are 78 %, 4.1 %, 3.1 % and 1.6 %. Of the drive reads, 72 % fetch an
+expert that was already read earlier in the same run and has fallen out of both caches. So decode speed on this machine
+is cache size and drive bandwidth, as on one card.
+
+Tried and left out, because they gained nothing: starting the next block's first token while the drafter proposes, so
+that its experts are cached when the block arrives (identical output, 5.44 against 5.43 tok/s: the step competes with the
+drafter for the card); keeping a list of experts resident with foresight, the lists taken from the same prompt's own
+statistics (+1.8 % on the record prompt and +3.7 % on chat at best, so a rule without foresight has little to win);
+a second, larger drafter (21 disagreements instead of 23); preloading the caches by expert use on other texts.
+
+Limits. The host pool is page-locked, and the spine is read through the page cache before it is uploaded: leave room
+for it. In our 80 GiB VM a 56 GiB pool is safe; a 60 GiB one, forced by lowering `DS4_K3_CACHE_RAM_RESERVE_MB`, stopped
+the VM while the spine loaded, so leave that reserve at its default. The DSpark drafter is not split. A fourth expert
+directory needs a checksum table now (above).
+
 ## The optional Qwen drafter
 
 Off by default. Greedy decoding only, and raw completions only unless you set `DS4_K3_QWEN_CHAT=1`.
@@ -534,6 +636,13 @@ inside a block. The 11 November release repeated them with blocks of up to 64 ro
 matched plain decoding, and 4,747 positions matched the 10 November release's own runs. The first drafter release's checks covered every layer of 40 positions (10,842 hashes) and the logits of 5,325 positions. That's evidence from these runs on this GPU and driver, not a
 proof for every input.
 
+The two-card paths of 19 November were checked the same way. With the layers split, with the second card as a cache, and
+on one card with no new switch, the runs of the table above and of the qualification beside it (plain, drafter, the 512-
+and 1,512-token prompt passes, the chat prompt, the 13,087-token prompt at a 16k cache) gave the reference logits at
+every one of 4,316 positions compared, and the chat endpoint the same answers as the one-card server, also when
+a 13,000-token prompt arrives after the caches are full and the second card has to give up its expert slabs for the
+pass. The references are the one-card runs of the 10 and 11 November releases.
+
 The expert path doesn't touch the arithmetic. Caches, read scheduling, chunked reads, prefetch and enqueue order only change
 when an expert's bytes arrive. Per-layer traces on a 5-token prompt plus 2 generated tokens match a reference run line for line,
 and the 128- and 512-token id files are the same with and without pool-first. The 7 November start-up and prompt-pass changes were of the same
@@ -592,4 +701,7 @@ optional drafter doesn't change the output. The output isn't bit-identical acros
 `cache_sim*.py`, `sim*.py`, `lru_test.cpp` (cache policy simulators on recorded routes), `serve_summary.py` /
 `tier_summary.py` (log summaries), `qwen_sidecar.py` (the drafter), `hash_compare.py` (bit-level comparison of two runs),
 `heat_from_routes.py` (an expert-use histogram for `DS4_K3_HEAT` from route traces), `k31_scale_recode.py` (the optional,
-lossless recode of the expert files' scale bytes).
+lossless recode of the expert files' scale bytes), `k3_expert_sums.c` (the checksum table for checked reads),
+`sim_two_cards.py` (recorded routes replayed through the cache sizes of one and two cards), `g1_linkbench.cu` (what two
+cards take in at once, and the hand-over paths between them), `dup_rank.py` (the second directory's experts ranked by
+recorded use).
