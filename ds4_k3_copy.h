@@ -52,9 +52,10 @@ typedef struct { uint32_t pos, len; } k3_copy_cand;
 typedef struct {
     /* settings, read once */
     int mode;                 /* 0 off, 1 drafts, 2 shadow: candidates are scored and what the rule would have drafted is counted, no blocks */
+    int both;                 /* DS4_K3_COPY=both: drafts beside the draft model too (step 162d: off by default) */
     uint32_t max_d;           /* the longest draft: DS4_K3_COPY_ROWS - 1 */
     double margin;            /* DS4_K3_COPY_MARGIN: the expected saving a draft must show, in plain steps */
-    double first;             /* DS4_K3_COPY_FIRST: a copy expected to give this many tokens is drafted without asking the draft model */
+    double fallback;          /* DS4_K3_COPY_FALLBACK: beside the draft model, the kept tokens a copy must expect where the model declined (step 162c) */
     double fix_a, fix_b;      /* DS4_K3_COPY_COST=a,b: the block cost, not fitted */
     int trace, cut_qwen;      /* DS4_K3_COPY_TRACE; DS4_K3_REFUTE_QWEN */
     /* the request */
@@ -75,7 +76,7 @@ typedef struct {
     double r1, rx, ry, rxx, rxy;   /* block time in plain steps against rows */
     /* the request's counts */
     uint32_t st_steps, st_found, st_scored, st_first_ok, st_blocks, st_drafted, st_acc, st_full, st_zero, st_prompt, st_answer;
-    uint32_t st_ref, st_swapped, st_qloss, st_qcut, st_qcut_right, st_qcut_lost;
+    uint32_t st_ref, st_swapped, st_qloss, st_qcut, st_qcut_right, st_qcut_lost, st_over;
     uint32_t sv_blocks, sv_drafted, sv_acc; double sv_saved, st_block_s;
 } k3_copy;
 
@@ -131,13 +132,14 @@ static void k3_copy_cost(const k3_copy *c, double *a, double *b) {
 static void k3_copy_settings(k3_copy *c) {
     const char *e = getenv("DS4_K3_COPY");
     c->mode = !e || !e[0] || !strcmp(e, "0") || !strcmp(e, "off") ? 0 : !strcmp(e, "shadow") ? 2 : 1;
+    c->both = e && !strcmp(e, "both");
     e = getenv("DS4_K3_COPY_ROWS");
-    int rows = e ? atoi(e) : 16;
+    int rows = e ? atoi(e) : (int)K3_COPY_MAXD + 1;   /* step 162b: as wide as the block buffers allow (the engine caps it at DS4_K3_QWEN_ROWS) */
     if (rows < 2) rows = 2;
     if (rows > (int)K3_COPY_MAXD + 1) rows = (int)K3_COPY_MAXD + 1;
     c->max_d = (uint32_t)rows - 1u;
     e = getenv("DS4_K3_COPY_MARGIN"); c->margin = e ? atof(e) : 0.10;
-    e = getenv("DS4_K3_COPY_FIRST"); c->first = e ? atof(e) : 3.0;
+    e = getenv("DS4_K3_COPY_FALLBACK"); c->fallback = e ? atof(e) : 3.0;
     c->fix_a = c->fix_b = 0.0;
     e = getenv("DS4_K3_COPY_COST");
     if (e) { double a = 0.0, b = 0.0; if (sscanf(e, "%lf,%lf", &a, &b) == 2 && b > 0.0) { c->fix_a = a; c->fix_b = b; } }
@@ -170,7 +172,7 @@ static void k3_copy_begin(k3_copy *c, const int *ids, uint32_t n_ids, int specia
     memset(c->ref, 0, sizeof(k3_copy_ref) << K3_COPY_RBITS);
     c->n = 0; c->special_base = special_base;
     c->st_steps = c->st_found = c->st_scored = c->st_first_ok = c->st_blocks = c->st_drafted = c->st_acc = c->st_full = c->st_zero = c->st_prompt = c->st_answer = 0;
-    c->st_ref = c->st_swapped = c->st_qloss = c->st_qcut = c->st_qcut_right = c->st_qcut_lost = 0;
+    c->st_ref = c->st_swapped = c->st_qloss = c->st_qcut = c->st_qcut_right = c->st_qcut_lost = c->st_over = 0;
     c->sv_blocks = c->sv_drafted = c->sv_acc = 0; c->sv_saved = 0.0; c->st_block_s = 0.0;
     for (uint32_t i = 0; i < n_ids; i++) {
         int t = ids[i];
@@ -278,8 +280,6 @@ static uint32_t k3_copy_propose(k3_copy *c, int *out, uint32_t want) {
     memcpy(out, c->p_tok, sizeof(int) * c->p_d);
     return c->p_d;
 }
-/* is this step's copy sure enough to be drafted without asking the draft model? */
-static inline bool k3_copy_sure(const k3_copy *c) { return c->p_d > 0u && c->p_exp >= c->first; }
 /* the copy is drafted: the block's result scores it, not the next token */
 static inline void k3_copy_drafted(k3_copy *c) { c->cand_on = false; if (c->p_src + 1u < c->n_prompt) c->st_prompt++; else c->st_answer++; }
 /* a plain step took this long */
@@ -328,6 +328,7 @@ static void k3_copy_report(k3_copy *c) {
             c->st_drafted ? 100.0 * (double)c->st_acc / (double)c->st_drafted : 0.0, c->st_full, c->st_zero, c->st_block_s, c->st_ref, c->st_swapped, a, b, c->t1);
     if (c->mode == 2) fprintf(stderr, "ds4: K3 copy (shadow): the rule would have run %u blocks: drafted %u, accepted %u; about %.1f plain steps saved at that block cost\n",
                               c->sv_blocks, c->sv_drafted, c->sv_acc, c->sv_saved);
+    if (c->st_over) fprintf(stderr, "ds4: K3 copy: drafted instead of the draft model's proposal %u times\n", c->st_over);
     if (c->st_qloss || c->st_qcut) fprintf(stderr, "ds4: K3 copy: the draft model's proposals: %u turned-down tokens recorded; the record marked %u proposals: %u cuts would have cost nothing, the others %u accepted tokens%s\n",
                                            c->st_qloss, c->st_qcut, c->st_qcut_right, c->st_qcut_lost, c->cut_qwen ? " (cuts applied)" : " (cuts not applied)");
     if (c->trace) {

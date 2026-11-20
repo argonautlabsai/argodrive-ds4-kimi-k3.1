@@ -68890,7 +68890,7 @@ static int generate_k3_cuda_argmax(
         if (!copy_set) {
             copy_set = 1; k3_copy_settings(&g_k3_copy);
             if (g_k3_copy.mode) fprintf(stderr, "ds4: K3 copy (steps 160-162): %s, blocks of up to %u rows, a draft must save %.2f plain steps%s\n",
-                                        g_k3_copy.mode == 2 ? "scored only (shadow), no blocks" : "drafts copied from the context", g_k3_copy.max_d + 1u, g_k3_copy.margin,
+                                        g_k3_copy.mode == 2 ? "scored only (shadow), no blocks" : g_k3_copy.both ? "drafts copied from the context, also beside the draft model" : "drafts copied from the context where no draft model runs", g_k3_copy.max_d + 1u, g_k3_copy.margin,
                                         g_k3_copy.cut_qwen ? "; the draft model's proposals are cut where the model turned a token down before" : "");
         }
         uint32_t *sp = NULL, *sn = NULL;
@@ -69132,22 +69132,26 @@ static int generate_k3_cuda_argmax(
                 if (pos + want + 1u >= cache_cap) want = cache_cap - pos - 2u;
                 /* step 160: this position's copy candidate; one expected to give DS4_K3_COPY_FIRST tokens or more is drafted without
                    asking the draft model, a weaker one only when the draft model has nothing */
-                int cp[K3_COPY_MAXD]; const uint32_t ncopy = g_k3_copy.active ? k3_copy_propose(&g_k3_copy, cp, want) : 0u;
+                int cp[K3_COPY_MAXD];   /* step 162d: beside the draft model only with DS4_K3_COPY=both */
+                const uint32_t ncopy = g_k3_copy.active && (!g_k3_qwen.active || g_k3_copy.both) ? k3_copy_propose(&g_k3_copy, cp, want) : 0u;
                 bool from_copy = false;
                 uint32_t cut = 0;
-                if (ncopy && (k3_copy_sure(&g_k3_copy) || !g_k3_qwen.active)) { memcpy(prop, cp, sizeof(int) * ncopy); nd = ncopy; from_copy = true; }
-                else if (g_k3_qwen.active && g_k3_qwen.hs_wait && !k3_qwen_ready()) {   /* step 94b: plain steps while the sidecar loads */
-                    if (g_k3_qwen.active) g_k3_qwen.n_early++;
+                if (!g_k3_qwen.active) { if (ncopy) { memcpy(prop, cp, sizeof(int) * ncopy); nd = ncopy; from_copy = true; } }
+                else if (g_k3_qwen.hs_wait && !k3_qwen_ready()) {   /* step 94b: plain steps while the sidecar loads */
+                    g_k3_qwen.n_early++;
                     if (ncopy) { memcpy(prop, cp, sizeof(int) * ncopy); nd = ncopy; from_copy = true; }
-                } else if (g_k3_qwen.active) {
+                } else {
+                    /* step 162b: the draft model is always asked; the copy is drafted instead only when it expects more kept tokens
+                       than the proposal at the draft model's kept rate in this request (prior 0.8 over ten drafts) */
                     int qp[K3_QWEN_MAX_ROWS - 1u]; uint32_t qn = 0;
                     if (!k3_qwen_propose(qp, want, &qn)) qn = 0;
                     if (qn) {
-                        memcpy(prop, qp, sizeof(int) * qn); nd = qn;
-                        cut = g_k3_copy.active ? k3_copy_cut(&g_k3_copy, prop, nd) : nd;   /* step 161: where the record says a token is turned down */
-                        if (g_k3_copy.cut_qwen && cut < nd) nd = cut;
+                        cut = g_k3_copy.active ? k3_copy_cut(&g_k3_copy, qp, qn) : qn;   /* step 161: where the record says a token is turned down */
+                        if (g_k3_copy.cut_qwen && cut < qn) qn = cut;
                     }
-                    if (nd == 0u && ncopy) { memcpy(prop, cp, sizeof(int) * ncopy); nd = ncopy; from_copy = true; }
+                    const double qrate = ((double)g_k3_qwen.n_acc + 8.0) / ((double)g_k3_qwen.n_drafts + 10.0);
+                    if (ncopy && (qn == 0u ? g_k3_copy.p_exp >= g_k3_copy.fallback : g_k3_copy.p_exp > (double)qn * qrate + 0.5)) {   /* step 162c */ memcpy(prop, cp, sizeof(int) * ncopy); nd = ncopy; from_copy = true; if (qn) g_k3_copy.st_over++; }
+                    else if (qn) { memcpy(prop, qp, sizeof(int) * qn); nd = qn; }
                 }
                 if (nd == 0u) break;
                 if (!k3_qwen_bufs()) { g_k3_qwen.active = false; g_k3_copy.active = false; break; }   /* step 120b */
