@@ -367,16 +367,16 @@ a fresh process, the head of *I Promessi Sposi* as the prompt; prefill is the pr
 after the first token. Three runs per row where a range is given. Every row uses
 `DS4_STREAMING_CACHE_IGNORE_HOST_BUDGET=1` and asks for 4,600 cached experts per card.
 
-| setup | 512-token prompt, 200 generated | 1,556-token prompt, 300 generated |
-|---|---|---|
-| one card, serial reads | 46.7 / 17.0 | 112.8 / 16.3 |
-| one card, parallel expert reads | 54.0 to 54.2 / 21.6 to 21.9 | 114.5 / 21.0 |
-| two cards, parallel expert reads | 53.1 to 53.3 / 44.6 to 44.7 | 112.2 to 112.6 / 45.6 to 45.9 |
-| two cards, the caches and a 48 GiB RAM tier preloaded | **144.8 to 149.0 / 47.7 to 47.8** | **219.0 to 220.2 / 49.1 to 49.2** |
+| setup | 512-token prompt: prefill tok/s | decode tok/s | 1,556-token prompt: prefill tok/s | decode tok/s |
+|---|---|---|---|---|
+| one card, serial reads | 46.7 | 17.0 | 112.8 | 16.3 |
+| one card, parallel expert reads | 54.0 to 54.2 | 21.6 to 21.9 | 114.5 | 21.0 |
+| two cards, parallel expert reads | 53.1 to 53.3 | 44.6 to 44.7 | 112.2 to 112.6 | 45.6 to 45.9 |
+| two cards, the caches and a 48 GiB RAM tier preloaded | **144.8 to 149.0** | **47.7 to 47.8** | **219.0 to 220.2** | **49.1 to 49.2** |
 
-Each cell is prefill / decode in tok/s; the two-card row without a preload was measured on the commit before the
-preload was added. A 3,000-token prompt in an 8,192-token context: 182.0 / 42.9 on two cards, 304.9 / 47.3 with the
-preload. With every expert of a token already in VRAM (a prompt of one repeated token) the two cards decode at
+The two-card row without a preload was measured on the commit before the preload was added. The decode kernels of
+21 November raise the last row to 54.8 to 56.0 and 58.1 to 58.4 tok/s (below). A 3,000-token prompt in an
+8,192-token context: 182.0 / 42.9 on two cards, 304.9 / 47.3 with the preload. With every expert of a token already in VRAM (a prompt of one repeated token) the two cards decode at
 57.0 tok/s: what is left between that and the table is expert loading, about three loads a token.
 
 Through `ds4-server` (8,192-token context), five chat prompts of about 1,600 tokens in a row on different text took
@@ -396,6 +396,39 @@ card and on two (`DS4_TEST_GPU_DEVICES=0,1`). Three things had to be made equal 
 kernels and the token-tile attention, which multi-GPU configurations turned off, stay on with the split; and each
 card's weights are laid out on 256-byte boundaries, because cuBLAS sums a matrix that starts elsewhere in a
 different order.
+
+**Exact decode kernels (21 November 2026).** With its experts in place a decode token spent about 16.7 ms in kernels
+on the two cards, in some 64 launches per layer, and much of it in kernels that wait on memory one load at a time or
+use a few of the card's 188 multiprocessors. These kernels now do the same work with more of the card:
+
+- The RMS norms (5,120, 1,280 and 512 wide) issue every load of the row at once: 12 to 17 µs became 2.2 µs for the
+  5,120-wide ones, and the 20,480-wide norm of the HC streams went from 7.0 to 4.3 µs.
+- A single-row Q8_0 projection that is rounded to BF16 rounds at its own store instead of in a launch of its own.
+- The Engram gate keeps sixteen iterations of loads in flight (52 to 18 µs), rope runs one head per block so that
+  its double-precision cos/sin of eight heads no longer queue on one multiprocessor, and the router's f32 projection
+  (5,120 × 384) takes 6.7 µs instead of 10.4.
+- The attention finalize ran one block per head, each reading every value row, on 64 multiprocessors. Its softmax
+  is unchanged in a kernel of its own; the value sums run in 512 one-warp blocks of two heads: 18.8 to 13.5 µs with
+  478 rows, 23.6 to 14.4 µs with 640.
+- The MXFP4 down projection of a decode token sums its six experts on six half-warps and adds them in the old order
+  (29.7 to 26.1 µs).
+- About fifteen fewer launches per layer: the shared expert's gate, up and SwiGLU in one kernel on one quantisation of
+  the input; the HC split, weighted sum and norm in one block; the q_a and kv projections on one quantisation and
+  their two norms in one launch; the addition of the routed and shared experts, its rounding, the HC expansion and
+  its rounding in one launch; a projection input's BF16 rounding together with its Q8_0 quantisation.
+
+None of this changes a result. Each new kernel performs the old one's operations in the same order: the same values
+per thread, the same order inside a thread, the same reduction trees and the same products fused into the same FMAs.
+Where the compiler could fuse either of two products, the generated code was checked (one fused kernel rounded
+differently until its multiply was made explicit). Every kernel was compared with the launches it replaces on random
+inputs, about 25 million values without a difference, and the engine with and without them: the decode logits of 14
+benchmark runs (3,096 steps against the one-card reference), the QA guide's state test on two cards, and four
+6,000-token server requests that returned the same text. `DS4_CUDA_KFAST=0` restores the previous kernels.
+
+The other changes were measured and left out: a Q8_0 projection that quantises its input in every block (the large
+projections already run at 1.3 to 1.6 TB/s of the card's 1.79, and the quantisation cost what the launch saved); the
+staged MXFP4 gate/up kernel written for DGX Spark (68 µs against 53 on this card); value sums of the attention
+finalize with the next rows' loads issued early (slower).
 
 **Limits.** Each layer runs on one card; this is not the tensor-parallel mode. Requests are served one at a time:
 decoding several sessions' rows in one batch is off with the split. DSpark and the decode read-ahead are not part of

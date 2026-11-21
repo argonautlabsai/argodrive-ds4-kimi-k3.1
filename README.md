@@ -172,19 +172,24 @@ two- and three-drive setup, memory sizing and the CUDA counterparts:
 
 On CUDA the same model runs on two cards with its layers split between them (`DS4_CUDA_STREAM_SPLIT=1`): the first
 20 layers on one card, the other 20 on the second, each card with its own cache of routed experts and the rest
-streamed from NVMe. Measured on 18 November with `ds4-bench` on two RTX PRO 6000 Blackwell cards (96 GB each), the
-model file on a RAID0 of three NVMe drives, fresh processes, three runs per row:
+streamed from NVMe. Measured with `ds4-bench` on two RTX PRO 6000 Blackwell cards (96 GB each), the model file on a
+RAID0 of three NVMe drives, fresh processes, three runs per row:
 
-| setup | 512-token prompt, 200 generated | 1,556-token prompt, 300 generated |
-|---|---|---|
-| one card | 54.0–54.2 / 21.6–21.9 | 114.5 / 21.0 |
-| two cards | 53.1–53.3 / 44.6–44.7 | 112.2–112.6 / 45.6–45.9 |
-| two cards, the caches and a 48 GiB host-RAM tier preloaded at start-up | **144.8–149.0 / 47.7–47.8** | **219.0–220.2 / 49.1–49.2** |
+| setup | 512-token prompt: prefill tok/s | decode tok/s | 1,556-token prompt: prefill tok/s | decode tok/s |
+|---|---|---|---|---|
+| one card | 54.0–54.2 | 21.6–21.9 | 114.5 | 21.0 |
+| two cards | 53.1–53.3 | 44.6–44.7 | 112.2–112.6 | 45.6–45.9 |
+| two cards, the caches and a 48 GiB host-RAM tier preloaded at start-up (18 November) | 144.8–149.0 | 47.7–47.8 | 219.0–220.2 | 49.1–49.2 |
+| the same with the exact decode kernels (21 November) | **141.7–154.6** | **54.8–56.0** | **230.0–236.7** | **58.1–58.4** |
 
-Each cell is prefill / decode in tok/s. Through the server, a chat prompt of about 1,600 tokens that follows another
-is processed in 4.6 to 4.9 s. Every decode step of these rows has the logits of the one-card build before the change
-(3,900 steps compared by hash). The split, the kernel and cache changes behind it, the preload lists and the
-limits: [two GPUs, the layers split between them](tools/deepseek-v41/README.md#cuda-two-gpus-the-layers-split-between-them).
+The last row was measured in one session with runs of the previous kernels in between (`DS4_CUDA_KFAST=0`): prefill
+154.8–155.1 and 236.5–236.7 tok/s, decode 48.2–48.4 and 50.0–50.1 tok/s. The new kernels add about 16 % to decode; the
+prompt pass, which here is mostly expert reads from the drives, is unchanged (the lower prefill figures are the first
+run of each group). A 3,000-token prompt decodes at 56.7 tok/s against 49.0. Through the server, a chat prompt of
+about 1,600 tokens that follows another is processed in 4.6 to 4.9 s, and requests of about 6,000 tokens now decode at
+56.5–56.9 tok/s (JSON extraction) and 46.1–46.7 tok/s (prose) against 48.7–49.0 and 40.6–41.1. Every decode step of
+these rows has the logits of the one-card build before the two-card work (5,448 steps compared by hash). The split,
+the kernels, the preload lists and the limits: [two GPUs, the layers split between them](tools/deepseek-v41/README.md#cuda-two-gpus-the-layers-split-between-them).
 
 ### Architecture and validation
 
