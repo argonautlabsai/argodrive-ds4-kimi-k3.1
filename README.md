@@ -13,7 +13,7 @@ This is a **source release**. Model weights, NVIDIA drivers, CUDA build tools (o
 - **Kimi K3.1 Pro:** [installation guide](https://argonautlabs.ai/guides/install-kimi-k31.html) · [CUDA and Metal configuration](tools/kimi-k3/README.md)
 - **DeepSeek V4.1 Flash 1017:** [setup, model file and streaming settings](tools/deepseek-v41/README.md) · [one-, two- and three-drive M5 Max results](#deepseek-v41-flash-on-the-same-macbook-pro-macos-metal)
 - **Kimi K3.1 Pro on two NVIDIA GPUs:** [results on two RTX PRO 6000](#kimi-k31-pro-on-two-rtx-pro-6000-linux-cuda) · [switches and what changed](tools/kimi-k3/README.md#two-cards-19-november-2026)
-- **DeepSeek V4.1 Flash 1017 on two NVIDIA GPUs:** [results on two RTX PRO 6000](#deepseek-v41-flash-on-two-rtx-pro-6000-linux-cuda) · [switches and preload lists](tools/deepseek-v41/README.md#cuda-two-gpus-the-layers-split-between-them)
+- **DeepSeek V4.1 Flash 1017 on two NVIDIA GPUs:** [results on two RTX PRO 6000](#deepseek-v41-flash-on-two-rtx-pro-6000-linux-cuda) · [switches and preload lists](tools/deepseek-v41/README.md#cuda-two-gpus-the-layers-split-between-them) · [both cards on every layer](tools/deepseek-v41/README.md#cuda-two-gpus-both-on-every-layer)
 
 ### Measured results at a glance
 
@@ -180,7 +180,9 @@ RAID0 of three NVMe drives, fresh processes, three runs per row:
 | one card | 54.0–54.2 | 21.6–21.9 | 114.5 | 21.0 |
 | two cards | 53.1–53.3 | 44.6–44.7 | 112.2–112.6 | 45.6–45.9 |
 | two cards, the caches and a 48 GiB host-RAM tier preloaded at start-up (18 November) | 144.8–149.0 | 47.7–47.8 | 219.0–220.2 | 49.1–49.2 |
-| the same with the exact decode kernels (21 November) | **141.7–154.6** | **54.8–56.0** | **230.0–236.7** | **58.1–58.4** |
+| the same with the exact decode kernels (21 November) | 141.7–154.6 | 54.8–56.0 | 230.0–236.7 | 58.1–58.4 |
+| the same with the later decode kernels and their scheduling (21 November, evening) | 145.6–147.3 | 58.7–58.8 | 232.2–232.5 | 62.1–62.4 |
+| both cards on every layer, `DS4_CUDA_TP2=1` (21 November, evening) | **234.4–243.3** | **66.6–67.1** | **386.7–395.9** | **68.1–68.6** |
 
 The last row was measured in one session with runs of the previous kernels in between (`DS4_CUDA_KFAST=0`): prefill
 154.8–155.1 and 236.5–236.7 tok/s, decode 48.2–48.4 and 50.0–50.1 tok/s. The new kernels add about 16 % to decode; the
@@ -190,6 +192,14 @@ about 1,600 tokens that follows another is processed in 4.6 to 4.9 s, and reques
 56.5–56.9 tok/s (JSON extraction) and 46.1–46.7 tok/s (prose) against 48.7–49.0 and 40.6–41.1. Every decode step of
 these rows has the logits of the one-card build before the two-card work (5,448 steps compared by hash). The split,
 the kernels, the preload lists and the limits: [two GPUs, the layers split between them](tools/deepseek-v41/README.md#cuda-two-gpus-the-layers-split-between-them).
+
+**Both cards on every layer (21 November, evening).** With `DS4_CUDA_TP2=1` both cards work on every layer instead of
+one card per half of the layers: in the same session the prompt pass is 60 to 70 % faster and decode 10 to 14 % faster
+than with the layers split (the last two rows; two runs of the split, three of TP2), and a 3,000-token prompt runs at
+542–543 tok/s prefill and 66.4–67.1 tok/s decode against 328 and 60.9. Through the server, four requests of about
+6,000 tokens in a row finished in 11.3 to 12.5 s instead of 13.7 to 15.4 s. Every decode step, and the prompt pass's
+own last position, has the logits of the one-card build. How it stays exact, the switches and the limits:
+[two GPUs, both on every layer](tools/deepseek-v41/README.md#cuda-two-gpus-both-on-every-layer).
 
 ### Architecture and validation
 

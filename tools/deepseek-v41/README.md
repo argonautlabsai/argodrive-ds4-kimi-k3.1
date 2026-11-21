@@ -430,10 +430,80 @@ projections already run at 1.3 to 1.6 TB/s of the card's 1.79, and the quantisat
 staged MXFP4 gate/up kernel written for DGX Spark (68 µs against 53 on this card); value sums of the attention
 finalize with the next rows' loads issued early (slower).
 
-**Limits.** Each layer runs on one card; this is not the tensor-parallel mode. Requests are served one at a time:
+**Limits.** Each layer runs on one card; for both cards on every layer see [below](#cuda-two-gpus-both-on-every-layer). Requests are served one at a time:
 decoding several sessions' rows in one batch is off with the split. DSpark and the decode read-ahead are not part of
 it. Prompts beyond about 11,000 tokens have not been run on two cards. And the model still does not fit: with 9,152
 experts in VRAM and 2,739 in the RAM tier, 3,469 stay on the drive.
+
+## CUDA: two GPUs, both on every layer
+
+With the layers split, one card works while the other waits. `DS4_CUDA_TP2=1` puts both cards on every layer of every
+token instead. Add it to the two-card command above (it needs `DS4_CUDA_STREAM_SPLIT`, `--ssd-streaming` and
+`--gpu-devices 0,1`); everything else stays as it is, the preload lists included.
+
+It keeps the output of the one-card build because no value is ever split: each is computed whole, on one card, by the
+kernel the one-card build uses for it. Matrices are divided by heads, by groups or by output rows, and the cards
+exchange finished halves, never partial sums.
+
+- **Decode.** q_b and the attention run by heads (32 on each card), out_a by its groups, out_b and the shared and
+  routed experts by output rows. The HC mixes, the norms, the router and the KV stores run on both cards from the same
+  inputs. A layer has four exchanges, each closed by an event barrier between the cards, and each card replays its
+  part of a layer from CUDA graphs.
+- **Experts.** Each card caches the row half of the experts it holds (gate and up rows 0–1,023 on one card and
+  1,024–2,047 on the other, down rows 0–2,559 and 2,560–5,119), for all 40 layers, with the same number of slots on
+  both so that their evictions stay in step. A missing expert is read once from the drive into pinned host memory, and
+  each card uploads its half over its own link.
+- **Prompt pass.** The routed experts are divided by rows over both cards; the rest of a layer stays on the card the
+  split gives it, and the KV caches are copied to the other card afterwards. A prompt pass mostly waits for expert
+  reads, so three things go after them: the missing experts of a batch are read by 16 threads that each take the next
+  read as soon as they finish one (19 GB/s became 28); the experts both cards already hold are computed while the
+  others load; and at a layer's first batch, where 84 % of the reads fall, the next layer's router runs on the same
+  rows and the experts it predicts (80 % of the next layer's reads) are read ahead whenever no other read is waiting.
+
+Two changes help both layouts. The routed experts' MMQ grid was sized as if one expert could take every row of a
+batch, so 60 to 75 % of each launch were empty blocks; it is now sized by the largest number of rows any expert takes,
+and only when the old and the new grid both give each tile one block, so every element keeps its full-K sum. And the
+F16 projections of the compressed attention and its indexer, which run one cuBLAS call per row so that the cache keys
+do not depend on how a prompt is chunked, are now issued from four threads with their own streams and cuBLAS handles;
+each shape is checked bit for bit against the main handle the first time it runs.
+
+| switch | effect |
+|---|---|
+| `DS4_CUDA_TP2=1` | both cards on every layer; 128 transfer slots (2.4 GB of pinned host memory) are set up when the engine opens |
+| `DS4_TP2_RA=0` | no read-ahead of the next layer's predicted experts |
+| `DS4_TP2_WAVES=0`, `DS4_TP2_WAVES_POOL=0` | no first wave of the experts already held; experts of the RAM tier left out of it |
+| `DS4_TP2_SLOTS=N`, `DS4_TP2_READERS=N` | transfer slots (default 128) and reader threads (default 16) |
+| `DS4_TP2_GRAPHS=0` | decode without CUDA graphs |
+| `DS4_TP2_XFER=0` | each card reads its own half of a missing expert from the drive |
+| `DS4_TP2_CHECK=1` | check: after every decode layer, both cards' HC streams must be the same bits |
+| `DS4_MMQ_TIGHT_GRID=0`, `DS4_F16_LAUNCHERS=1` | the old expert MMQ grid; the F16 row projections from one thread (both also apply with the layers split) |
+
+**Measured on 21 November 2026**, same machine and method as the layer-split table above: `ds4-bench`, every run a
+fresh process with the caches and the 48 GiB RAM tier preloaded, three runs with `DS4_CUDA_TP2=1` and two with the
+layers split (one at 3,000 tokens), in one session. Every decode step of every run has the logits of the one-card
+reference, compared by hash, and so does the prompt pass's own last position at 512, 1,556 and 3,000 tokens.
+
+| setup | 512 + 200: prefill tok/s | decode tok/s | 1,556 + 300: prefill tok/s | decode tok/s | 3,000 + 48: prefill tok/s | decode tok/s |
+|---|---|---|---|---|---|---|
+| layers split | 145.6–147.3 | 58.7–58.8 | 232.2–232.5 | 62.1–62.4 | 328.1 | 60.9 |
+| both cards on every layer | **234.4–243.3** | **66.6–67.1** | **386.7–395.9** | **68.1–68.6** | **542.2–543.2** | **66.4–67.1** |
+
+Through `ds4-server` (32,768-token context, image input on), four requests of about 6,000 tokens in a row, two JSON
+extractions with 600-token answers and two 400-token commentaries, took 12.3, 12.5, 11.7 and 11.3 s against 15.4,
+15.1, 13.7 and 14.3 s with the layers split; the first token came after 3.7 to 4.1 s instead of 5.5 to 6.6 s. The
+answers were the same text, and so were an invoice image (869 tokens, 24 s) and short chat prompts. Commentary decodes
+at about the same speed in both layouts: after a long prompt it waits mostly on expert reads from the drive (about
+1.3 ms each), which a second card does not shorten.
+
+**Measured and left out.** Reading ahead in decode with the next layer's router (it predicts 57 % of the decode
+reads, but one layer, 0.3 to 0.5 ms, is less time than a read takes); several rows in one cuBLAS call for the F16
+projections (cuBLAS then picks other kernels and the result differs in the last bits); keeping the predicted experts
+out of the eviction scan until their layer (no change); running the prompt pass's dense projections and attention on
+both cards as well (estimated at about zero: the exchanges cost what the split saves).
+
+**Limits.** DSpark does not run with `DS4_CUDA_TP2`. Decode rows that carry an image run without the CUDA graphs.
+Requests are served one at a time. Each card holds the dense weights of all 40 layers, so the two caches hold about
+6 % fewer experts than with the layers split. Prompts beyond about 6,000 tokens have not been run with `DS4_CUDA_TP2`.
 
 ## What was measured and left out
 
