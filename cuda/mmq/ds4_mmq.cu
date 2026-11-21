@@ -28,6 +28,13 @@
 
 static thread_local const int32_t *t_ds4_mmq_x_slot = NULL;   /* K5: set around the prompt pass's MoE calls */
 extern "C" void ds4_mmq_set_x_slot(const int32_t *slot) { t_ds4_mmq_x_slot = slot; }
+/* MMQ-T: the largest column count of any expert in the next routed-expert MMQ calls (0: unknown) */
+static thread_local int64_t t_ds4_mmq_col_bound = 0;
+extern "C" void ds4_mmq_set_col_bound(int64_t n) {
+    static int off = -1;
+    if (off < 0) { const char *e = getenv("DS4_MMQ_TIGHT_GRID"); off = e && !strcmp(e, "0"); }
+    t_ds4_mmq_col_bound = off ? 0 : n;
+}
 
 #include <cstdio>
 #include <cstdlib>
@@ -1672,6 +1679,7 @@ int ds4_mmq_moe_impl(
         /*x_soa=*/x_soa,
         /*soa_blocks=*/soa_blocks,
         /*x_slot=*/t_ds4_mmq_x_slot,
+        /*ncols_tile_max=*/t_ds4_mmq_col_bound,   /* MMQ-T */
     };
 
     mul_mat_q_case<type>(*ctx, args, stream);
@@ -2241,6 +2249,7 @@ int ds4_mmq_moe_pair_impl(
         /*soa_blocks=*/soa_blocks,
         /*x_slot=*/t_ds4_mmq_x_slot,
     };
+    args.ncols_tile_max = t_ds4_mmq_col_bound;   /* MMQ-T */
 
     {
         ds4_mmq_nvtx_scope stage(

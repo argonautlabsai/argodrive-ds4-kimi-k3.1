@@ -838,6 +838,17 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ds4-bench: prefill window mono %.1f .. %.1f ms\n",
                     prefill_t0 * 1e3, prefill_t1 * 1e3);
         const int prefill_tokens = frontier - previous;
+        if (getenv("DS4_BENCH_DECODE_LOGITS_HASH")) {   /* the prompt pass's own last logits (TP2-X) */
+            const int vocab = ds4_engine_vocab_size(engine);
+            float *lg = vocab > 0 ? malloc((size_t)vocab * sizeof(lg[0])) : NULL;
+            if (lg && ds4_session_copy_logits(session, lg, vocab) == vocab) {
+                uint64_t hsh = 1469598103934665603ull;
+                const unsigned char *p8 = (const unsigned char *)lg;
+                for (size_t k = 0; k < (size_t)vocab * sizeof(lg[0]); k++) hsh = (hsh ^ p8[k]) * 1099511628211ull;
+                fprintf(stderr, "ds4-bench: prefill-hash frontier=%d %016llx\n", frontier, (unsigned long long)hsh);
+            }
+            free(lg);
+        }
 
         if (write_frontier_logits_json(&cfg, engine, session, frontier, previous) != 0) {
             rc = 1;

@@ -473,6 +473,10 @@ typedef struct ds4_gpu_stream_expert_table {
     uint64_t    down_offset;
     uint64_t    gate_expert_bytes;
     uint64_t    down_expert_bytes;
+    /* TP2: 2 when each card caches one row part of every expert, this card's being part_index (gate/up rows
+     * [part_index * mid/2, +mid/2), down rows [part_index * out/2, +out/2)); 0: whole experts */
+    uint32_t    part_count;
+    uint32_t    part_index;
 } ds4_gpu_stream_expert_table;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
 /* Optional CUDA look-ahead between completed layers, inside the existing
@@ -513,6 +517,100 @@ void ds4_gpu_stream_expert_lookahead_arm(const ds4_gpu_stream_expert_table *next
 int ds4_gpu_selected_ids_early(const ds4_gpu_tensor *selected, uint32_t n_selected);
 /* E3: the one-token decode's periodic flush; a no-op on CUDA (see ds4_cuda.cu). */
 int ds4_gpu_decode_flush_commands(void);
+
+/* TP2 (exact two-card tensor parallelism over the SSD-streaming split, DS4_CUDA_TP2=1): both cards run every layer;
+ * large matrices are split by heads, groups or output rows and the cards exchange finished pieces, never partial
+ * sums. Each card's streaming cache holds one row part of every expert. The calls act on the current card. */
+int ds4_gpu_tp2_init(void);
+int ds4_gpu_tp2_active(void);
+/* both cards' streams wait for each other's work queued so far */
+int ds4_gpu_tp2_barrier(void);
+/* the card to_tier waits for the work queued so far on from_tier */
+int ds4_gpu_tp2_signal(int from_tier, int to_tier);
+/* bytes from src (this card) into dst (the other card, or this one); a kernel, or the copy engine when large */
+int ds4_gpu_tp2_push(ds4_gpu_tensor *dst, uint64_t dst_off, const ds4_gpu_tensor *src, uint64_t src_off,
+                     uint64_t bytes);
+/* rows x cols floats from src (row stride src_stride) into a and b (either may be NULL; row stride dst_stride),
+ * offsets in floats */
+int ds4_gpu_tp2_rows(ds4_gpu_tensor *a, ds4_gpu_tensor *b, uint64_t dst_off, uint32_t dst_stride,
+                     const ds4_gpu_tensor *src, uint64_t src_off, uint32_t src_stride, uint32_t cols, uint32_t rows);
+/* the router's IDs on the host: the early copy of this card when one is pending for `selected`, else a read */
+int ds4_gpu_tp2_ids(const ds4_gpu_tensor *selected, int32_t *ids, uint32_t n);
+/* one token, this card's part `part` of the selected experts (host IDs, the same on both cards): loads the part of
+ * each, then mid_part[6][mid_dim/2] = the part's weighted SwiGLU rows */
+int ds4_gpu_tp2_moe_gate_up(ds4_gpu_tensor *mid_part, const ds4_gpu_tensor *x, const ds4_gpu_tensor *weights,
+                            const int32_t *ids, uint32_t n_ids, const void *model_map, uint64_t model_size,
+                            uint32_t layer, uint32_t n_total_expert, uint64_t gate_offset, uint64_t up_offset,
+                            uint64_t down_offset, uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                            uint32_t part, uint32_t in_dim, uint32_t mid_dim, float clamp);
+/* one token: the part's down rows of the experts of the last gate/up call, summed: out_part[out_dim/2] from the whole
+ * mid [6][mid_dim] */
+/* before a decode layer's routed experts on both cards: every selected expert that a card's cache lacks and the
+ * RAM tier does not hold is read whole from the drive, once, into a transfer slot on card 0 both cards copy from */
+int ds4_gpu_tp2_moe_prefetch(const int32_t *ids, uint32_t n_ids, const void *model_map, uint64_t model_size,
+                             uint32_t n_total_expert, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+                             uint64_t gate_expert_bytes, uint64_t down_expert_bytes);
+/* after both cards queued that layer's routed experts: the transfer slots it used are free once that work has run */
+int ds4_gpu_tp2_moe_prefetch_mark(void);
+/* the two halves of ds4_gpu_tp2_moe_gate_up: the cache lookup and loads (host), then the launch from the cache's
+ * state (graph-capturable) */
+int ds4_gpu_tp2_moe_load(const int32_t *ids, uint32_t n_ids, const void *model_map, uint64_t model_size,
+                         uint32_t layer, uint32_t n_total_expert, uint64_t gate_offset, uint64_t up_offset,
+                         uint64_t down_offset, uint64_t gate_expert_bytes, uint64_t down_expert_bytes, uint32_t part);
+int ds4_gpu_tp2_moe_gate_up_launch(ds4_gpu_tensor *mid_part, const ds4_gpu_tensor *x, const ds4_gpu_tensor *weights,
+                                   uint32_t n_ids, uint32_t in_dim, uint32_t mid_dim, float clamp);
+/* TP2-G: island il/island of the current card: 1 replayed, 0 capturing (encode it, then _end), -1 encode it eagerly */
+int ds4_gpu_tp2_graph_begin(uint32_t il, uint32_t island);
+int ds4_gpu_tp2_graph_end(uint32_t il, uint32_t island);
+void ds4_gpu_tp2_graph_abort(void);
+void ds4_gpu_tp2_graphs_invalidate(void);
+/* the prompt pass's counterpart of ds4_gpu_tp2_moe_prefetch: ids are the chunk's rows x 6 selected experts */
+int ds4_gpu_tp2_moe_batch_prefetch(const int32_t *ids, uint32_t n_ids, const void *model_map, uint64_t model_size,
+                                   uint32_t layer, uint32_t n_total_expert, uint64_t gate_offset, uint64_t up_offset,
+                                   uint64_t down_offset, uint64_t gate_expert_bytes, uint64_t down_expert_bytes);
+/* TP2-V: the prompt pass's routed experts in two waves (see ds4_cuda.cu). plan: 1 = both waves have work and
+ * wave 0's tables are on both cards, 0 = one pass, -1 = error. wave2_prepare: the chunk's load on the current card
+ * (whatever is still missing), then wave 1's tables. gate_up/down: the current card's part of a wave. */
+int ds4_gpu_tp2_waves_on(void);
+/* TP2-RA: prompt-pass read-ahead. on: DS4_TP2_RA (default on) with TP2. set: the predicted IDs (rows x 6) of `layer`'s
+ * first batch, with that layer's expert tensor offsets and sizes */
+int ds4_gpu_tp2_ra_on(void);
+/* TP2-XP: the transfer slots, pinned now (engine open) */
+int ds4_gpu_tp2_xfer_prepare(uint64_t gate_expert_bytes, uint64_t down_expert_bytes);
+void ds4_gpu_tp2_ra_set(uint32_t layer, const int32_t *ids, uint32_t n, uint32_t n_total_expert, uint64_t gate_offset,
+                        uint64_t up_offset, uint64_t down_offset, uint64_t gate_expert_bytes, uint64_t down_expert_bytes);
+/* TP2-X: a prompt-pass chunk of n_tokens <= 8 rows after ds4_gpu_tp2_moe_load of its rows x 6 IDs: the part's
+ * weighted SwiGLU rows (mid_part[rows*6][mid_dim/2]), then the part's down rows summed (out_part[rows][out_dim/2]) */
+int ds4_gpu_tp2_moe_vec_rows(ds4_gpu_tensor *mid_part, const ds4_gpu_tensor *x, const ds4_gpu_tensor *weights,
+                             uint32_t n_tokens, uint32_t in_dim, uint32_t mid_dim, float clamp);
+int ds4_gpu_tp2_moe_vec_down_rows(ds4_gpu_tensor *out_part, const ds4_gpu_tensor *mid_full, uint32_t n_tokens,
+                                  uint32_t out_dim, uint32_t mid_dim);
+void ds4_gpu_tp2_waves_end(void);
+int ds4_gpu_tp2_waves_plan(const int32_t *ids, uint32_t pairs, uint32_t n_total_expert, uint64_t gate_offset,
+                           uint64_t gate_expert_bytes);
+int ds4_gpu_tp2_wave2_prepare(const int32_t *ids, uint32_t pairs, const void *model_map, uint64_t model_size,
+                              uint32_t layer, uint32_t n_total_expert, uint64_t gate_offset, uint64_t up_offset,
+                              uint64_t down_offset, uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                              uint32_t part);
+int ds4_gpu_tp2_wave_gate_up(int wave, ds4_gpu_tensor *mid_here, ds4_gpu_tensor *mid_there, ds4_gpu_tensor *gate_buf,
+                             ds4_gpu_tensor *up_buf, const ds4_gpu_tensor *x, const ds4_gpu_tensor *weights,
+                             uint32_t rows, uint32_t in_dim, uint32_t mid_dim, float clamp);
+int ds4_gpu_tp2_wave_down(int wave, ds4_gpu_tensor *out, uint32_t out_stride, uint32_t col0, ds4_gpu_tensor *down_buf,
+                          const ds4_gpu_tensor *mid_full, uint32_t rows, uint32_t out_dim, uint32_t mid_dim, int sum);
+int ds4_gpu_tp2_moe_down(ds4_gpu_tensor *out_part, const ds4_gpu_tensor *mid_full, uint32_t out_dim, uint32_t mid_dim);
+/* a prompt chunk of `rows` tokens, this card's part: loads the part of every selected expert (ids: rows x 6 on the
+ * host), then the part's gate/up rows and the weighted SwiGLU into columns [part*mid_dim/2, +mid_dim/2) of the whole
+ * mid [rows*6][mid_dim] here (mid_here) and on the other card (mid_there) */
+int ds4_gpu_tp2_moe_batch_gate_up(ds4_gpu_tensor *mid_here, ds4_gpu_tensor *mid_there, ds4_gpu_tensor *gate_buf,
+                                  ds4_gpu_tensor *up_buf, const ds4_gpu_tensor *x, const ds4_gpu_tensor *weights,
+                                  const int32_t *ids, uint32_t rows, const void *model_map, uint64_t model_size,
+                                  uint32_t layer, uint32_t n_total_expert, uint64_t gate_offset, uint64_t up_offset,
+                                  uint64_t down_offset, uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                                  uint32_t part, uint32_t in_dim, uint32_t mid_dim, float clamp);
+/* a prompt chunk: the part's down rows of the experts of this card's last batch gate/up, summed per token into
+ * columns [col0, col0 + out_dim/2) of out (row stride out_stride floats; on this card or the other) */
+int ds4_gpu_tp2_moe_batch_down(ds4_gpu_tensor *out, uint32_t out_stride, uint32_t col0, ds4_gpu_tensor *down_buf,
+                               const ds4_gpu_tensor *mid_full, uint32_t rows, uint32_t out_dim, uint32_t mid_dim);
 #endif
 #ifdef __APPLE__
 /* The async selected-load worker registers itself so Metal cache paths never

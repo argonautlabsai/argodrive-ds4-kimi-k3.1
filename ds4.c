@@ -41889,13 +41889,25 @@ typedef struct {
      * above belong to now, `other` the other card's set; ds41_tier_enter() exchanges them. NULL on one card. */
     int split_cut, tier;
     ds41_tier_set *other;
+    /* TP2 (DS4_CUDA_TP2=1): both cards run every layer of a decode step (ds41_tp2_layer). tp2_kv[t]: card t's KV
+     * caches and Engram norms; the graph's fields name card tp2_cur's (outside a TP2 step: g->tier's). tp2v[t]: views
+     * of card t's halves. */
+    bool tp2;
+    int tp2_cur;
+    struct ds41_tp2_kv *tp2_kv[2];
+    ds4_gpu_tensor *tp2v[2][10];
 } ds41_gpu_graph;
+struct ds41_tp2_kv {
+    ds4_gpu_tensor *window[40], *compressed[4], *index_cache[4], *previous_kv[4], *previous_score[4];
+    ds4_gpu_tensor *engram_q_norm[2], *engram_k_norm[2];
+};
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
 #define DS41_SPLIT_BUILD 1
 /* The cut the engine opened with (0: every layer on one card) and the card ds41_alloc() allocates on while a graph is
  * being built. */
 static int g_ds41_split_cut, g_ds41_alloc_tier;
+static int g_ds41_tp2;   /* TP2 is on: session graphs build both cards' KV caches */
 static ds4_gpu_tensor *ds41_alloc_at(int tier, uint64_t bytes) {
     return g_ds41_split_cut ? ds4_gpu_tensor_alloc_ptr_on(tier, bytes) : ds4_gpu_tensor_alloc(bytes);
 }
@@ -41985,6 +41997,9 @@ static DS4_MAYBE_UNUSED bool ds41_tier_copy_full(void) {
 /* Make `tier` the card the graph works on. The card being left is drained, the state the next layer reads is copied
  * to the other card's tensors and the working fields are exchanged. rows: the prompt-pass rows whose batch and carry
  * state must follow (0 while decoding: the hidden state, its split weights and `pre` do). */
+#ifdef DS41_SPLIT_BUILD
+static void ds41_tp2_point(ds41_gpu_graph *g, int tier);
+#endif
 static bool ds41_tier_enter(ds41_gpu_graph *g, int tier, uint32_t rows) {
 #ifdef DS41_SPLIT_BUILD
     if (!g->other) return true;
@@ -42035,11 +42050,186 @@ static bool ds41_tier_enter(ds41_gpu_graph *g, int tier, uint32_t rows) {
     if (full && g->block_list_mask == g->block_mask) g->block_list_mask = o->block_mask;
     ds41_tier_swap(g);
     g->tier = tier;
+    if (g->tp2) {   /* TP2: this card's KV caches */
+        ds41_tp2_point(g, tier);
+        g->tp2_cur = tier;
+    }
     return true;
 #else
     (void)g; (void)tier; (void)rows;
     return true;
 #endif
+}
+
+#ifdef DS41_SPLIT_BUILD
+/* TP2: the views of a card's halves (ds41_tp2_finish_alloc) */
+enum { TP2V_Q, TP2V_HEADS, TP2V_LOW, TP2V_BLOCK, TP2V_SMID, TP2V_SGATE, TP2V_SUP, TP2V_SHARED, TP2V_ROUTED, TP2V_MIDP,
+       TP2V_N };
+
+/* the card that holds a compressed-KV owner's caches in the split: that of its source layer */
+static int ds41_tp2_owner_home(const ds41_gpu_graph *g, uint32_t i) {
+    return ds41_layer_tier(g, i == 0 ? 2u : i == 1 ? 8u : i == 2 ? 14u : 20u);
+}
+
+/* Name card `tier`'s KV caches and Engram norms in the graph's fields. */
+static void ds41_tp2_point(ds41_gpu_graph *g, int tier) {
+    const struct ds41_tp2_kv *k = g->tp2_kv[tier];
+    for (uint32_t i = 0; i < 40; i++) g->window[i] = k->window[i];
+    for (uint32_t i = 0; i < 4; i++) {
+        g->compressed[i] = k->compressed[i];
+        g->index_cache[i] = k->index_cache[i];
+        g->previous_kv[i] = k->previous_kv[i];
+        g->previous_score[i] = k->previous_score[i];
+    }
+    for (uint32_t i = 0; i < 2; i++) {
+        g->engram_q_norm[i] = k->engram_q_norm[i];
+        g->engram_k_norm[i] = k->engram_k_norm[i];
+    }
+}
+
+/* Make `tier` the card the graph works on within a TP2 step: no drain, no copy. Only the decode working tensors
+ * and the KV caches change sides; the prompt-pass sets stay with g->tier. */
+static bool ds41_tp2_switch(ds41_gpu_graph *g, int tier) {
+    if (ds4_gpu_set_current_device(tier) != 0) return false;
+    if (g->tp2_cur == tier) return true;
+    ds41_tier_set *o = g->other;
+    ds4_gpu_tensor *t;
+#define DS41_SWAP(name, count) t = g->name; g->name = o->name; o->name = t;
+    DS41_SCRATCH(DS41_SWAP)
+#undef DS41_SWAP
+    ds41_tp2_point(g, tier);
+    g->tp2_cur = tier;
+    return true;
+}
+
+/* While the graph is built: the other card's copy of every KV cache and Engram norm. */
+static bool ds41_tp2_alloc_kv(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w, uint32_t ctx) {
+    for (int t = 0; t < 2; t++)
+        if (!(g->tp2_kv[t] = calloc(1, sizeof(*g->tp2_kv[t])))) return false;
+    struct ds41_tp2_kv **k = g->tp2_kv;
+#define DS41_TP2_TWIN(field, home, bytes) do { \
+        const int h_ = (home); \
+        k[h_]->field = g->field; \
+        if (!(k[1 - h_]->field = ds41_alloc_at(1 - h_, (bytes)))) return false; \
+    } while (0)
+    for (uint32_t i = 0; i < 40; i++) DS41_TP2_TWIN(window[i], ds41_layer_tier(g, i), 128u * 512u * sizeof(float));
+    for (uint32_t i = 0; i < 4; i++) {
+        const uint64_t cap = ctx / (i < 3 ? 2u : 1u) + 1u;
+        const int h = ds41_tp2_owner_home(g, i);
+        DS41_TP2_TWIN(compressed[i], h, cap * 512u * sizeof(float));
+        DS41_TP2_TWIN(index_cache[i], h, cap * 128u * sizeof(float));
+        DS41_TP2_TWIN(previous_kv[i], h, 512u * sizeof(float));
+        DS41_TP2_TWIN(previous_score[i], h, 512u * sizeof(float));
+    }
+    for (uint32_t i = 0; i < 2; i++) {
+        const uint32_t il = i ? 14u : 1u;
+        const uint64_t bytes = (uint64_t)DS4_N_EMBD * DS4_N_HC * 4;
+        const int h = ds41_layer_tier(g, il);
+        DS41_TP2_TWIN(engram_q_norm[i], h, bytes);
+        DS41_TP2_TWIN(engram_k_norm[i], h, bytes);
+        if (!ds4_gpu_tensor_write(k[1 - h]->engram_q_norm[i], 0, tensor_data(m, w->layer[il].engram_q_norm), bytes) ||
+            !ds4_gpu_tensor_write(k[1 - h]->engram_k_norm[i], 0, tensor_data(m, w->layer[il].engram_k_norm), bytes))
+            return false;
+    }
+#undef DS41_TP2_TWIN
+    return true;
+}
+
+/* After the graph is built (its fields name card 0's working tensors, g->other card 1's): the views of each card's
+ * halves, and card 0's KV caches in the fields. */
+static bool ds41_tp2_finish_alloc(ds41_gpu_graph *g) {
+    const uint64_t hd = (uint64_t)(DS4_N_HEAD / 2u) * DS4_N_HEAD_DIM * 4u;
+    const uint64_t low = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O / 2u * 4u;
+    const uint64_t eh = (uint64_t)DS4_N_EMBD / 2u * 4u, fh = (uint64_t)DS4_N_FF_EXP / 2u * 4u;
+    for (int t = 0; t < 2; t++) {
+        ds4_gpu_tensor **v = g->tp2v[t];
+#define DS41_TP2_T(name) (t ? g->other->name : g->name)
+        v[TP2V_Q] = ds4_gpu_tensor_view(DS41_TP2_T(q), (uint64_t)t * hd, hd);
+        v[TP2V_HEADS] = ds4_gpu_tensor_view(DS41_TP2_T(heads), (uint64_t)t * hd, hd);
+        v[TP2V_LOW] = ds4_gpu_tensor_view(DS41_TP2_T(low), (uint64_t)t * low, low);
+        v[TP2V_BLOCK] = ds4_gpu_tensor_view(DS41_TP2_T(block), (uint64_t)t * eh, eh);
+        v[TP2V_SMID] = ds4_gpu_tensor_view(DS41_TP2_T(shared_mid), (uint64_t)t * fh, fh);
+        v[TP2V_SGATE] = ds4_gpu_tensor_view(DS41_TP2_T(shared_gate), (uint64_t)t * fh, fh);
+        v[TP2V_SUP] = ds4_gpu_tensor_view(DS41_TP2_T(shared_up), (uint64_t)t * fh, fh);
+        v[TP2V_SHARED] = ds4_gpu_tensor_view(DS41_TP2_T(shared), (uint64_t)t * eh, eh);
+        v[TP2V_ROUTED] = ds4_gpu_tensor_view(DS41_TP2_T(routed), (uint64_t)t * eh, eh);
+        v[TP2V_MIDP] = ds4_gpu_tensor_view(DS41_TP2_T(gate), 0, (uint64_t)DS4_N_EXPERT_USED * fh);
+#undef DS41_TP2_T
+        for (int i = 0; i < TP2V_N; i++)
+            if (!v[i]) return false;
+    }
+    ds41_tp2_point(g, 0);
+    g->tp2_cur = 0;
+    return true;
+}
+
+/* Before the graph is freed: its fields name the home copies again (the generic free releases those), the other
+ * card's copies and the views go here. */
+static void ds41_tp2_free(ds41_gpu_graph *g) {
+    for (int t = 0; t < 2; t++)
+        for (int i = 0; i < TP2V_N; i++) {
+            ds4_gpu_tensor_free(g->tp2v[t][i]);
+            g->tp2v[t][i] = NULL;
+        }
+    struct ds41_tp2_kv **k = g->tp2_kv;
+    if (k[0] && k[1]) {
+#define DS41_TP2_UNTWIN(field, home) do { \
+            const int h_ = (home); \
+            if (k[h_]->field) g->field = k[h_]->field; \
+            ds4_gpu_tensor_free(k[1 - h_]->field); \
+        } while (0)
+        for (uint32_t i = 0; i < 40; i++) DS41_TP2_UNTWIN(window[i], ds41_layer_tier(g, i));
+        for (uint32_t i = 0; i < 4; i++) {
+            const int h = ds41_tp2_owner_home(g, i);
+            DS41_TP2_UNTWIN(compressed[i], h);
+            DS41_TP2_UNTWIN(index_cache[i], h);
+            DS41_TP2_UNTWIN(previous_kv[i], h);
+            DS41_TP2_UNTWIN(previous_score[i], h);
+        }
+        for (uint32_t i = 0; i < 2; i++) {
+            const int h = ds41_layer_tier(g, i ? 14u : 1u);
+            DS41_TP2_UNTWIN(engram_q_norm[i], h);
+            DS41_TP2_UNTWIN(engram_k_norm[i], h);
+        }
+#undef DS41_TP2_UNTWIN
+    }
+    free(k[0]);
+    free(k[1]);
+    k[0] = k[1] = NULL;
+    g->tp2 = false;
+}
+
+/* After a prompt pass, which writes each layer's caches on that layer's card: the other card's copies. */
+static bool ds41_tp2_mirror(ds41_gpu_graph *g) {
+    struct ds41_tp2_kv **k = g->tp2_kv;
+    bool ok = true;
+#define DS41_TP2_MIRROR(field, home) do { \
+        const int h_ = (home); \
+        if (ok) ok = ds4_gpu_tensor_copy_xdev_default(k[1 - h_]->field, k[h_]->field, \
+                                                      ds4_gpu_tensor_bytes(k[h_]->field)) != 0; \
+    } while (0)
+    for (uint32_t i = 0; i < 40; i++) DS41_TP2_MIRROR(window[i], ds41_layer_tier(g, i));
+    for (uint32_t i = 0; i < 4; i++) {
+        const int h = ds41_tp2_owner_home(g, i);
+        DS41_TP2_MIRROR(compressed[i], h);
+        DS41_TP2_MIRROR(index_cache[i], h);
+        DS41_TP2_MIRROR(previous_kv[i], h);
+        DS41_TP2_MIRROR(previous_score[i], h);
+    }
+#undef DS41_TP2_MIRROR
+    return ok;
+}
+#endif
+
+/* After a prompt pass of several rows: with TP2 the other card takes a copy of the KV caches it wrote. */
+static DS4_MAYBE_UNUSED bool ds41_tp2_after_prefill(ds41_gpu_graph *g, bool rows, bool ok) {
+#ifdef DS41_SPLIT_BUILD
+    if (rows && g->tp2) ds4_gpu_tp2_graphs_invalidate();   /* TP2-G: the pass may have moved a buffer */
+    if (ok && rows && g->tp2) return ds41_tp2_mirror(g);
+#else
+    (void)g; (void)rows;
+#endif
+    return ok;
 }
 
 /* DS4_V41_LAYER_HASH=<n> (diagnostic): a hash of the hidden state after every layer of the prompt pass (the last row
@@ -42104,6 +42294,9 @@ static bool ds41_index_bf16_on(void) { return !(ds4_gpu_v41_off() & DS4_GPU_V41_
 
 static void ds41_graph_free(ds41_gpu_graph *g) {
     if (!g) return;
+#ifdef DS41_SPLIT_BUILD
+    if (g->tp2) ds41_tp2_free(g);
+#endif
     ds41_tier_set_free(g->other, g->prefill_cap);   /* the other card's set */
     g->other = NULL;
 #ifdef DS41_SPLIT_BUILD
@@ -42275,6 +42468,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     if (streaming && g_ds41_split_cut) {   /* DS4_CUDA_STREAM_SPLIT: a set of working tensors for each card */
         g->split_cut = g_ds41_split_cut;
         if (!(g->other = calloc(1, sizeof(*g->other)))) goto fail;
+        g->tp2 = g_ds41_tp2 != 0;
     }
 #endif
     g->token_map = malloc((size_t)DS4_N_VOCAB * sizeof(uint32_t));
@@ -42330,6 +42524,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
             goto fail;
 #endif
     }
+#ifdef DS41_SPLIT_BUILD
+    if (g->tp2 && !ds41_tp2_alloc_kv(g, m, w, ctx)) goto fail;
+#endif
 #ifdef __APPLE__
     if (ds41_index_bf16_on() && !(g->index_bf16_flag = ds4_gpu_tensor_alloc(sizeof(uint32_t)))) goto fail;
 #endif
@@ -42394,6 +42591,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
         g_ds41_alloc_tier = 0;
         g->tier = 0;
     }
+    if (g->tp2 && !ds41_tp2_finish_alloc(g)) goto fail;
 #endif
 #ifndef __APPLE__
     g->engram_reader = ds4_engram_reader_create();
@@ -44570,6 +44768,131 @@ static bool ds41_stage_selected_for_layer(ds41_gpu_graph *g, const ds4_model *m,
 }
 #endif
 
+#ifdef DS41_SPLIT_BUILD
+/* TP2 prompt pass: the chunk's routed experts on both cards, each card its row part of every selected expert (the
+ * part its cache holds). The layer's card (h) sends the normalized rows and routing weights across; each card
+ * computes its gate/up rows and writes its columns of the whole SwiGLU mid on both cards; after the barrier each
+ * computes its down rows and sums them per token into its columns of the routed output on card h. */
+static bool ds41_tp2_moe_batch(ds41_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t il,
+                               uint32_t count) {
+    const int h = g->tier, o = 1 - h;
+    ds41_prefill_row *bh = &g->batch, *bo = &g->other->batch;
+    const uint32_t E = DS4_N_EMBD, F = DS4_N_FF_EXP, K = DS4_N_EXPERT_USED;
+    uint64_t gate_row = 0, down_row = 0;
+    if (!count || !tensor_nbytes(l->ffn_gate_exps->type, E, &gate_row) ||
+        !tensor_nbytes(l->ffn_down_exps->type, F, &down_row)) return false;
+    const uint64_t pairs = (uint64_t)count * K;
+    int32_t *ids = malloc((size_t)pairs * sizeof(int32_t));
+    if (!ids) return false;
+    /* TP2-RA: at a layer's first batch, the next layer's router on these rows (scratch on the home card) */
+    static uint32_t ra_last_il = UINT32_MAX;
+    const bool ra_first = il != ra_last_il;
+    ra_last_il = il;
+    bool ra = false;
+    static ds4_gpu_tensor *ra_t[2][4];   /* per card: logits, selected, weights, probs */
+    static uint32_t ra_cap[2];
+    if (ra_first && il + 1u < DS4_N_LAYER && !g->image_count && ds4_gpu_tp2_ra_on() && h >= 0 && h < 2) {
+        const ds4_layer_weights *ln = l + 1;
+        if (ra_cap[h] < count) {
+            for (int k = 0; k < 4; k++) { if (ra_t[h][k]) ds4_gpu_tensor_free(ra_t[h][k]); ra_t[h][k] = NULL; }
+            ra_t[h][0] = ds41_alloc_at(h, (uint64_t)count * DS4_N_EXPERT * sizeof(float));
+            ra_t[h][1] = ds41_alloc_at(h, (uint64_t)count * DS4_N_EXPERT_USED * sizeof(int32_t));
+            ra_t[h][2] = ds41_alloc_at(h, (uint64_t)count * DS4_N_EXPERT_USED * sizeof(float));
+            ra_t[h][3] = ds41_alloc_at(h, (uint64_t)count * DS4_N_EXPERT * sizeof(float));
+            ra_cap[h] = ra_t[h][0] && ra_t[h][1] && ra_t[h][2] && ra_t[h][3] ? count : 0;
+        }
+        ra = ra_cap[h] >= count && ln->ffn_gate_inp && ln->ffn_exp_probs_b && ds4_gpu_set_current_device(h) == 0 &&
+            ds41_matmul_batch(ra_t[h][0], m, ln->ffn_gate_inp, bh->norm, count, false) &&
+            ds4_gpu_router_select_batch_tensor(ra_t[h][1], ra_t[h][2], ra_t[h][3], m->map, m->size,
+                ln->ffn_exp_probs_b->abs_offset, 0, 0, 0, 0, true, false, ra_t[h][0], g->prefill_tokens,
+                DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, count);
+    }
+    bool ok = ds4_gpu_tp2_push(bo->norm, 0, bh->norm, 0, (uint64_t)count * E * sizeof(float)) &&
+        ds4_gpu_tp2_push(bo->route_weights, 0, bh->route_weights, 0, pairs * sizeof(float)) &&
+        ds4_gpu_tensor_read(bh->selected, 0, ids, pairs * sizeof(int32_t)) &&
+        ds4_gpu_tp2_signal(h, o);
+    if (ok && ra) {   /* TP2-RA: the prediction (its kernels ran before the IDs' read) */
+        const ds4_layer_weights *ln = l + 1;
+        uint64_t ng = 0, nd = 0;
+        int32_t *pid = malloc(pairs * sizeof(int32_t));
+        if (pid && tensor_nbytes(ln->ffn_gate_exps->type, E, &ng) && tensor_nbytes(ln->ffn_down_exps->type, F, &nd) &&
+            ds4_gpu_set_current_device(h) == 0 && ds4_gpu_tensor_read(ra_t[h][1], 0, pid, pairs * sizeof(int32_t)))
+            ds4_gpu_tp2_ra_set(il + 1u, pid, (uint32_t)pairs, DS4_N_EXPERT, ln->ffn_gate_exps->abs_offset,
+                ln->ffn_up_exps->abs_offset, ln->ffn_down_exps->abs_offset, ng * F, nd * E);
+        free(pid);
+        ok = ds4_gpu_set_current_device(h) == 0;
+    }
+    /* TP2-V: the experts both cards hold run while the others are read */
+    const bool vec_rows = count <= 8u;   /* TP2-X: the one-card path's vector kernels for such chunks */
+    int waves = ok && !vec_rows ? ds4_gpu_tp2_waves_plan(ids, (uint32_t)pairs, DS4_N_EXPERT,
+                                                         l->ffn_gate_exps->abs_offset, gate_row * F) : 0;
+    if (waves < 0) ok = false;
+    for (int k = 0; ok && waves > 0 && k < 2; k++) {
+        const int t = k ? o : h;
+        ds41_prefill_row *b = t == h ? bh : bo, *p = t == h ? bo : bh;
+        ok = ds4_gpu_set_current_device(t) == 0 &&
+            ds4_gpu_tp2_wave_gate_up(0, b->mid, p->mid, b->gate, b->up, b->norm, b->route_weights, count, E, F,
+                                     DS4_SWIGLU_CLAMP_EXP);
+    }
+    ok = ok && (waves <= 0 || ds4_gpu_tp2_barrier());
+    for (int k = 0; ok && waves > 0 && k < 2; k++) {
+        const int t = k ? o : h;
+        ds41_prefill_row *b = t == h ? bh : bo;
+        ok = ds4_gpu_set_current_device(t) == 0 &&
+            ds4_gpu_tp2_wave_down(0, bh->routed, E, (uint32_t)t * (E / 2u), b->experts, b->mid, count, E, F, 0);
+    }
+    ok = ok &&
+        ds4_gpu_tp2_moe_batch_prefetch(ids, (uint32_t)pairs, m->map, m->size, il, DS4_N_EXPERT,
+            l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset, l->ffn_down_exps->abs_offset,
+            gate_row * F, down_row * E) &&
+        ds4_gpu_set_current_device(h) == 0;
+    for (int k = 0; ok && vec_rows && k < 2; k++) {   /* TP2-X */
+        const int t = k ? o : h;
+        ds41_prefill_row *b = t == h ? bh : bo, *p = t == h ? bo : bh;
+        ok = ds4_gpu_set_current_device(t) == 0 &&
+            ds4_gpu_tp2_moe_load(ids, (uint32_t)pairs, m->map, m->size, il, DS4_N_EXPERT, l->ffn_gate_exps->abs_offset,
+                l->ffn_up_exps->abs_offset, l->ffn_down_exps->abs_offset, gate_row * F, down_row * E, (uint32_t)t) &&
+            ds4_gpu_tp2_moe_vec_rows(b->gate, b->norm, b->route_weights, count, E, F, DS4_SWIGLU_CLAMP_EXP) &&
+            ds4_gpu_tp2_rows(b->mid, p->mid, (uint64_t)t * (F / 2u), F, b->gate, 0, F / 2u, F / 2u, (uint32_t)pairs);
+    }
+    for (int k = 0; ok && !vec_rows && k < 2; k++) {
+        const int t = k ? o : h;
+        ds41_prefill_row *b = t == h ? bh : bo, *p = t == h ? bo : bh;
+        ok = ds4_gpu_set_current_device(t) == 0 &&
+            (waves > 0 ?
+             ds4_gpu_tp2_wave2_prepare(ids, (uint32_t)pairs, m->map, m->size, il, DS4_N_EXPERT,
+                 l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset, l->ffn_down_exps->abs_offset,
+                 gate_row * F, down_row * E, (uint32_t)t) &&
+             ds4_gpu_tp2_wave_gate_up(1, b->mid, p->mid, b->gate, b->up, b->norm, b->route_weights, count, E, F,
+                                      DS4_SWIGLU_CLAMP_EXP) :
+             ds4_gpu_tp2_moe_batch_gate_up(b->mid, p->mid, b->gate, b->up, b->norm, b->route_weights, ids, count,
+                m->map, m->size, il, DS4_N_EXPERT, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                l->ffn_down_exps->abs_offset, gate_row * F, down_row * E, (uint32_t)t, E, F, DS4_SWIGLU_CLAMP_EXP));
+    }
+    ok = ok && ds4_gpu_tp2_barrier();
+    for (int k = 0; ok && vec_rows && k < 2; k++) {   /* TP2-X: each card's output rows into the home card's */
+        const int t = k ? o : h;
+        ds41_prefill_row *b = t == h ? bh : bo;
+        ok = ds4_gpu_set_current_device(t) == 0 &&
+            ds4_gpu_tp2_moe_vec_down_rows(b->experts, b->mid, count, E, F) &&
+            ds4_gpu_tp2_rows(bh->routed, NULL, (uint64_t)t * (E / 2u), E, b->experts, 0, E / 2u, E / 2u, count);
+    }
+    for (int k = 0; ok && !vec_rows && k < 2; k++) {
+        const int t = k ? o : h;
+        ds41_prefill_row *b = t == h ? bh : bo;
+        ok = ds4_gpu_set_current_device(t) == 0 &&
+            (waves > 0 ?
+             ds4_gpu_tp2_wave_down(1, bh->routed, E, (uint32_t)t * (E / 2u), b->experts, b->mid, count, E, F, 1) :
+             ds4_gpu_tp2_moe_batch_down(bh->routed, E, (uint32_t)t * (E / 2u), b->experts, b->mid, count, E, F));
+    }
+    if (waves > 0) ds4_gpu_tp2_waves_end();
+    ok = ok && ds4_gpu_tp2_signal(o, h);
+    if (ds4_gpu_set_current_device(h) != 0) ok = false;
+    free(ids);
+    return ok;
+}
+#endif
+
 static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, uint32_t count,
                            bool shared_owner, bool shared_down) {
@@ -44615,6 +44938,9 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
             DS4_N_EMBD, count, DS4_N_EXPERT, DS4_N_EXPERT_USED, g->tp_rank, il & 1u)) &&
 #endif
         (
+#ifdef DS41_SPLIT_BUILD
+        g->tp2 ? ds41_tp2_moe_batch(g, m, l, il, count) :
+#endif
 #ifndef __APPLE__
         g->tp_world == 2 ?
         ds4_gpu_routed_moe_batch_owned_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
@@ -44673,8 +44999,296 @@ static void ar_keepalive_scope_end(int *active) {
 }
 #endif
 
+#ifdef DS41_SPLIT_BUILD
+/* TP2: this card's piece of a working tensor into the other card's, at the same offset */
+#define DS41_TP2_PUSH(name, off, bytes) ds4_gpu_tp2_push(g->other->name, (off), g->name, (off), (bytes))
+
+/* One decode layer on both cards. Every value is computed whole, on one card, by the kernel and the inputs the one-card
+ * layer uses: the replicated steps run on both cards from identical inputs, the split matrices by heads, groups or
+ * output rows, and the cards exchange finished halves (never partial sums). Exchanges: A (out_a's low), B (out_b),
+ * C (the shared and routed SwiGLU mids), D (the shared and routed downs); each ends in a barrier, which also orders
+ * a card's reuse of a buffer after the other card's last read of it. */
+/* TP2-G: what a layer's islands read besides the graph */
+typedef struct {
+    const ds4_model *m;
+    const ds4_layer_weights *l;
+    uint32_t il;
+    int token;
+    uint64_t oa_row, ob_row, sh_row, sd_row, gate_row, down_row;
+    uint32_t ob_half, sd_half;
+    const ds4_tensor *bias;
+} ds41_tp2_ctx;
+typedef bool (*ds41_tp2_island_fn)(ds41_gpu_graph *g, const ds41_tp2_ctx *c, int t);
+
+/* One island of card t: replayed when captured, else encoded (and captured on its second visit). A failed capture ran
+ * nothing and retires the island, which is then encoded eagerly. */
+static bool ds41_tp2_island(ds41_gpu_graph *g, const ds41_tp2_ctx *c, int t, uint32_t island, ds41_tp2_island_fn fn) {
+    for (int tries = 0; tries < 3; tries++) {
+        const int state = ds4_gpu_tp2_graph_begin(c->il, island);
+        if (state == 1) return true;
+        const bool ok = fn(g, c, t);
+        if (state != 0) return ok;
+        if (!ok) { ds4_gpu_tp2_graph_abort(); continue; }
+        if (ds4_gpu_tp2_graph_end(c->il, island) == 0) return true;
+    }
+    return false;
+}
+
+/* island 0: the HC mix, the q_a/kv projections and norms (replicated); this card's heads' q_b rows */
+static bool ds41_tp2i_pre(ds41_gpu_graph *g, const ds41_tp2_ctx *c, int t) {
+    const ds4_model *m = c->m;
+    const ds4_layer_weights *l = c->l;
+    const uint32_t D = DS4_N_HEAD_DIM, HH = DS4_N_HEAD / 2u;
+    if (!ds41_graph_before_attention(g, m, l, c->il)) return false;
+    const bool paired = l->attn_q_a->type == DS4_TENSOR_Q8_0 && l->attn_kv->type == DS4_TENSOR_Q8_0 &&
+        ds4_gpu_dsv41_project_pair_q8(g->qr, g->kv, m->map, m->size, l->attn_q_a->abs_offset,
+            l->attn_kv->abs_offset, DS4_N_EMBD, (uint32_t)l->attn_q_a->dim[1], (uint32_t)l->attn_kv->dim[1], g->norm);
+    return (paired || (ds41_matmul(g->qr, m, l->attn_q_a, g->norm, true) &&
+                       ds41_matmul(g->kv, m, l->attn_kv, g->norm, true))) &&
+        (ds4_gpu_dsv41_norm_pair_rows(g->qr, g->qr, l->attn_q_a_norm->abs_offset, DS4_N_LORA_Q,
+                                      g->kv, g->kv, l->attn_kv_a_norm->abs_offset, DS4_N_HEAD_DIM,
+                                      m->map, m->size, DS4_RMS_EPS, 1u) ||
+         (ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) && ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm))) &&
+        ds41_matmul_rows(g->tp2v[t][TP2V_Q], m, l->attn_q_b, g->qr, (uint32_t)t * HH * D, HH * D);
+}
+
+/* positional, eager: rope, the KV store and the index selection (replicated); this card's heads' attention and their
+ * inverse rope */
+static bool ds41_tp2_attention_core(ds41_gpu_graph *g, const ds41_tp2_ctx *c, int t) {
+    const ds4_model *m = c->m;
+    const ds4_layer_weights *l = c->l;
+    const uint32_t il = c->il, D = DS4_N_HEAD_DIM, HH = DS4_N_HEAD / 2u;
+    const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
+    const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
+    const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
+    const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
+    const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
+    ds4_gpu_tensor *const *v = g->tp2v[t];
+    return ds41_rope(v[TP2V_Q], HH, D, il, pos, false) &&
+        ds41_rope_store(g->kv, g->window[il], (uint64_t)(pos % 128u) * 512u * 4u, DS4_N_HEAD_DIM, il, pos,
+                        DS4_V41_FP8_E8M0) &&
+        ds41_attention_select(g, m, l, il) &&
+        (!n_comp || ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner], g->selected_comp, n_comp,
+                                            attended)) &&
+        ds4_gpu_attention_decode_heads_tensor(v[TP2V_HEADS], m->map, m->size,
+            l->attn_sinks->abs_offset + (uint64_t)t * HH * sizeof(float), v[TP2V_Q], g->window[il], n_raw, 128,
+            (pos + 1u - n_raw) % 128u, g->selected_kv, 0, attended, NULL, 0, HH, DS4_N_HEAD_DIM) &&
+        ds4_gpu_dsv41_rope_bf16(v[TP2V_HEADS], DS4_N_HEAD_DIM, HH, 1, pos, ratio != 0, true);
+}
+
+/* island 1: this card's groups of out_a from its heads, sent to the other card (exchange A) */
+static bool ds41_tp2i_outa(ds41_gpu_graph *g, const ds41_tp2_ctx *c, int t) {
+    const uint32_t GG = DS4_N_OUT_GROUP / 2u, LOWH = DS4_N_OUT_GROUP * DS4_N_LORA_O / 2u;
+    ds4_gpu_tensor *const *v = g->tp2v[t];
+    return ds4_gpu_attention_output_low_q8_tensor(v[TP2V_LOW], c->m->map, c->m->size,
+            c->l->attn_output_a->abs_offset + (uint64_t)t * GG * 1024u * c->oa_row, 4096, 1024, GG, v[TP2V_HEADS]) &&
+        DS41_TP2_PUSH(low, (uint64_t)t * LOWH * 4u, (uint64_t)LOWH * 4u);
+}
+
+/* island 2: this card's output rows of out_b from the whole low (exchange B) */
+static bool ds41_tp2i_outb(ds41_gpu_graph *g, const ds41_tp2_ctx *c, int t) {
+    return ds4_gpu_matmul_q8_0_bf16io_tensor(g->tp2v[t][TP2V_BLOCK], c->m->map, c->m->size,
+            c->l->attn_output_b->abs_offset + (uint64_t)t * c->ob_half * c->ob_row, c->l->attn_output_b->dim[0],
+            c->ob_half, g->low, 1) != 0 &&
+        DS41_TP2_PUSH(block, (uint64_t)t * c->ob_half * 4u, (uint64_t)c->ob_half * 4u);
+}
+
+/* island 3 (replicated): the HC expand and FFN mix, the router */
+static bool ds41_tp2i_ffn(ds41_gpu_graph *g, const ds41_tp2_ctx *c, int t) {
+    (void)t;
+    return ds41_hc_expand(g->after_attn, g->block, g->residual, g->attn_split) &&
+        ds41_hc_mix(g, c->m, c->l, true, g->attn_split) &&
+        ds41_matmul(g->route_logits, c->m, c->l->ffn_gate_inp, g->norm, false) &&
+        ds4_gpu_router_select_tensor(g->selected, g->route_weights, g->route_probs,
+            c->m->map, c->m->size, c->bias->abs_offset, 0, 0, (uint32_t)c->token,
+            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false, g->route_logits);
+}
+
+/* island 4: this card's rows of the shared expert's SwiGLU, sent to the other card (exchange C) */
+static bool ds41_tp2i_shared(ds41_gpu_graph *g, const ds41_tp2_ctx *c, int t) {
+    const uint32_t F = DS4_N_FF_EXP;
+    ds4_gpu_tensor *const *v = g->tp2v[t];
+    return ds4_gpu_dsv41_shared_swiglu(v[TP2V_SMID], v[TP2V_SGATE], v[TP2V_SUP], c->m->map, c->m->size,
+            c->l->ffn_gate_shexp->abs_offset + (uint64_t)t * (F / 2u) * c->sh_row,
+            c->l->ffn_up_shexp->abs_offset + (uint64_t)t * (F / 2u) * c->sh_row,
+            DS4_N_EMBD, F / 2u, g->norm, DS4_SWIGLU_CLAMP_EXP, 1u) &&
+        DS41_TP2_PUSH(shared_mid, (uint64_t)t * (F / 2u) * 4u, (uint64_t)(F / 2u) * 4u);
+}
+
+/* island 5: this card's part of the routed experts' SwiGLU rows, written into both cards' whole mid (exchange C) */
+static bool ds41_tp2i_moe(ds41_gpu_graph *g, const ds41_tp2_ctx *c, int t) {
+    const uint32_t F = DS4_N_FF_EXP;
+    ds4_gpu_tensor *const *v = g->tp2v[t];
+    (void)c;
+    return ds4_gpu_tp2_moe_gate_up_launch(v[TP2V_MIDP], g->norm, g->route_weights, DS4_N_EXPERT_USED, DS4_N_EMBD, F,
+                                          DS4_SWIGLU_CLAMP_EXP) &&
+        ds4_gpu_tp2_rows(g->mid, g->other->mid, (uint64_t)t * (F / 2u), F, v[TP2V_MIDP], 0, F / 2u, F / 2u,
+                         DS4_N_EXPERT_USED);
+}
+
+/* island 6: this card's output rows of the shared and the routed downs, sent to the other card (exchange D) */
+static bool ds41_tp2i_down(ds41_gpu_graph *g, const ds41_tp2_ctx *c, int t) {
+    const uint32_t E = DS4_N_EMBD, F = DS4_N_FF_EXP;
+    ds4_gpu_tensor *const *v = g->tp2v[t];
+    return ds4_gpu_matmul_q8_0_bf16io_tensor(v[TP2V_SHARED], c->m->map, c->m->size,
+            c->l->ffn_down_shexp->abs_offset + (uint64_t)t * c->sd_half * c->sd_row, c->l->ffn_down_shexp->dim[0],
+            c->sd_half, g->shared_mid, 1) != 0 &&
+        ds4_gpu_tp2_moe_down(v[TP2V_ROUTED], g->mid, E, F) &&
+        DS41_TP2_PUSH(shared, (uint64_t)t * c->sd_half * 4u, (uint64_t)c->sd_half * 4u) &&
+        DS41_TP2_PUSH(routed, (uint64_t)t * (E / 2u) * 4u, (uint64_t)(E / 2u) * 4u);
+}
+
+/* island 7 (replicated): the expand into the HC streams */
+static bool ds41_tp2i_exp(ds41_gpu_graph *g, const ds41_tp2_ctx *c, int t) {
+    (void)t;
+    return ds4_gpu_hc_expand_split_add_bf16_tensor(g->residual, g->routed, g->shared, g->after_attn, g->ffn_split,
+                                                   DS4_N_EMBD, DS4_N_HC) &&
+        (c->il + 1u != DS4_N_LAYER || ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float)));
+}
+
+/* One decode layer on both cards. Every value is computed whole, on one card, by the kernel and the inputs the one-card
+ * layer uses: the replicated steps run on both cards from identical inputs, the split matrices by heads, groups or
+ * output rows, and the cards exchange finished halves (never partial sums). Exchanges: A (out_a's low), B (out_b),
+ * C (the shared and routed SwiGLU mids), D (the shared and routed downs); each ends in a barrier, which also orders
+ * a card's reuse of a buffer after the other card's last read of it. */
+static bool ds41_tp2_layer(ds41_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t il, int token) {
+    const uint32_t E = DS4_N_EMBD, F = DS4_N_FF_EXP;
+    ds41_tp2_ctx c = {.m = m, .l = l, .il = il, .token = token};
+    if (!tensor_nbytes(l->attn_output_a->type, 4096, &c.oa_row) ||
+        !tensor_nbytes(l->attn_output_b->type, l->attn_output_b->dim[0], &c.ob_row) ||
+        !tensor_nbytes(l->ffn_gate_shexp->type, E, &c.sh_row) ||
+        !tensor_nbytes(l->ffn_down_shexp->type, l->ffn_down_shexp->dim[0], &c.sd_row) ||
+        !tensor_nbytes(l->ffn_gate_exps->type, E, &c.gate_row) ||
+        !tensor_nbytes(l->ffn_down_exps->type, F, &c.down_row)) return false;
+    c.ob_half = (uint32_t)l->attn_output_b->dim[1] / 2u;
+    c.sd_half = (uint32_t)l->ffn_down_shexp->dim[1] / 2u;
+    c.bias = ds41_image_at(g, g->pos) ? l->ffn_exp_probs_vl : l->ffn_exp_probs_b;
+    if (!c.bias || l->attn_q_b->type != DS4_TENSOR_Q8_0 || l->attn_output_b->type != DS4_TENSOR_Q8_0 ||
+        l->ffn_gate_shexp->type != DS4_TENSOR_Q8_0 || l->ffn_up_shexp->type != DS4_TENSOR_Q8_0 ||
+        l->ffn_down_shexp->type != DS4_TENSOR_Q8_0 || c.ob_half * 2u != E || c.sd_half * 2u != E) return false;
+    const bool graphs = !g->image_count;   /* an image position changes what a layer runs */
+#define DS41_TP2_ISL(id, fn) (graphs ? ds41_tp2_island(g, &c, t, (id), (fn)) : (fn)(g, &c, t))
+    bool ok = true;
+    for (int t = 0; ok && t < 2; t++) ok = ds41_tp2_switch(g, t) && DS41_TP2_ISL(0, ds41_tp2i_pre);
+    for (int t = 0; ok && t < 2; t++) ok = ds41_tp2_switch(g, t) && ds41_tp2_attention_core(g, &c, t);
+    for (int t = 0; ok && t < 2; t++) ok = ds41_tp2_switch(g, t) && DS41_TP2_ISL(1, ds41_tp2i_outa);
+    ok = ok && ds4_gpu_tp2_barrier();   /* A */
+    for (int t = 0; ok && t < 2; t++)
+        ok = ds41_tp2_switch(g, t) && DS41_TP2_ISL(2, ds41_tp2i_outb);
+    ok = ok && ds4_gpu_tp2_barrier();   /* B */
+    for (int t = 0; ok && t < 2; t++) {
+        ok = ds41_tp2_switch(g, t) && DS41_TP2_ISL(3, ds41_tp2i_ffn);
+        if (ok && t == 0 && g->streaming && !g->quality && !g->imatrix)
+            (void)ds4_gpu_selected_ids_early(g->selected, DS4_N_EXPERT_USED);
+    }
+    for (int t = 0; ok && t < 2; t++) ok = ds41_tp2_switch(g, t) && DS41_TP2_ISL(4, ds41_tp2i_shared);
+    int32_t ids[DS4_N_EXPERT_USED];
+    ok = ok && ds41_tp2_switch(g, 0) && ds4_gpu_tp2_ids(g->selected, ids, DS4_N_EXPERT_USED) &&
+        ds4_gpu_tp2_moe_prefetch(ids, DS4_N_EXPERT_USED, m->map, m->size, DS4_N_EXPERT, l->ffn_gate_exps->abs_offset,
+            l->ffn_up_exps->abs_offset, l->ffn_down_exps->abs_offset, c.gate_row * F, c.down_row * E);
+    for (int t = 0; ok && t < 2; t++) {
+        ok = ds41_tp2_switch(g, t) &&
+            ds4_gpu_tp2_moe_load(ids, DS4_N_EXPERT_USED, m->map, m->size, il, DS4_N_EXPERT, l->ffn_gate_exps->abs_offset,
+                l->ffn_up_exps->abs_offset, l->ffn_down_exps->abs_offset, c.gate_row * F, c.down_row * E, (uint32_t)t) &&
+            DS41_TP2_ISL(5, ds41_tp2i_moe);
+    }
+    ok = ok && ds4_gpu_tp2_moe_prefetch_mark() && ds4_gpu_tp2_barrier();   /* C */
+    for (int t = 0; ok && t < 2; t++)
+        ok = ds41_tp2_switch(g, t) && DS41_TP2_ISL(6, ds41_tp2i_down);
+    ok = ok && ds4_gpu_tp2_barrier();   /* D */
+    for (int t = 0; ok && t < 2; t++)
+        ok = ds41_tp2_switch(g, t) && DS41_TP2_ISL(7, ds41_tp2i_exp);
+#undef DS41_TP2_ISL
+    return ok;
+}
+#undef DS41_TP2_PUSH
+
+/* DS4_TP2_CHECK=1 (diagnostic): after every layer, the two cards' HC streams must be the same bits. */
+static bool ds41_tp2_check(ds41_gpu_graph *g, uint32_t il) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DS4_TP2_CHECK"); on = e && strcmp(e, "0") != 0; }
+    if (!on) return true;
+    uint64_t hsh[2] = {0, 0};
+    for (int t = 0; t < 2; t++) {
+        if (!ds41_tp2_switch(g, t)) return false;
+        hsh[t] = ds41_tensor_hash(g->residual);
+    }
+    if (hsh[0] != hsh[1]) {
+        fprintf(stderr, "ds4: TP2 check: the cards' streams differ after layer %u at position %u\n", il, g->pos);
+        return false;
+    }
+    return true;
+}
+
+/* A decode step with TP2: ds41_graph_step's work on both cards; the head runs on card 1. */
+static bool ds41_tp2_graph_step(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w, int token,
+                                float *logits) {
+    if (!g || !g->valid || !g->other || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
+    uint32_t ids[2][DS4_ENGRAM_COLS];
+    ds4_engram_history next_history = g->history;
+    if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
+    const bool overlap_engram = g->engram_reader && !ds41_image_at(g, g->pos) &&
+        !getenv("DS4_DISABLE_V41_ENGRAM_OVERLAP");
+    if (overlap_engram && !ds4_engram_reader_start(g->engram_reader, g->table, ids, &g->rows[0][0])) return false;
+    ds4_engram_prefetch *rows[2] = {NULL, NULL};
+    for (uint32_t i = 0; !overlap_engram && !ds41_image_at(g, g->pos) && i < 2; i++) {
+        rows[i] = ds4_engram_read_batch_start(&g->table[i], ids[i], 1, DS4_ENGRAM_COLS, g->rows[i]);
+        if (!rows[i]) {
+            if (i) ds4_engram_read_batch_finish(rows[0]);
+            return false;
+        }
+    }
+    const int home = g->tier;
+    const float initial_pre[] = {1, 0, 0, 0};
+    bool ok = true;
+    for (int t = 0; ok && t < 2; t++)
+        ok = ds41_tp2_switch(g, t) && ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) &&
+            ds41_embed(g, m, w, g->residual, g->x, token, g->pos);
+    g->scalar_decode = true;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        const unsigned table = il == 1 ? 0 : 1;
+        if (ds41_engram_layer(il) && (rows[table] || overlap_engram)) {   /* each table joins at its layer */
+            const bool read = overlap_engram ? ds4_engram_reader_wait(g->engram_reader, table) :
+                ds4_engram_read_batch_finish(rows[table]);
+            rows[table] = NULL;
+            for (int t = 0; ok && t < 2; t++)
+                ok = read && ds41_tp2_switch(g, t) && ds4_gpu_tensor_write(table ? g->engram_rows_b : g->engram_rows,
+                    0, g->rows[table], sizeof(g->rows[table]));
+        }
+        if (ok) ok = ds41_tp2_layer(g, m, &w->layer[il], il, token) && ds41_tp2_check(g, il);
+        if (ok && ds41_layer_hash_steps() && ds41_layer_hash_left != 0) {
+            if (ds41_layer_hash_left < 0) ds41_layer_hash_left = ds41_layer_hash_steps();
+            ok = ds41_tp2_switch(g, 0);
+            ds41_layer_hash("decode", il, g->pos, g->residual);
+            if (il + 1u == DS4_N_LAYER) ds41_layer_hash_left--;
+        }
+        if (!ok) fprintf(stderr, "ds4: V4.1 TP2 layer %u failed at position %u\n", il, g->pos);
+    }
+    g->scalar_decode = false;
+    for (uint32_t i = 0; i < 2; i++)
+        if (rows[i]) ds4_engram_read_batch_finish(rows[i]);   /* a failure before layer 1 */
+    if (ok && logits)
+        ok = ds41_tp2_switch(g, 1) && ds41_graph_encode_logits(g, m, w) &&
+            ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float));
+    if (overlap_engram && !ds4_engram_reader_wait(g->engram_reader, 1)) ok = false;
+    for (int t = 0; t < 2; t++)   /* the token's work is done on both cards */
+        if (ds4_gpu_set_current_device(t) != 0 || !ds4_gpu_synchronize()) ok = false;
+    if (!ds41_tp2_switch(g, home)) ok = false;
+    if (!ok) {
+        g->valid = false;
+        return false;
+    }
+    g->history = next_history;
+    g->pos++;
+    return true;
+}
+#endif
+
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
+#ifdef DS41_SPLIT_BUILD
+    if (g && g->tp2) return ds41_tp2_graph_step(g, m, w, token, logits);
+#endif
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     /* The cleanup covers error exits too: a failed request cannot leave the keep-alive running. */
@@ -77611,6 +78225,11 @@ static int engine_stream_split_cut(const ds4_engine *e, const ds4_gpu_config *cf
 }
 /* a tensor that is never resident: the routed experts of a layer (streamed from the drive) and the Engram tables (read by
  * rows on the host, named as the single-card mapping names them) */
+/* TP2: DS4_CUDA_TP2=1 with the two-card SSD-streaming split: both cards run every layer */
+static bool engine_tp2_requested(const ds4_engine *e) {
+    const char *s = getenv("DS4_CUDA_TP2");
+    return s && !strcmp(s, "1") && engine_stream_split_cut(e, &e->gpu_cfg) > 0;
+}
 static bool engine_stream_split_routed_tensor(const ds4_engine *e, const ds4_tensor *t, int entry) {
     if (!e || !t) return false;
     if (t == e->model.ngram_tensor || ds4_streq(t->name, "blk.1.engram_embd.weight") ||
@@ -78198,6 +78817,12 @@ static int engine_install_per_device_caches(ds4_engine *e) {
             ? expert_bytes * (DS4_N_EXPERT / 2u) : t->bytes;
         if (engine_append_device_cache_span(per_dev_ranges, per_dev_n, per_dev_cap,
                                             logical_tier, physical_device,
+                                            home_offset, home_bytes) != 0) {
+            goto cleanup;
+        }
+        if (engine_tp2_requested(e) && e->gpu_cfg.n_gpus == 2 &&   /* TP2: the other card runs this layer too */
+            engine_append_device_cache_span(per_dev_ranges, per_dev_n, per_dev_cap,
+                                            1 - logical_tier, g_gpu[1 - logical_tier].device_id,
                                             home_offset, home_bytes) != 0) {
             goto cleanup;
         }
@@ -80171,6 +80796,30 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                 gpu_cfg->device_indices[tier], share, (double)slab_expert_bytes / 1048576.0);
                     }
                     (void)ds4_gpu_set_current_device(0);
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+                    if (engine_tp2_requested(e)) {   /* TP2: each card caches its row part of every layer's experts */
+                        if (e->dspark) {
+                            fprintf(stderr, "ds4: TP2 does not run the DSpark drafter\n");
+                            ds4_engine_close(e); *out = NULL; return 1;
+                        }
+                        for (int tier = 0; tier < 2; tier++) {
+                            if (ds4_gpu_set_current_device(tier) != 0) { ds4_engine_close(e); *out = NULL; return 1; }
+                            ds4_gpu_set_streaming_expert_cache_layers(DS4_N_LAYER);
+                            ds4_gpu_set_streaming_expert_cache_span(0, 0);
+                        }
+                        (void)ds4_gpu_set_current_device(0);
+                        if (!ds4_gpu_tp2_init()) { ds4_engine_close(e); *out = NULL; return 1; }
+                        g_ds41_tp2 = 1;
+                        {   /* TP2-XP: the transfer slots now, not in the first prompt pass */
+                            const ds4_layer_weights *l0 = &e->weights.layer[0];
+                            uint64_t gr = 0, dr = 0;
+                            if (l0->ffn_gate_exps && l0->ffn_down_exps &&
+                                tensor_nbytes(l0->ffn_gate_exps->type, DS4_N_EMBD, &gr) &&
+                                tensor_nbytes(l0->ffn_down_exps->type, DS4_N_FF_EXP, &dr))
+                                (void)ds4_gpu_tp2_xfer_prepare(gr * DS4_N_FF_EXP, dr * DS4_N_EMBD);
+                        }
+                    }
+#endif
                 }
             }
 #endif
@@ -81920,13 +82569,27 @@ void ds4_engine_streaming_preload(ds4_engine *e) {
         !((seed_vram && seed_vram[0]) || (seed_ram && seed_ram[0]))) return;
     done = true;
     const double t0 = now_sec();
+    if (g_ds41_tp2) {   /* TP2: the RAM tier is pinned first; pinned memory takes room on both cards */
+        const ds4_layer_weights *l = &e->weights.layer[0];
+        if (l->ffn_gate_exps && l->ffn_down_exps && ds4_gpu_set_current_device(0) == 0) {
+            const ds4_gpu_stream_expert_table table = graph_stream_expert_table_make(&e->model, l, 0,
+                routed_expert_row_bytes(l->ffn_gate_exps) * DS4_N_FF_EXP,
+                routed_expert_row_bytes(l->ffn_down_exps) * DS4_N_EMBD);
+            (void)ds4_gpu_stream_expert_host_tier_prime(&table);
+            (void)ds4_gpu_synchronize();
+        }
+    }
     for (int tier = 0; tier < 2; tier++) {
         const uint32_t il = tier == 0 ? 0u : (uint32_t)cut;
         const ds4_layer_weights *l = &e->weights.layer[il];
         if (!l->ffn_gate_exps || !l->ffn_down_exps || ds4_gpu_set_current_device(tier) != 0) continue;
-        const ds4_gpu_stream_expert_table table = graph_stream_expert_table_make(&e->model, l, il,
+        ds4_gpu_stream_expert_table table = graph_stream_expert_table_make(&e->model, l, il,
             routed_expert_row_bytes(l->ffn_gate_exps) * DS4_N_FF_EXP,
             routed_expert_row_bytes(l->ffn_down_exps) * DS4_N_EMBD);
+        if (g_ds41_tp2) {   /* TP2: the card caches its row part of every expert */
+            table.part_count = 2u;
+            table.part_index = (uint32_t)tier;
+        }
         const int32_t first_expert = 0;   /* asking for one expert builds the card's cache and seeds it */
         if (!ds4_gpu_stream_expert_cache_begin_selected_load(&table, &first_expert, 1))
             fprintf(stderr, "ds4: SSD streaming split: preload failed on card %d\n", tier);
@@ -84720,7 +85383,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             /* Never add an encoder sweep just to defer the decoder. A short
              * remainder finishes the pending decoder here, then runs normally. */
             const bool layer_major = count > 1u;
-            const bool ok = short_count ?
+            const bool ok = ds41_tp2_after_prefill(g, short_count || layer_major, short_count ?
                 ds41_graph_short_prefill(g, &e->model, &e->weights, prompt->v + i, count) :
                 layer_major ?
                 (defer_decoder || decoder_pending ?
@@ -84729,7 +85392,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                     defer_decoder, decoder_pending) :
                  ds41_graph_prefill(g, &e->model, &e->weights, prompt->v + i, count,
                     s->progress, s->progress_ud, prompt->len, s->cancel, s->cancel_ud)) :
-                ds41_graph_step(g, &e->model, &e->weights, prompt->v[i], NULL);
+                ds41_graph_step(g, &e->model, &e->weights, prompt->v[i], NULL));
             if (!ok) {
                 ds41_encoder_release(g, &e->model, &encoder);
                 s->checkpoint_valid = false;

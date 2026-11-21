@@ -1252,6 +1252,219 @@ extern "C" int ds4_gpu_dsv41_indexer_all_batch(ds4_gpu_tensor *selected, uint32_
     return cuda_ok(cudaGetLastError(), "V4.1 indexer select all");
 }
 
+/* F16-G: groups of rows per cuBLAS GEMM where bitwise equal to one GEMM per row (checked per card and shape) */
+__global__ static void f16g_diff_kernel(const float *a, const float *b, uint64_t n, unsigned int *diff) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n && __float_as_uint(a[i]) != __float_as_uint(b[i])) atomicAdd(diff, 1u);
+}
+
+static int f16g_group(void) {
+    static int g = -1;
+    if (g < 0) { const char *e = getenv("DS4_F16_ROW_GROUP"); g = e && *e ? atoi(e) : 1; if (g < 1) g = 1; if (g > 64) g = 64; }
+    return g;
+}
+
+static int f16g_gemm_h(cublasHandle_t h, const __half *w, const __half *x, float *y, uint32_t width, uint32_t outputs,
+                       uint32_t n) {
+    const float alpha = 1.0f, beta = 0.0f;
+    const cublasStatus_t st = cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, (int)outputs, (int)n,
+        (int)width, &alpha, w, CUDA_R_16F, (int)width, x, CUDA_R_16F, (int)width, &beta, y, CUDA_R_32F, (int)outputs,
+        CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+    return st == CUBLAS_STATUS_SUCCESS;
+}
+
+/* ---- F16-P: one-row GEMMs issued by launcher threads ----------------------------------------------------------- */
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <atomic>
+struct f16p_job { const __half *w; const __half *x; float *y; uint32_t width, outputs, r0, r1; };
+struct f16p_pool {
+    int dev = -1, n = 0;
+    std::vector<cudaStream_t> st;
+    std::vector<cublasHandle_t> h;
+    std::vector<cudaEvent_t> done;
+    cudaEvent_t start = NULL;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::vector<f16p_job> jobs;
+    uint64_t gen = 0;
+    std::atomic<int> left{0}, fail{0};
+};
+static f16p_pool *g_f16p[DS4_MAX_GPUS];
+
+static int f16p_launchers(void) {
+    static int n = -1;
+    if (n < 0) { const char *e = getenv("DS4_F16_LAUNCHERS"); n = e && *e ? atoi(e) : 4; if (n < 1) n = 1; if (n > 16) n = 16; }
+    return n;
+}
+
+static void f16p_worker(f16p_pool *p, int k) {
+    (void)cudaSetDevice(p->dev);
+    uint64_t seen = 0;
+    for (;;) {
+        f16p_job j;
+        {
+            std::unique_lock<std::mutex> lk(p->mu);
+            p->cv.wait(lk, [&] { return p->gen != seen; });
+            seen = p->gen;
+            j = p->jobs[(size_t)k];
+        }
+        bool ok = cudaStreamWaitEvent(p->st[(size_t)k], p->start, 0) == cudaSuccess;
+        for (uint32_t r = j.r0; ok && r < j.r1; r++)
+            ok = f16g_gemm_h(p->h[(size_t)k], j.w, j.x + (uint64_t)r * j.width, j.y + (uint64_t)r * j.outputs, j.width,
+                             j.outputs, 1) != 0;
+        ok = ok && cudaEventRecord(p->done[(size_t)k], p->st[(size_t)k]) == cudaSuccess;
+        if (!ok) p->fail.store(1);
+        p->left.fetch_sub(1, std::memory_order_acq_rel);
+    }
+}
+
+static f16p_pool *f16p_ensure(int tier) {
+    if (tier < 0 || tier >= DS4_MAX_GPUS) return NULL;
+    if (g_f16p[tier]) return g_f16p[tier]->n ? g_f16p[tier] : NULL;
+    f16p_pool *p = new f16p_pool();   /* never freed: its threads wait on it for ever */
+    g_f16p[tier] = p;
+    const int n = f16p_launchers();
+    if (n < 2) return NULL;
+    int cur = -1;
+    if (cudaGetDevice(&cur) != cudaSuccess) { (void)cudaGetLastError(); return NULL; }
+    p->dev = g_gpu[tier].device_id;
+    if (cudaSetDevice(p->dev) != cudaSuccess) { (void)cudaGetLastError(); return NULL; }
+    cublasMath_t math = CUBLAS_DEFAULT_MATH;
+    bool ok = cublasGetMathMode(cuda_cublas_main_for_tier(tier), &math) == CUBLAS_STATUS_SUCCESS &&
+        cudaEventCreateWithFlags(&p->start, cudaEventDisableTiming) == cudaSuccess;
+    for (int k = 0; ok && k < n; k++) {
+        cudaStream_t st = NULL; cublasHandle_t h = NULL; cudaEvent_t ev = NULL;
+        ok = cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) == cudaSuccess &&
+            cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) == cudaSuccess &&
+            cublasCreate(&h) == CUBLAS_STATUS_SUCCESS && cublasSetStream(h, st) == CUBLAS_STATUS_SUCCESS &&
+            cublasSetMathMode(h, math) == CUBLAS_STATUS_SUCCESS;
+        p->st.push_back(st); p->h.push_back(h); p->done.push_back(ev);
+    }
+    (void)cudaSetDevice(cur);
+    if (!ok) { (void)cudaGetLastError(); fprintf(stderr, "ds4: F16-P: launcher streams could not be set up on card %d\n", tier); return NULL; }
+    p->jobs.resize((size_t)n);
+    for (int k = 0; k < n; k++) std::thread(f16p_worker, p, k).detach();
+    p->n = n;
+    return p;
+}
+
+/* rows [0, rows) on the launcher threads; the calling (legacy) stream waits for them */
+static int f16p_issue(f16p_pool *p, const __half *w, const __half *x, float *y, uint32_t width, uint32_t outputs,
+                      uint32_t rows) {
+    if (!cuda_ok(cudaEventRecord(p->start, cuda_decode_stream()), "F16-P start")) return 0;
+    {
+        std::lock_guard<std::mutex> lk(p->mu);
+        for (int k = 0; k < p->n; k++) {
+            const uint32_t r0 = (uint32_t)((uint64_t)rows * (uint32_t)k / (uint32_t)p->n);
+            const uint32_t r1 = (uint32_t)((uint64_t)rows * (uint32_t)(k + 1) / (uint32_t)p->n);
+            p->jobs[(size_t)k] = {w, x, y, width, outputs, r0, r1};
+        }
+        p->fail.store(0);
+        p->left.store(p->n, std::memory_order_release);
+        p->gen++;
+    }
+    p->cv.notify_all();
+    while (p->left.load(std::memory_order_acquire) != 0) std::this_thread::yield();
+    if (p->fail.load()) { fprintf(stderr, "ds4: F16-P: a launcher failed\n"); return 0; }
+    for (int k = 0; k < p->n; k++)
+        if (!cuda_ok(cudaStreamWaitEvent(cuda_decode_stream(), p->done[(size_t)k], 0), "F16-P join")) return 0;
+    return 1;
+}
+
+static int f16g_gemm(int tier, const __half *w, const __half *x, float *y, uint32_t width, uint32_t outputs, uint32_t n) {
+    const float alpha = 1.0f, beta = 0.0f;
+    const cublasStatus_t st = cublasGemmEx(cuda_cublas_for_tier(tier), CUBLAS_OP_T, CUBLAS_OP_N, (int)outputs, (int)n,
+        (int)width, &alpha, w, CUDA_R_16F, (int)width, x, CUDA_R_16F, (int)width, &beta, y, CUDA_R_32F, (int)outputs,
+        CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+    return cublas_ok(st, "F16 row group");
+}
+
+/* rows [0, rows) of y = w^T x, x already in F16: groups where checked equal, else one GEMM per row */
+static int f16g_rows(int tier, const __half *w, const __half *x, float *y, uint32_t width, uint32_t outputs,
+                     uint32_t rows) {
+    static std::map<std::tuple<int, uint32_t, uint32_t, uint32_t>, int> verdict;
+    static float *check[DS4_MAX_GPUS];
+    static uint64_t check_cap[DS4_MAX_GPUS];
+    static unsigned int *diff[DS4_MAX_GPUS];
+    /* F16-P */
+    static std::map<std::tuple<int, uint32_t, uint32_t>, int> par_verdict;
+    f16p_pool *pool = rows >= 32u && !g_dsv41_shared.active && !g_decode_graph_capturing && g_tp2g_capturing < 0 ?
+        f16p_ensure(tier) : NULL;
+    if (pool) {
+        const auto key = std::make_tuple(tier, width, outputs);
+        const auto it = par_verdict.find(key);
+        if (it != par_verdict.end() && it->second == 1) return f16p_issue(pool, w, x, y, width, outputs, rows);
+        if (it == par_verdict.end()) {   /* first sight: rows by the launchers, the first 32 again on the main handle */
+            const uint64_t need = (uint64_t)32u * outputs;
+            if (check_cap[tier] < need) {
+                if (check[tier]) (void)cudaFree(check[tier]);
+                check[tier] = NULL; check_cap[tier] = 0;
+                if (!cuda_ok(cudaMalloc((void **)&check[tier], (size_t)need * sizeof(float)), "F16-P check")) return 0;
+                check_cap[tier] = need;
+            }
+            if (!diff[tier] && !cuda_ok(cudaMalloc((void **)&diff[tier], sizeof(unsigned int)), "F16-P diff")) return 0;
+            if (!f16p_issue(pool, w, x, y, width, outputs, rows)) return 0;
+            for (uint32_t i = 0; i < 32u; i++)
+                if (!f16g_gemm(tier, w, x + (uint64_t)i * width, check[tier] + (uint64_t)i * outputs, width, outputs, 1)) return 0;
+            unsigned int h_diff = 1u;
+            if (!cuda_ok(cudaMemsetAsync(diff[tier], 0, sizeof(unsigned int), cuda_decode_stream()), "F16-P diff clear")) return 0;
+            f16g_diff_kernel<<<(unsigned)((need + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(check[tier], y, need, diff[tier]);
+            if (!cuda_ok(cudaGetLastError(), "F16-P compare") ||
+                !cuda_ok(cudaMemcpy(&h_diff, diff[tier], sizeof(unsigned int), cudaMemcpyDeviceToHost), "F16-P verdict")) return 0;
+            const int v = h_diff == 0u;
+            par_verdict[key] = v;
+            fprintf(stderr, "ds4: F16-P on card %d: %u x %u by %d launcher threads: %s\n", tier, width, outputs, pool->n,
+                    v ? "bitwise equal to the main handle, used" : "DIFFERS from the main handle, kept on it");
+            if (v) return 1;
+            /* the launchers' rows are not used: all rows again on the main handle below */
+        }
+    }
+    const uint32_t G = (uint32_t)f16g_group();
+    for (uint32_t r0 = 0; r0 < rows; ) {
+        const uint32_t n = rows - r0 < G ? rows - r0 : G;
+        float *yr = y + (uint64_t)r0 * outputs;
+        const __half *xr = x + (uint64_t)r0 * width;
+        int v = n > 1u ? -1 : 0;
+        if (n > 1u) {
+            const auto it = verdict.find(std::make_tuple(tier, width, outputs, n));
+            if (it != verdict.end()) v = it->second;
+        }
+        if (v == 1) {
+            if (!f16g_gemm(tier, w, xr, yr, width, outputs, n)) return 0;
+        } else if (v == 0) {
+            for (uint32_t i = 0; i < n; i++)
+                if (!f16g_gemm(tier, w, xr + (uint64_t)i * width, yr + (uint64_t)i * outputs, width, outputs, 1)) return 0;
+        } else {   /* first sight of this shape on this card: both ways, compared */
+            const uint64_t need = (uint64_t)n * outputs;
+            if (check_cap[tier] < need) {
+                if (check[tier]) (void)cudaFree(check[tier]);
+                check[tier] = NULL; check_cap[tier] = 0;
+                if (!cuda_ok(cudaMalloc((void **)&check[tier], (size_t)need * sizeof(float)), "F16 row group check")) return 0;
+                check_cap[tier] = need;
+            }
+            if (!diff[tier] && !cuda_ok(cudaMalloc((void **)&diff[tier], sizeof(unsigned int)), "F16 row group diff")) return 0;
+            for (uint32_t i = 0; i < n; i++)
+                if (!f16g_gemm(tier, w, xr + (uint64_t)i * width, check[tier] + (uint64_t)i * outputs, width, outputs, 1)) return 0;
+            if (!f16g_gemm(tier, w, xr, yr, width, outputs, n)) return 0;
+            unsigned int h_diff = 1u;
+            if (!cuda_ok(cudaMemsetAsync(diff[tier], 0, sizeof(unsigned int), cuda_decode_stream()), "F16 row group diff clear")) return 0;
+            f16g_diff_kernel<<<(unsigned)((need + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(check[tier], yr, need, diff[tier]);
+            if (!cuda_ok(cudaGetLastError(), "F16 row group compare") ||
+                !cuda_ok(cudaMemcpy(&h_diff, diff[tier], sizeof(unsigned int), cudaMemcpyDeviceToHost), "F16 row group verdict")) return 0;
+            v = h_diff == 0u ? 1 : 0;
+            verdict[std::make_tuple(tier, width, outputs, n)] = v;
+            fprintf(stderr, "ds4: F16 row groups on card %d: %u x %u, %u rows per GEMM: %s\n", tier, width, outputs, n,
+                    v ? "bitwise equal to one row per GEMM, used" : "DIFFERS from one row per GEMM, kept row by row");
+            if (!v && !cuda_ok(cudaMemcpyAsync(yr, check[tier], (size_t)need * sizeof(float), cudaMemcpyDeviceToDevice,
+                                               cuda_decode_stream()), "F16 row group keep rows")) return 0;
+        }
+        r0 += n;
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *model_map,
                                              uint64_t model_size, uint64_t weight_offset,
                                              uint32_t width, uint32_t outputs, uint32_t rows,
@@ -1259,6 +1472,29 @@ extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *mo
     if (!width || !outputs || !rows || rows > 8192u || !model_map ||
         !dsv41_has_floats(in, (uint64_t)width * rows) ||
         !dsv41_has_floats(out, (uint64_t)outputs * rows)) return 0;
+#ifndef __HIP_PLATFORM_AMD__
+    /* F16-G: the cuBLAS one-row path of ds4_gpu_matmul_f16_tensor (the default for these shapes), grouped */
+    if (rows > 1u && (f16g_group() > 1 || f16p_launchers() > 1) && g_cublas_ready && !g_quality_mode &&
+        !getenv("DS4_CUDA_SERIAL_F16_MATMUL") && !getenv("DS4_CUDA_NO_F16_CUBLAS_ONE") &&
+        !getenv("DS4_CUDA_SERIAL_ROUTER") && !getenv("DS4_CUDA_F16_SMALL_OUT") &&
+        !(width == 4096u && outputs == 256u) &&
+        width <= INT32_MAX && outputs <= INT32_MAX && weight_offset <= model_size &&
+        outputs <= (model_size - weight_offset) / sizeof(__half) / width) {
+        const uint64_t bytes = (uint64_t)width * outputs * sizeof(__half);
+        const int tier = ds4_tensor_device_idx(out);
+        if (ds4_tensor_device_idx(in) == tier) {
+            const char *w = cuda_resolve_weight_ptr(model_map, weight_offset, bytes, tier, "V4.1 F16 row groups");
+            const uint64_t count = (uint64_t)rows * width;
+            __half *x = (__half *)cuda_tmp_alloc_on(tier, count * sizeof(__half), "F16 row group inputs");
+            if (w && x) {
+                f32_to_f16_kernel<<<(count + 255u) / 256u, 256, 0, cuda_decode_stream()>>>(
+                    x, (const float *)in->ptr, count);
+                if (!cuda_ok(cudaGetLastError(), "F16 row group convert")) return 0;
+                return f16g_rows(tier, (const __half *)w, x, (float *)out->ptr, width, outputs, rows);
+            }
+        }
+    }
+#endif
 #ifndef __HIP_PLATFORM_AMD__
     if (rows > 1u && outputs <= 128u && g_cublas_ready && !g_quality_mode &&
         !getenv("DS4_CUDA_SERIAL_F16_MATMUL") && !getenv("DS4_CUDA_NO_F16_CUBLAS_ONE") &&

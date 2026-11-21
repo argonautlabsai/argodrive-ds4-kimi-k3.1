@@ -22,6 +22,7 @@
 #include <atomic>
 #include "ds4_linux_memory.h"
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <deque>
 #include <string>
@@ -165,7 +166,53 @@ typedef struct ds4_gpu_stream_expert_table {
     uint32_t layer, n_total_expert;
     uint64_t gate_offset, up_offset, down_offset;
     uint64_t gate_expert_bytes, down_expert_bytes;
+    uint32_t part_count, part_index;   /* TP2: see ds4_gpu.h */
 } ds4_gpu_stream_expert_table;
+/* TP2: what one slot of the cache holds of an expert, and where in the file it starts. Whole experts unless the table
+ * names a part. gate_expert_bytes and down_expert_bytes stay the strides between experts in the file. */
+static int g_tp2_on = 0;   /* TP2: both cards run every layer; the caches hold row parts of the experts */
+static int g_tp2g_capturing = -1;     /* TP2-G: the card whose island is being captured, -1 none */
+static cudaStream_t g_tp2g_stream[2];
+extern "C" void ds4_gpu_tp2_graphs_invalidate(void);
+/* TP2-E: whole experts read once from the drive into card 0's memory, for both cards' parts */
+struct tp2_xfer_slot {
+    uint64_t gate = 0, up = 0, down = 0;
+    char *base = NULL;                          /* pinned host: gate | up | down, each aligned for direct reads */
+    const char *pg = NULL, *pu = NULL, *pd = NULL;
+    cudaEvent_t done[2] = {NULL, NULL};
+    int marked = 0, fresh = 0;
+    /* TP2-R: a read-ahead in flight (spec): its offsets, lengths and payloads; g_tp2_left[slot] counts its parts */
+    int spec = 0;
+    uint32_t slayer = 0;   /* TP2-S: the layer the guess is for */
+    uint64_t soff[3] = {0, 0, 0}, slen[3] = {0, 0, 0};
+    const char *spay[3] = {NULL, NULL, NULL};
+};
+static std::vector<tp2_xfer_slot> g_tp2_xfer;
+#define TP2_XFER_SLOTS_MAX 128u
+static uint32_t tp2_xfer_count(void) {   /* TP2-U: DS4_TP2_SLOTS, default 32 */
+    static uint32_t n = 0;
+    if (!n) { const char *e = getenv("DS4_TP2_SLOTS"); long v = e && *e ? strtol(e, NULL, 10) : 128; n = (uint32_t)(v < 8 ? 8 : v > (long)TP2_XFER_SLOTS_MAX ? (long)TP2_XFER_SLOTS_MAX : v); }
+    return n;
+}
+static std::atomic<int> g_tp2_left[TP2_XFER_SLOTS_MAX], g_tp2_spec_fail[TP2_XFER_SLOTS_MAX];
+static std::unordered_map<uint64_t, uint32_t> g_tp2_xfer_by_gate;
+static uint32_t g_tp2_xfer_next = 0;
+static uint64_t g_tp2_xfer_reads = 0, g_tp2_xfer_hits = 0, g_tp2_xfer_peer = 0, g_tp2_xfer_gspan = 0, g_tp2_xfer_dspan = 0;
+static inline uint64_t cst_gate_bytes(const ds4_gpu_stream_expert_table *t) {
+    return t->part_count > 1u ? t->gate_expert_bytes / t->part_count : t->gate_expert_bytes;
+}
+static inline uint64_t cst_down_bytes(const ds4_gpu_stream_expert_table *t) {
+    return t->part_count > 1u ? t->down_expert_bytes / t->part_count : t->down_expert_bytes;
+}
+static inline uint64_t cst_gate_at(const ds4_gpu_stream_expert_table *t, uint64_t e) {
+    return t->gate_offset + e * t->gate_expert_bytes + (t->part_count > 1u ? t->part_index * cst_gate_bytes(t) : 0u);
+}
+static inline uint64_t cst_up_at(const ds4_gpu_stream_expert_table *t, uint64_t e) {
+    return t->up_offset + e * t->gate_expert_bytes + (t->part_count > 1u ? t->part_index * cst_gate_bytes(t) : 0u);
+}
+static inline uint64_t cst_down_at(const ds4_gpu_stream_expert_table *t, uint64_t e) {
+    return t->down_offset + e * t->down_expert_bytes + (t->part_count > 1u ? t->part_index * cst_down_bytes(t) : 0u);
+}
 extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
     const ds4_gpu_stream_expert_table *, const ds4_gpu_tensor *, uint32_t);
 static int cuda_stream_selected_cache_begin_load_tensor(
@@ -290,6 +337,11 @@ static int g_moe_skip_load = 0;          /* routed_moe_launch: use the cache as 
  * (publish a remap with misses masked to -1, skip the miss loop); 2 = load the misses with no
  * stream sync and publish a remap masked to the loaded experts. */
 static int g_begin_load_skip_sync = 0;   /* begin_load: the caller already drained the stream */
+/* TP2-W: slots a running wave reads (per card: the victim scan skips them); an install that publishes no remap */
+static std::vector<uint8_t> g_tp2v_pin[2];
+static int g_tp2v_pinned[2] = {0, 0};
+static int g_begin_load_no_remap = 0;
+static int g_begin_load_share_apply = 0;   /* TP2-W3: the previous batch has run (no drain needed) */
 static int cuda_stream_selected_cache_begin_load(const ds4_gpu_stream_expert_table *, const int32_t *, uint32_t,
                                                  bool order_reads = false);
 static int g_wave_mode = 0;
@@ -430,6 +482,20 @@ static int cuda_stream_compact_prefill(const char **gate, const char **up,
                                       uint32_t mid_dim = 0, uint32_t out_dim = 0);
 static int cuda_stream_slots_prefill(const int32_t **ids, const int32_t **slots, uint32_t *experts);   /* K5 */
 extern "C" void ds4_mmq_set_x_slot(const int32_t *slot);
+extern "C" void ds4_mmq_set_col_bound(int64_t n);   /* MMQ-T */
+/* MMQ-T: the largest number of entries any one value has among n small non-negative IDs (below `range`) */
+static int64_t cuda_ids_max_count(const int32_t *ids, size_t n, size_t range) {
+    if (!ids || !n || !range) return 0;
+    std::vector<uint32_t> c(range, 0u);
+    uint32_t best = 0;
+    for (size_t i = 0; i < n; i++) {
+        const int32_t v = ids[i];
+        if (v < 0) continue;
+        if ((size_t)v >= range) return 0;
+        if (++c[(size_t)v] > best) best = c[(size_t)v];
+    }
+    return (int64_t)best;
+}
 
 static void cuda_stream_selected_cache_invalidate(void) {
     g_stream_selected_cache.valid = 0;
@@ -439,6 +505,7 @@ static void cuda_spec_quiesce(void);
 static void cuda_spec_reap(int wait);
 static void cuda_stream_release_every_tier(int stages);
 static void cuda_stream_selected_cache_release(void) {
+    if (g_tp2_on) ds4_gpu_tp2_graphs_invalidate();   /* TP2-G: graphs name the cache's slots */
     ds4_gpu_stream_expert_cache_prefetch_finish(true);
     cuda_spec_quiesce();
     g_slot_table_rebuild = 1;
@@ -1362,6 +1429,7 @@ extern "C" int ds4_gpu_decode_graphs_supported(void) {
  * or replay is in flight. */
 static inline cudaStream_t cuda_decode_stream(void) {
     if (g_dsv41_shared.active) return g_dsv41_shared.stream;
+    if (g_tp2g_capturing >= 0) return g_tp2g_stream[g_tp2g_capturing];   /* TP2-G */
     return g_decode_graph_capturing ? g_decode_graph_stream : (cudaStream_t)0;
 }
 
@@ -1377,7 +1445,7 @@ static void cuda_dsv41_shared_free(void) {
 
 static bool cuda_dsv41_shared_prepare(void) {
     if (g_dsv41_shared.stream) return true;
-    if (g_dsv41_shared.disabled || g_decode_graph_capturing) return false;
+    if (g_dsv41_shared.disabled || g_decode_graph_capturing || g_tp2g_capturing >= 0) return false;
     if (cuda_ok(cudaStreamCreateWithFlags(&g_dsv41_shared.stream, cudaStreamNonBlocking),
                 "shared expert stream") &&
         cuda_ok(cudaEventCreateWithFlags(&g_dsv41_shared.ready, cudaEventDisableTiming),
@@ -4758,7 +4826,7 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     WITH_DEVICE(g_gpu[d].device_id) {
         /* TP gates drain the stream before exposing results to the peer. Keep
          * intermediate device copies queued instead of stalling submission. */
-        if (g_decode_graph_capturing || g_network_tp_async_copy ||
+        if (g_decode_graph_capturing || g_tp2g_capturing >= 0 || g_network_tp_async_copy ||
             g_dsv41_shared.active || async_d2d) {
             ok = cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
                                          (const char *)src->ptr + src_offset,
@@ -19846,6 +19914,9 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand launch");
 }
 
+
+#include <map>     /* the V4.1 F16 row projections keep per-shape checks */
+#include <tuple>
 extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map) return 0;
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
@@ -28434,6 +28505,10 @@ static int routed_moe_launch(
 
     /* Resident support models must not use the target model's SSD cache. */
     const bool stream_model = g_ssd_streaming_mode && model_map == g_model_fd_host_base;
+    if (g_tp2_on && stream_model) {   /* TP2: the caches hold row parts; whole experts would thrash them */
+        fprintf(stderr, "ds4: TP2: the whole-expert routed path was called (layer %u, %u rows)\n", layer_index, n_tokens);
+        return 0;
+    }
     ds4_gpu_tensor local_ids = {}, local_weights = {};
     /* Intermediate split: every rank holds half of every expert, so all
      * assignments are computed here with half the intermediate rows and the
@@ -28798,6 +28873,9 @@ static int routed_moe_launch(
             n_tokens == 1u ? cuda_decode_stream() : (cudaStream_t)0;
         int rc = -1;
         ds4_mmq_set_x_slot(k5_slots);   /* K5: the MMQ calls below read the cache slots in place */
+        /* MMQ-T: with the K5 table the compact IDs are the host's g_stream_prefill_ids */
+        ds4_mmq_set_col_bound(k5_slots && g_stream_prefill_ids.size() == (size_t)slot_count ?
+            cuda_ids_max_count(g_stream_prefill_ids.data(), g_stream_prefill_ids.size(), g_stream_prefill_slots.size()) : 0);
         if (n_tokens <= 8u && n_expert == 6u) {
             rc = ds4_mmq_mxfp4_moe_gate_up_mid_vec(
                 gate_w, up_w, (const float *)x->ptr,
@@ -28857,6 +28935,7 @@ static int routed_moe_launch(
             }
         }
         ds4_mmq_set_x_slot(NULL);
+        ds4_mmq_set_col_bound(0);
         if (rc == 0) return 1;
         fprintf(stderr,
                 "ds4: CUDA MXFP4 routed-MoE returned %d "
@@ -31847,7 +31926,7 @@ static int cuda_stream_selected_ranges_valid(
 static int cuda_async_upload_wait(void) {
     static int checked = 0, on = 0;
     if (!checked) { const char *e = getenv("DS4_CUDA_ASYNC_UPLOAD_WAIT"); on = e && strcmp(e, "0") != 0; checked = 1; }
-    return on;
+    return on || g_tp2_on;   /* TP2: the stream waits for a load's uploads, the host goes on to the other card */
 }
 static ds4_per_tier<cudaEvent_t> g_upload_done_event_pt;
 #define g_upload_done_event (g_upload_done_event_pt.v[g_stream_tier])
@@ -32223,17 +32302,20 @@ static int cuda_host_expert_tier_fill(cuda_host_expert_slot &s,
 static int cuda_host_expert_tier_upload(const cuda_host_expert_slot &s,
                                         char *dg, char *du, char *dd,
                                         const ds4_gpu_stream_expert_table *table) {
-    const uint64_t g = table->gate_expert_bytes, d = table->down_expert_bytes;
+    const uint64_t g = cst_gate_bytes(table), d = cst_down_bytes(table);   /* TP2: the part, from the whole expert */
+    const char *pg = s.pg + (table->part_count > 1u ? table->part_index * g : 0u);
+    const char *pu = s.pu + (table->part_count > 1u ? table->part_index * g : 0u);
+    const char *pd = s.pd + (table->part_count > 1u ? table->part_index * d : 0u);
     cudaStream_t st = g_stream_selected_upload_stream;
     if (st) {
-        if (!cuda_ok(cudaMemcpyAsync(dg, s.pg, (size_t)g, cudaMemcpyHostToDevice, cuda_upload_stream_for(0)), "host tier gate")) return 0;
-        if (!cuda_ok(cudaMemcpyAsync(du, s.pu, (size_t)g, cudaMemcpyHostToDevice, cuda_upload_stream_for(1)), "host tier up")) return 0;
-        if (!cuda_ok(cudaMemcpyAsync(dd, s.pd, (size_t)d, cudaMemcpyHostToDevice, cuda_upload_stream_for(2)), "host tier down")) return 0;
+        if (!cuda_ok(cudaMemcpyAsync(dg, pg, (size_t)g, cudaMemcpyHostToDevice, cuda_upload_stream_for(0)), "host tier gate")) return 0;
+        if (!cuda_ok(cudaMemcpyAsync(du, pu, (size_t)g, cudaMemcpyHostToDevice, cuda_upload_stream_for(1)), "host tier up")) return 0;
+        if (!cuda_ok(cudaMemcpyAsync(dd, pd, (size_t)d, cudaMemcpyHostToDevice, cuda_upload_stream_for(2)), "host tier down")) return 0;
         return 1;
     }
-    if (!cuda_ok(cudaMemcpy(dg, s.pg, (size_t)g, cudaMemcpyHostToDevice), "host tier gate")) return 0;
-    if (!cuda_ok(cudaMemcpy(du, s.pu, (size_t)g, cudaMemcpyHostToDevice), "host tier up")) return 0;
-    if (!cuda_ok(cudaMemcpy(dd, s.pd, (size_t)d, cudaMemcpyHostToDevice), "host tier down")) return 0;
+    if (!cuda_ok(cudaMemcpy(dg, pg, (size_t)g, cudaMemcpyHostToDevice), "host tier gate")) return 0;
+    if (!cuda_ok(cudaMemcpy(du, pu, (size_t)g, cudaMemcpyHostToDevice), "host tier up")) return 0;
+    if (!cuda_ok(cudaMemcpy(dd, pd, (size_t)d, cudaMemcpyHostToDevice), "host tier down")) return 0;
     return 1;
 }
 
@@ -32242,6 +32324,26 @@ static int cuda_host_expert_tier_load(char *dg, char *du, char *dd,
                                       const ds4_gpu_stream_expert_table *table,
                                       uint64_t gate, uint64_t up, uint64_t down) {
     g_host_tier_loads++; /* counts every VRAM miss, whether the tier is on or not */
+    if (table->part_count > 1u) {   /* TP2: the tier keeps whole experts; this card uploads its part */
+        gate -= table->part_index * cst_gate_bytes(table);
+        up -= table->part_index * cst_gate_bytes(table);
+        down -= table->part_index * cst_down_bytes(table);
+    }
+    if (!g_tp2_xfer_by_gate.empty()) {   /* TP2-E: read once from the drive into card 0, for both cards */
+        const auto x = g_tp2_xfer_by_gate.find(gate);
+        if (x != g_tp2_xfer_by_gate.end() && g_tp2_xfer[x->second].up == up && g_tp2_xfer[x->second].down == down) {
+            const tp2_xfer_slot &s = g_tp2_xfer[x->second];
+            cuda_host_expert_slot hs;   /* this card's part, from host memory over its own link */
+            hs.pg = s.pg;
+            hs.pu = s.pu;
+            hs.pd = s.pd;
+            if (!cuda_host_expert_tier_upload(hs, dg, du, dd, table)) { g_host_tier_fail++; return 0; }
+            g_tp2_xfer[x->second].fresh = 1;   /* TP2-R: its upload events are marked after this layer */
+            if (g_stream_tier == 1) g_tp2_xfer_peer++;
+            g_tp2_xfer_hits++;
+            return 2;   /* in the slot now, not backed by the RAM tier */
+        }
+    }
     { cuda_host_miss_stat &st = g_host_tier_miss_hist[gate];
       st.count++; st.up = up; st.down = down; }
     /* atexit does not run when the server is signalled, so report periodically. */
@@ -32780,7 +32882,7 @@ static int cuda_stream_selected_cache_begin_load(
     const double t_begin = cuda_now_ms();
     cuda_spec_reap(0);
     if (slot_count != 6u) g_slot_table_rebuild = 1;
-    if (slot_count == 6u && cuda_decode_ahead_early()) cuda_spec_issue(table, selected_ids, slot_count);
+    if (slot_count == 6u && table->part_count < 2u && cuda_decode_ahead_early()) cuda_spec_issue(table, selected_ids, slot_count);
     try {
         std::vector<int32_t> expert_to_slot(table->n_total_expert, -1);
         std::vector<int32_t> unique, remap(slot_count);
@@ -32799,16 +32901,16 @@ static int cuda_stream_selected_cache_begin_load(
         }
         auto &cache = g_stream_selected_cache;
         if (cache.model_map != table->model_map ||
-            cache.gate_expert_bytes != table->gate_expert_bytes ||
-            cache.down_expert_bytes != table->down_expert_bytes ||
+            cache.gate_expert_bytes != cst_gate_bytes(table) ||
+            cache.down_expert_bytes != cst_down_bytes(table) ||
             g_stream_expert_slots.size() < unique.size()) {
             cuda_stream_selected_cache_release();
             if (ds4_gpu_set_current_device(g_stream_tier) != 0) return 0;   /* S3: this tier's card (0 on one card) */
-            if (table->gate_expert_bytes > (UINT64_MAX - table->down_expert_bytes) / 2u)
+            if (cst_gate_bytes(table) > (UINT64_MAX - cst_down_bytes(table)) / 2u)
                 return 0;
-            const uint64_t expert_bytes = 2u * table->gate_expert_bytes + table->down_expert_bytes;
+            const uint64_t expert_bytes = 2u * cst_gate_bytes(table) + cst_down_bytes(table);
             uint64_t capacity = ds4_gpu_stream_expert_cache_budget_for_expert_size(
-                table->gate_expert_bytes, table->down_expert_bytes);
+                cst_gate_bytes(table), cst_down_bytes(table));
             if (capacity < unique.size()) capacity = unique.size();
             size_t free_bytes = 0, total_bytes = 0;
             if (!cuda_ok(cudaMemGetInfo(&free_bytes, &total_bytes), "stream expert memory budget"))
@@ -32829,6 +32931,25 @@ static int cuda_stream_selected_cache_begin_load(
             }
             const uint64_t available = free_bytes > reserve ? free_bytes - reserve : 0;
             capacity = std::min(capacity, available / expert_bytes);
+            if (g_tp2_on && table->part_count > 1u) {   /* TP2: the same size on both cards: the same evictions */
+                static uint64_t shared_cap = 0;
+                if (!shared_cap) {   /* both cards' room, measured once, before either cache exists */
+                    uint64_t cap = capacity;
+                    size_t f = 0, tt = 0;
+                    const int other = 1 - g_stream_tier;
+                    if (cudaSetDevice(g_gpu[other].device_id) == cudaSuccess && cudaMemGetInfo(&f, &tt) == cudaSuccess)
+                        cap = std::min(cap, (uint64_t)(f > reserve ? f - reserve : 0) / expert_bytes);
+                    (void)cudaSetDevice(g_gpu[g_stream_tier].device_id);
+                    (void)cudaGetLastError();
+                    shared_cap = cap > 64u ? cap - 8u : cap;   /* TP2-EQ: room for a late small allocation */
+                    fprintf(stderr, "ds4: TP2: each card's expert cache takes %llu parts\n", (unsigned long long)shared_cap);
+                }
+                capacity = std::min(capacity, shared_cap);
+                const uint64_t other_n = (uint64_t)g_stream_expert_slots_pt.v[1 - g_stream_tier].size();
+                if (other_n && other_n != capacity)
+                    fprintf(stderr, "ds4: TP2: card %d's expert cache (%llu parts) differs from the other card's (%llu)\n",
+                            g_stream_tier, (unsigned long long)capacity, (unsigned long long)other_n);
+            }
             if (capacity < unique.size()) {
                 fprintf(stderr, "ds4: CUDA SSD cache cannot stage %zu experts with system headroom\n",
                         unique.size());
@@ -32837,11 +32958,11 @@ static int cuda_stream_selected_cache_begin_load(
             /* A budget is a hint. Back off before publishing any live slots. */
             while (capacity >= unique.size()) {
                 if (cuda_stream_selected_ensure_bytes(&cache.gate_ptr, &cache.gate_capacity,
-                        capacity * table->gate_expert_bytes, "cached gate experts") &&
+                        capacity * cst_gate_bytes(table), "cached gate experts") &&
                     cuda_stream_selected_ensure_bytes(&cache.up_ptr, &cache.up_capacity,
-                        capacity * table->gate_expert_bytes, "cached up experts") &&
+                        capacity * cst_gate_bytes(table), "cached up experts") &&
                     cuda_stream_selected_ensure_bytes(&cache.down_ptr, &cache.down_capacity,
-                        capacity * table->down_expert_bytes, "cached down experts"))
+                        capacity * cst_down_bytes(table), "cached down experts"))
                     break;
                 cuda_stream_selected_cache_release();
                 if (capacity == unique.size()) return 0;
@@ -32850,8 +32971,8 @@ static int cuda_stream_selected_cache_begin_load(
             g_stream_expert_slots.resize(capacity);
             g_vram_seed_pending = true;
             cache.model_map = table->model_map;
-            cache.gate_expert_bytes = table->gate_expert_bytes;
-            cache.down_expert_bytes = table->down_expert_bytes;
+            cache.gate_expert_bytes = cst_gate_bytes(table);
+            cache.down_expert_bytes = cst_down_bytes(table);
             cache.logical_tier = g_stream_tier;
             if (g_stream_split_on)
                 fprintf(stderr, "ds4: CUDA SSD expert cache on tier %d: %llu slots, %.2f GiB\n", g_stream_tier,
@@ -32890,27 +33011,32 @@ static int cuda_stream_selected_cache_begin_load(
                         if (g_stream_span_hi_pt.v[g_stream_tier] &&
                             ((uint64_t)lg < g_stream_span_lo_pt.v[g_stream_tier] ||
                              (uint64_t)lg >= g_stream_span_hi_pt.v[g_stream_tier])) continue;   /* another card's layer */
+                        if (table->part_count > 1u) {   /* TP2: this card's part of the listed expert */
+                            lg += table->part_index * cst_gate_bytes(table);
+                            lu += table->part_index * cst_gate_bytes(table);
+                            ld += table->part_index * cst_down_bytes(table);
+                        }
                         if (g_stream_expert_by_gate.count((uint64_t)lg)) continue;
                         const uint32_t idx = (uint32_t)filled;
-                        char *dg = cache.gate_ptr + (uint64_t)idx * table->gate_expert_bytes;
-                        char *du = cache.up_ptr   + (uint64_t)idx * table->gate_expert_bytes;
-                        char *dd = cache.down_ptr + (uint64_t)idx * table->down_expert_bytes;
+                        char *dg = cache.gate_ptr + (uint64_t)idx * cst_gate_bytes(table);
+                        char *du = cache.up_ptr   + (uint64_t)idx * cst_gate_bytes(table);
+                        char *dd = cache.down_ptr + (uint64_t)idx * cst_down_bytes(table);
                         seed.active = true;
                         const int par = cuda_model_copy_expert_parallel(
-                            dg, (uint64_t)lg, table->gate_expert_bytes,
-                            du, (uint64_t)lu, table->gate_expert_bytes,
-                            dd, (uint64_t)ld, table->down_expert_bytes,
+                            dg, (uint64_t)lg, cst_gate_bytes(table),
+                            du, (uint64_t)lu, cst_gate_bytes(table),
+                            dd, (uint64_t)ld, cst_down_bytes(table),
                             table->model_map, table->model_size, seed.chunks);
                         if (par == 0) break;
                         if (par < 0) {
                             if (!cuda_model_copy_to_device_streamed(dg, table->model_map,
-                                    table->model_size, (uint64_t)lg, table->gate_expert_bytes,
+                                    table->model_size, (uint64_t)lg, cst_gate_bytes(table),
                                     "seed gate", seed.chunks) ||
                                 !cuda_model_copy_to_device_streamed(du, table->model_map,
-                                    table->model_size, (uint64_t)lu, table->gate_expert_bytes,
+                                    table->model_size, (uint64_t)lu, cst_gate_bytes(table),
                                     "seed up", seed.chunks) ||
                                 !cuda_model_copy_to_device_streamed(dd, table->model_map,
-                                    table->model_size, (uint64_t)ld, table->down_expert_bytes,
+                                    table->model_size, (uint64_t)ld, cst_down_bytes(table),
                                     "seed down", seed.chunks)) break;
                         }
                         g_stream_expert_slots[idx] = {(uint64_t)lg, (uint64_t)lu, (uint64_t)ld,
@@ -32936,7 +33062,7 @@ static int cuda_stream_selected_cache_begin_load(
                 }
             }
         }
-        if (!g_begin_load_skip_sync && (!g_pf_share.trim.empty() || g_pf_share.batch_stamp)) {
+        if ((!g_begin_load_skip_sync || g_begin_load_share_apply) && (!g_pf_share.trim.empty() || g_pf_share.batch_stamp)) {
             /* The stream was drained on entry, so the batch that held these rows has run. A row touched since
              * then keeps its stamp. What the batch keeps takes the stamp of its pass's first batch (never a
              * younger one): the layers of a pass are then equally old, and neither decode nor the next pass
@@ -32969,19 +33095,19 @@ static int cuda_stream_selected_cache_begin_load(
         /* Protect every hit first: a miss must not evict a later request's hit. */
         for (size_t i = 0; i < unique.size(); i++) {
             const uint64_t expert = (uint32_t)unique[i];
-            const uint64_t gate = table->gate_offset + expert * table->gate_expert_bytes;
+            const uint64_t gate = cst_gate_at(table, expert);
             {
                 cuda_host_miss_stat &rq = g_req_hist[gate];
                 rq.count++;
-                rq.up = table->up_offset + expert * table->gate_expert_bytes;
-                rq.down = table->down_offset + expert * table->down_expert_bytes;
+                rq.up = cst_up_at(table, expert);
+                rq.down = cst_down_at(table, expert);
                 g_req_total++;
             }
             const auto found = g_stream_expert_by_gate.find(gate);
             if (found == g_stream_expert_by_gate.end()) continue;
             auto &slot = g_stream_expert_slots[found->second];
-            if (slot.up != table->up_offset + expert * table->gate_expert_bytes ||
-                slot.down != table->down_offset + expert * table->down_expert_bytes) {
+            if (slot.up != cst_up_at(table, expert) ||
+                slot.down != cst_down_at(table, expert)) {
                 slot.used = 0;
                 cuda_slot_table_note(slot.gate, -1);
                 g_stream_expert_by_gate.erase(found);
@@ -33108,7 +33234,7 @@ static int cuda_stream_selected_cache_begin_load(
         } else if (pool_first && g_host_tier_state == 1) {
             std::stable_partition(order.begin(), order.end(), [&](size_t i) {
                 if (slots[i] >= 0) return true;
-                const uint64_t g = table->gate_offset + (uint64_t)(uint32_t)unique[i] * table->gate_expert_bytes;
+                const uint64_t g = table->gate_offset + (uint64_t)(uint32_t)unique[i] * table->gate_expert_bytes;   /* the RAM tier keys whole experts */
                 return g_host_tier_by_gate.count(g) != 0;
             });
         }
@@ -33126,6 +33252,8 @@ static int cuda_stream_selected_cache_begin_load(
                 /* A slot stamped by this call (hit or fill) is never a victim, whatever
                  * its pool bias makes its effective age. */
                 if (g_stream_expert_slots[j].used == stamp) continue;
+                if ((uint32_t)g_stream_tier < 2u && g_tp2v_pinned[g_stream_tier] &&
+                    j < g_tp2v_pin[g_stream_tier].size() && g_tp2v_pin[g_stream_tier][j]) continue;   /* TP2-W */
                 if (j == 0u && cuda_moe_defer_enabled()) continue; /* slot 0 is the deferred path's dummy */
                 const uint64_t age_j = cuda_slot_eff_age(g_stream_expert_slots[j]);
                 if (share_batch && g_stream_expert_slots[j].layer == share_layer && age_j < oldest_same &&
@@ -33161,23 +33289,23 @@ static int cuda_stream_selected_cache_begin_load(
             if (slot.used) { cuda_slot_table_note(slot.gate, -1); g_stream_expert_by_gate.erase(slot.gate); }
             slot.used = 0;
             const uint64_t expert = (uint32_t)unique[i];
-            const uint64_t gate = table->gate_offset + expert * table->gate_expert_bytes;
-            const uint64_t up = table->up_offset + expert * table->gate_expert_bytes;
-            const uint64_t down = table->down_offset + expert * table->down_expert_bytes;
+            const uint64_t gate = cst_gate_at(table, expert);
+            const uint64_t up = cst_up_at(table, expert);
+            const uint64_t down = cst_down_at(table, expert);
             int htier = -1;
             if (ordered) {
-                copies.push_back({cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes,
-                    gate, table->gate_expert_bytes, 0});
-                copies.push_back({cache.up_ptr + (uint64_t)victim * table->gate_expert_bytes,
-                    up, table->gate_expert_bytes, 1});
-                copies.push_back({cache.down_ptr + (uint64_t)victim * table->down_expert_bytes,
-                    down, table->down_expert_bytes, 2});
+                copies.push_back({cache.gate_ptr + (uint64_t)victim * cst_gate_bytes(table),
+                    gate, cst_gate_bytes(table), 0});
+                copies.push_back({cache.up_ptr + (uint64_t)victim * cst_gate_bytes(table),
+                    up, cst_gate_bytes(table), 1});
+                copies.push_back({cache.down_ptr + (uint64_t)victim * cst_down_bytes(table),
+                    down, cst_down_bytes(table), 2});
                 pending.push_back(i);
             } else {
                 uploads.active = true;
-                char *const d_gate = cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes;
-                char *const d_up   = cache.up_ptr   + (uint64_t)victim * table->gate_expert_bytes;
-                char *const d_down = cache.down_ptr + (uint64_t)victim * table->down_expert_bytes;
+                char *const d_gate = cache.gate_ptr + (uint64_t)victim * cst_gate_bytes(table);
+                char *const d_up   = cache.up_ptr   + (uint64_t)victim * cst_gate_bytes(table);
+                char *const d_down = cache.down_ptr + (uint64_t)victim * cst_down_bytes(table);
                 htier = cuda_host_expert_tier_load(d_gate, d_up, d_down,
                                                              table, gate, up, down);
                 if (htier == 0) { fprintf(stderr, "ds4: begin_load: host tier load failed (layer %u, mode %d)\n", table->layer, g_wave_mode); return 0; }
@@ -33191,35 +33319,35 @@ static int cuda_stream_selected_cache_begin_load(
                     slots[i] = (int32_t)victim;
                     filled.push_back(victim);
                     pend.push_back({d_gate, d_up, d_down, gate, up, down,
-                                    table->gate_expert_bytes, table->gate_expert_bytes,
-                                    table->down_expert_bytes});
+                                    cst_gate_bytes(table), cst_gate_bytes(table),
+                                    cst_down_bytes(table)});
                     if (pend.size() >= (size_t)batch_max && !flush_pend()) return 0;
                     continue;
                 }
                 int par = (htier > 0) ? 1 : 0;
-                if (!par && cuda_pack_init() > 0 && table->gate_expert_bytes == table->down_expert_bytes) {
+                if (!par && table->part_count < 2u && cuda_pack_init() > 0 && cst_gate_bytes(table) == cst_down_bytes(table)) {
                     const int pl = cuda_pack_layer_for(table->gate_offset);
                     if (pl >= 0) par = cuda_model_copy_expert_pack(pl, (uint32_t)expert, table->n_total_expert,
-                                                                  d_gate, d_up, d_down, table->gate_expert_bytes, uploads.chunks);
+                                                                  d_gate, d_up, d_down, cst_gate_bytes(table), uploads.chunks);
                 }
                 if (!par) par = cuda_model_copy_expert_parallel(
-                    cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes, gate, table->gate_expert_bytes,
-                    cache.up_ptr   + (uint64_t)victim * table->gate_expert_bytes, up,   table->gate_expert_bytes,
-                    cache.down_ptr + (uint64_t)victim * table->down_expert_bytes, down, table->down_expert_bytes,
+                    cache.gate_ptr + (uint64_t)victim * cst_gate_bytes(table), gate, cst_gate_bytes(table),
+                    cache.up_ptr   + (uint64_t)victim * cst_gate_bytes(table), up,   cst_gate_bytes(table),
+                    cache.down_ptr + (uint64_t)victim * cst_down_bytes(table), down, cst_down_bytes(table),
                     table->model_map, table->model_size, uploads.chunks);
                 if (par == 0) { fprintf(stderr, "ds4: begin_load: parallel expert read failed (layer %u, mode %d)\n", table->layer, g_wave_mode); return 0; }
                 if (par < 0 && (!cuda_model_copy_to_device_streamed(
-                        cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes,
-                        table->model_map, table->model_size, gate, table->gate_expert_bytes, "stream gate", uploads.chunks) ||
+                        cache.gate_ptr + (uint64_t)victim * cst_gate_bytes(table),
+                        table->model_map, table->model_size, gate, cst_gate_bytes(table), "stream gate", uploads.chunks) ||
                     !cuda_model_copy_to_device_streamed(
-                        cache.up_ptr + (uint64_t)victim * table->gate_expert_bytes,
-                        table->model_map, table->model_size, up, table->gate_expert_bytes, "stream up", uploads.chunks) ||
+                        cache.up_ptr + (uint64_t)victim * cst_gate_bytes(table),
+                        table->model_map, table->model_size, up, cst_gate_bytes(table), "stream up", uploads.chunks) ||
                     !cuda_model_copy_to_device_streamed(
-                        cache.down_ptr + (uint64_t)victim * table->down_expert_bytes,
-                        table->model_map, table->model_size, down, table->down_expert_bytes, "stream down", uploads.chunks)))
+                        cache.down_ptr + (uint64_t)victim * cst_down_bytes(table),
+                        table->model_map, table->model_size, down, cst_down_bytes(table), "stream down", uploads.chunks)))
                     return 0;
             }
-            slot = {gate, up, down, stamp, (uint8_t)(htier > 0 ? 1 : 0), share_layer};
+            slot = {gate, up, down, stamp, (uint8_t)(htier == 1 ? 1 : 0), share_layer};
             /* Ordered copies are still pending. Protect their slots, but do
              * not advertise a cache hit until every upload has completed. */
             if (!ordered) {
@@ -33256,9 +33384,9 @@ static int cuda_stream_selected_cache_begin_load(
                     for (size_t index : pending) {
                         const uint32_t slot_index = (uint32_t)slots[index];
                         auto &slot = g_stream_expert_slots[slot_index];
-                        if (slot.gate + table->gate_expert_bytes <= complete_until[0] &&
-                            slot.up + table->gate_expert_bytes <= complete_until[1] &&
-                            slot.down + table->down_expert_bytes <= complete_until[2]) {
+                        if (slot.gate + cst_gate_bytes(table) <= complete_until[0] &&
+                            slot.up + cst_gate_bytes(table) <= complete_until[1] &&
+                            slot.down + cst_down_bytes(table) <= complete_until[2]) {
                             g_stream_expert_by_gate[slot.gate] = slot_index;
                             cuda_slot_table_note(slot.gate, (int32_t)slot_index);
                         } else slot.used = 0;
@@ -33356,8 +33484,10 @@ static int cuda_stream_selected_cache_begin_load(
         }
         {
             const double t_rm0 = cuda_now_ms();
-            int rm_ok;
-            if (g_remap_via_upload_stream && g_stream_selected_upload_stream) {
+            int rm_ok = 1;
+            if (g_begin_load_no_remap) {
+                /* TP2-W: an install while a wave runs; the chunk's own load publishes its remap later */
+            } else if (g_remap_via_upload_stream && g_stream_selected_upload_stream) {
                 const uint64_t need = (uint64_t)slot_count * sizeof(int32_t);
                 if (g_remap_pinned_cap < need) {
                     if (g_remap_pinned) (void)cudaFreeHost(g_remap_pinned);
@@ -39146,7 +39276,7 @@ static void cuda_early_ids_report(void) {
 
 extern "C" int ds4_gpu_selected_ids_early(const ds4_gpu_tensor *selected, uint32_t n_selected) {
     if (!selected || !selected->ptr || n_selected != 6u || !g_ssd_streaming_mode || !cuda_early_ids_on() ||
-        g_decode_graph_capturing || g_dsv41_shared.active ||
+        g_decode_graph_capturing || g_tp2g_capturing >= 0 || g_dsv41_shared.active ||
         selected->bytes < (uint64_t)n_selected * sizeof(int32_t)) return 0;
     int dev = -1;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= DS4_MAX_GPUS) {
@@ -40511,7 +40641,7 @@ extern "C" int ds4_gpu_tp_big_gate_wait(uint64_t seq) {
 extern "C" int ds4_gpu_side_begin(void) {
     if (g_dsv41_shared.active) return -1;
     /* Never inside a graph capture, even when the side stream exists. */
-    if (g_decode_graph_capturing) return 0;
+    if (g_decode_graph_capturing || g_tp2g_capturing >= 0) return 0;
     if (g_dsv41_shared.pending && !ds4_gpu_dsv41_shared_join()) return -1;
     if (g_n_gpus != 1 || !g_cublas_ready || !cuda_dsv41_shared_prepare()) return 0;
     cublasMath_t math = CUBLAS_DEFAULT_MATH;
@@ -45780,4 +45910,1331 @@ extern "C" int ds4_gpu_k3_memset_tensor(ds4_gpu_tensor *t, uint64_t offset, int 
     if (!t || offset > t->bytes || bytes > t->bytes - offset) return 0;
     if (bytes == 0u) return 1;
     return cuda_ok(cudaMemsetAsync((char *)t->ptr + offset, value, bytes, cuda_decode_stream()), "K3 memset");
+}
+
+
+/* ===========================================================================
+ * TP2 (21 Nov 2026): exact tensor parallelism over the two cards of the SSD-streaming split. See ds4_gpu.h.
+ * ======================================================================== */
+static cudaEvent_t g_tp2_ev[2];
+/* a card's K5 slot tables between its batch gate/up and down */
+struct tp2_batch_state { const int32_t *ids, *slots; uint32_t experts, pairs; int valid; };
+static tp2_batch_state g_tp2_batch[2];
+
+/* E1's per-card state (the remap ring) on a card whose router IDs are not copied out early */
+static int tp2_early_ids_ensure(int dev) {
+    if (dev < 0 || dev >= DS4_MAX_GPUS) return 0;
+    cuda_early_ids_state &e = g_early_ids[dev];
+    if (e.broken) return 0;
+    if (e.stream) return 1;
+    void *host = NULL, *ring = NULL;
+    if (cudaStreamCreateWithFlags(&e.stream, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaEventCreateWithFlags(&e.routed, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&e.done, cudaEventDisableTiming) != cudaSuccess ||
+        cudaHostAlloc(&host, 64u * sizeof(int32_t), cudaHostAllocPortable) != cudaSuccess ||
+        cudaHostAlloc(&ring, (size_t)CUDA_EARLY_RING * CUDA_EARLY_RING_IDS * sizeof(int32_t),
+                      cudaHostAllocPortable) != cudaSuccess) {
+        (void)cudaGetLastError();
+        e.broken = 1;
+        return 0;
+    }
+    e.host = (int32_t *)host;
+    e.ring = (int32_t *)ring;
+    return 1;
+}
+
+extern "C" int ds4_gpu_tp2_init(void) {
+    if (g_tp2_on) return 1;
+    if (g_n_gpus != 2 || !g_stream_split_on) {
+        fprintf(stderr, "ds4: TP2 needs the two-card SSD-streaming split\n");
+        return 0;
+    }
+    const int saved = g_stream_tier;
+    for (int t = 0; t < 2; t++) {
+        if (ds4_gpu_set_current_device(t) != 0) return 0;
+        const cudaError_t e = cudaDeviceEnablePeerAccess(g_gpu[1 - t].device_id, 0);
+        if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) {
+            fprintf(stderr, "ds4: TP2: peer access %d -> %d failed: %s\n", t, 1 - t, cudaGetErrorString(e));
+            (void)cudaGetLastError();
+            return 0;
+        }
+        (void)cudaGetLastError();
+        if (!g_tp2_ev[t] && !cuda_ok(cudaEventCreateWithFlags(&g_tp2_ev[t], cudaEventDisableTiming), "tp2 event"))
+            return 0;
+        if (!tp2_early_ids_ensure(g_gpu[t].device_id)) {
+            fprintf(stderr, "ds4: TP2: remap ring setup failed on card %d\n", t);
+            return 0;
+        }
+    }
+    (void)ds4_gpu_set_current_device(saved);
+    g_tp2_on = 1;
+    fprintf(stderr, "ds4: TP2: both cards run every layer (peer access on, exact exchanges)\n");
+    return 1;
+}
+
+extern "C" int ds4_gpu_tp2_active(void) { return g_tp2_on; }
+
+extern "C" int ds4_gpu_tp2_signal(int from_tier, int to_tier) {
+    if (!g_tp2_on || from_tier < 0 || from_tier > 1 || to_tier < 0 || to_tier > 1) return 0;
+    if (from_tier == to_tier) return 1;
+    const int saved = g_stream_tier;
+    const int ok = ds4_gpu_set_current_device(from_tier) == 0 &&
+        cuda_ok(cudaEventRecord(g_tp2_ev[from_tier], cuda_decode_stream()), "tp2 mark") &&
+        ds4_gpu_set_current_device(to_tier) == 0 &&
+        cuda_ok(cudaStreamWaitEvent(cuda_decode_stream(), g_tp2_ev[from_tier], 0), "tp2 wait");
+    (void)ds4_gpu_set_current_device(saved);
+    return ok;
+}
+
+extern "C" int ds4_gpu_tp2_barrier(void) {
+    if (!g_tp2_on) return 0;
+    const int saved = g_stream_tier;
+    int ok = 1;
+    for (int t = 0; t < 2 && ok; t++)
+        ok = ds4_gpu_set_current_device(t) == 0 &&
+             cuda_ok(cudaEventRecord(g_tp2_ev[t], cuda_decode_stream()), "tp2 mark");
+    for (int t = 0; t < 2 && ok; t++)
+        ok = ds4_gpu_set_current_device(t) == 0 &&
+             cuda_ok(cudaStreamWaitEvent(cuda_decode_stream(), g_tp2_ev[1 - t], 0), "tp2 wait");
+    (void)ds4_gpu_set_current_device(saved);
+    return ok;
+}
+
+__global__ static void tp2_copy16_kernel(uint4 *dst, const uint4 *src, uint64_t n) {
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (uint64_t)gridDim.x * blockDim.x)
+        dst[i] = src[i];
+}
+__global__ static void tp2_copy4_kernel(uint32_t *dst, const uint32_t *src, uint64_t n) {
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (uint64_t)gridDim.x * blockDim.x)
+        dst[i] = src[i];
+}
+
+extern "C" int ds4_gpu_tp2_push(ds4_gpu_tensor *dst, uint64_t dst_off, const ds4_gpu_tensor *src, uint64_t src_off,
+                                uint64_t bytes) {
+    if (!dst || !src || !dst->ptr || !src->ptr || dst_off > dst->bytes || bytes > dst->bytes - dst_off ||
+        src_off > src->bytes || bytes > src->bytes - src_off || (bytes & 3u) || (dst_off & 3u) || (src_off & 3u))
+        return 0;
+    if (!bytes) return 1;
+    char *d = (char *)dst->ptr + dst_off;
+    const char *s = (const char *)src->ptr + src_off;
+    const cudaStream_t st = cuda_decode_stream();
+    if (bytes >= ((uint64_t)4 << 20)) {   /* large: the copy engine (its call costs ~10 us of host time) */
+        const int dd = ds4_tensor_device_idx(dst), sd = ds4_tensor_device_idx(src);
+        return cuda_ok(cudaMemcpyPeerAsync(d, g_gpu[dd].device_id, s, g_gpu[sd].device_id, (size_t)bytes, st),
+                       "tp2 peer copy");
+    }
+    if (!((uintptr_t)d & 15u) && !((uintptr_t)s & 15u) && !(bytes & 15u)) {
+        const uint64_t n = bytes / 16u;
+        const uint32_t blocks = (uint32_t)std::min<uint64_t>((n + 255u) / 256u, 64u);
+        tp2_copy16_kernel<<<blocks, 256, 0, st>>>((uint4 *)d, (const uint4 *)s, n);
+    } else {
+        const uint64_t n = bytes / 4u;
+        const uint32_t blocks = (uint32_t)std::min<uint64_t>((n + 255u) / 256u, 64u);
+        tp2_copy4_kernel<<<blocks, 256, 0, st>>>((uint32_t *)d, (const uint32_t *)s, n);
+    }
+    return cuda_ok(cudaGetLastError(), "tp2 push");
+}
+
+__global__ static void tp2_rows_kernel(float *a, float *b, uint32_t dst_stride, const float *src, uint32_t src_stride,
+                                       uint32_t cols, uint32_t rows) {
+    const uint64_t n = (uint64_t)rows * cols;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (uint64_t)gridDim.x * blockDim.x) {
+        const uint64_t r = i / cols, c = i - r * cols;
+        const float v = src[r * src_stride + c];
+        if (a) a[r * dst_stride + c] = v;
+        if (b) b[r * dst_stride + c] = v;
+    }
+}
+
+extern "C" int ds4_gpu_tp2_rows(ds4_gpu_tensor *a, ds4_gpu_tensor *b, uint64_t dst_off, uint32_t dst_stride,
+                                const ds4_gpu_tensor *src, uint64_t src_off, uint32_t src_stride, uint32_t cols,
+                                uint32_t rows) {
+    if (!src || !src->ptr || (!a && !b) || !cols || !rows || cols > dst_stride || cols > src_stride) return 0;
+    const uint64_t dst_need = (dst_off + (uint64_t)(rows - 1u) * dst_stride + cols) * sizeof(float);
+    const uint64_t src_need = (src_off + (uint64_t)(rows - 1u) * src_stride + cols) * sizeof(float);
+    if (src_need > src->bytes || (a && dst_need > a->bytes) || (b && dst_need > b->bytes)) return 0;
+    const uint64_t n = (uint64_t)rows * cols;
+    const uint32_t blocks = (uint32_t)std::min<uint64_t>((n + 255u) / 256u, 1024u);
+    tp2_rows_kernel<<<blocks, 256, 0, cuda_decode_stream()>>>(a ? (float *)a->ptr + dst_off : NULL,
+        b ? (float *)b->ptr + dst_off : NULL, dst_stride, (const float *)src->ptr + src_off, src_stride, cols, rows);
+    return cuda_ok(cudaGetLastError(), "tp2 rows");
+}
+
+extern "C" int ds4_gpu_tp2_ids(const ds4_gpu_tensor *selected, int32_t *ids, uint32_t n) {
+    if (!selected || !selected->ptr || !ids || !n || selected->bytes < (uint64_t)n * sizeof(int32_t)) return 0;
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= DS4_MAX_GPUS) { (void)cudaGetLastError(); return 0; }
+    cuda_early_ids_state &e = g_early_ids[dev];
+    if (e.pending && e.src == selected->ptr && e.n == n) {   /* E1: the copy the router queued */
+        e.pending = 0;
+        const double t0 = cuda_now_ms();
+        for (;;) {
+            const cudaError_t q = cudaEventQuery(e.done);
+            if (q == cudaSuccess) break;
+            if (q != cudaErrorNotReady) return cuda_ok(q, "tp2 ids poll");
+            if (cuda_now_ms() - t0 > 50.0) { if (!cuda_ok(cudaEventSynchronize(e.done), "tp2 ids wait")) return 0; break; }
+        }
+        g_stall_readback_ms += cuda_now_ms() - t0;
+        g_stall_readback_n++;
+        g_early_ids_used++;
+        memcpy(ids, e.host, (size_t)n * sizeof(int32_t));
+        return 1;
+    }
+    e.pending = 0;
+    return cuda_ok(cudaMemcpy(ids, selected->ptr, (size_t)n * sizeof(int32_t), cudaMemcpyDeviceToHost), "tp2 ids read");
+}
+
+extern "C" int ds4_gpu_tp2_moe_load(const int32_t *ids, uint32_t n_ids, const void *model_map, uint64_t model_size,
+                                    uint32_t layer, uint32_t n_total_expert, uint64_t gate_offset, uint64_t up_offset,
+                                    uint64_t down_offset, uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                                    uint32_t part) {
+    if (!g_tp2_on || !ids || n_ids != 6u || part > 1u) return 0;
+    ds4_gpu_stream_expert_table table = {model_map, model_size, layer, n_total_expert, gate_offset, up_offset,
+                                         down_offset, gate_expert_bytes, down_expert_bytes, 2u, part};
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    g_begin_load_skip_sync = 1;   /* the layer's barriers ordered this card's earlier use of the slots (ds4.c) */
+    g_early_remap_dev = dev;
+    const int loaded = cuda_stream_selected_cache_begin_load(&table, ids, n_ids, false);
+    g_begin_load_skip_sync = 0;
+    g_early_remap_dev = -1;
+    auto &cache = g_stream_selected_cache;
+    return loaded && cache.valid && cache.gate_ptr && cache.up_ptr && cache.slot_selected_ptr &&
+        cache.slot_count == n_ids && cache.gate_expert_bytes == cst_gate_bytes(&table);
+}
+
+extern "C" int ds4_gpu_tp2_moe_gate_up_launch(ds4_gpu_tensor *mid_part, const ds4_gpu_tensor *x,
+                                              const ds4_gpu_tensor *weights, uint32_t n_ids, uint32_t in_dim,
+                                              uint32_t mid_dim, float clamp) {
+    auto &cache = g_stream_selected_cache;
+    if (!g_tp2_on || !mid_part || !x || !weights || n_ids != 6u || (mid_dim % 64u) || !cache.valid ||
+        !cache.gate_ptr || !cache.up_ptr || !cache.slot_selected_ptr || cache.slot_count != n_ids ||
+        mid_part->bytes < (uint64_t)n_ids * (mid_dim / 2u) * sizeof(float)) return 0;
+    ds4_mmq_set_x_slot(NULL);
+    return ds4_mmq_mxfp4_moe_gate_up_mid_vec(cache.gate_ptr, cache.up_ptr, (const float *)x->ptr,
+        cache.slot_selected_ptr, (const float *)weights->ptr, (float *)mid_part->ptr, (int)(mid_dim / 2u),
+        (int)in_dim, 1, (int)cache.compact_count, (int)n_ids, clamp, cuda_decode_stream()) == 0;
+}
+
+extern "C" int ds4_gpu_tp2_moe_gate_up(ds4_gpu_tensor *mid_part, const ds4_gpu_tensor *x, const ds4_gpu_tensor *weights,
+                                       const int32_t *ids, uint32_t n_ids, const void *model_map, uint64_t model_size,
+                                       uint32_t layer, uint32_t n_total_expert, uint64_t gate_offset, uint64_t up_offset,
+                                       uint64_t down_offset, uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                                       uint32_t part, uint32_t in_dim, uint32_t mid_dim, float clamp) {
+    if (!g_tp2_on || !mid_part || !x || !weights || !ids || n_ids != 6u || part > 1u || (mid_dim % 64u) ||
+        mid_part->bytes < (uint64_t)n_ids * (mid_dim / 2u) * sizeof(float)) return 0;
+    ds4_gpu_stream_expert_table table = {model_map, model_size, layer, n_total_expert, gate_offset, up_offset,
+                                         down_offset, gate_expert_bytes, down_expert_bytes, 2u, part};
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    /* No drain: the layer's barriers have ordered this card's earlier use of the slots before the router whose IDs
+     * these are (see ds4.c, TP2). */
+    g_begin_load_skip_sync = 1;
+    g_early_remap_dev = dev;
+    const int loaded = cuda_stream_selected_cache_begin_load(&table, ids, n_ids, false);
+    g_begin_load_skip_sync = 0;
+    g_early_remap_dev = -1;
+    if (!loaded) return 0;
+    auto &cache = g_stream_selected_cache;
+    if (!cache.valid || !cache.gate_ptr || !cache.up_ptr || !cache.slot_selected_ptr || cache.slot_count != n_ids ||
+        cache.gate_expert_bytes != cst_gate_bytes(&table)) return 0;
+    ds4_mmq_set_x_slot(NULL);
+    return ds4_mmq_mxfp4_moe_gate_up_mid_vec(cache.gate_ptr, cache.up_ptr, (const float *)x->ptr,
+        cache.slot_selected_ptr, (const float *)weights->ptr, (float *)mid_part->ptr, (int)(mid_dim / 2u),
+        (int)in_dim, 1, (int)cache.compact_count, (int)n_ids, clamp, cuda_decode_stream()) == 0;
+}
+
+extern "C" int ds4_gpu_tp2_moe_down(ds4_gpu_tensor *out_part, const ds4_gpu_tensor *mid_full, uint32_t out_dim,
+                                    uint32_t mid_dim) {
+    auto &cache = g_stream_selected_cache;
+    if (!g_tp2_on || !out_part || !mid_full || !cache.valid || !cache.down_ptr || cache.slot_count != 6u ||
+        (out_dim % 2u) || out_part->bytes < (uint64_t)(out_dim / 2u) * sizeof(float) ||
+        mid_full->bytes < (uint64_t)6u * mid_dim * sizeof(float)) return 0;
+    return ds4_mmq_mxfp4_moe_down_sum6_vec(cache.down_ptr, (const float *)mid_full->ptr, cache.slot_selected_ptr,
+        (float *)out_part->ptr, (int)(out_dim / 2u), (int)mid_dim, 1, (int)cache.compact_count, 6,
+        cuda_decode_stream()) == 0;
+}
+
+/* moe_mmq_swiglu_weighted_clamp_kernel's arithmetic, written as columns [col0, col0 + part_mid) of rows of
+ * mid_stride floats, here and on the other card */
+__global__ static void tp2_swiglu_kernel(float *mid_a, float *mid_b, uint32_t mid_stride, uint32_t col0,
+                                         const float *gate_buf, const float *up_buf, const float *weights,
+                                         uint32_t part_mid, uint32_t n_tokens, uint32_t n_expert_used, float clamp) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)n_tokens * n_expert_used * part_mid;
+    if (gid >= n) return;
+    const uint64_t slot_pair = gid / part_mid;
+    const uint32_t j = (uint32_t)(gid - slot_pair * part_mid);
+    const uint32_t tok = (uint32_t)(slot_pair / n_expert_used);
+    const uint32_t slot = (uint32_t)(slot_pair - (uint64_t)tok * n_expert_used);
+    const float w = weights[(uint64_t)tok * n_expert_used + slot];
+    float v = 0.0f;
+    if (w != 0.0f) {
+        float g = gate_buf[gid];
+        float u = up_buf[gid];
+        if (!isfinite(g)) g = 0.0f;
+        if (!isfinite(u)) u = 0.0f;
+        if (clamp > 1.0e-6f) {
+            if (g > clamp) g = clamp;
+            if (u > clamp) u = clamp;
+            if (u < -clamp) u = -clamp;
+        }
+        const float s = g / (1.0f + expf(-g));
+        v = s * u * w;
+    }
+    const uint64_t o = slot_pair * mid_stride + col0 + j;
+    mid_a[o] = v;
+    if (mid_b) mid_b[o] = v;
+}
+
+/* moe_mmq_sum_kernel's arithmetic (no owner filter, non-finite values skipped), into columns [col0, col0 + part_out)
+ * of rows of out_stride floats */
+__global__ static void tp2_sum_kernel(float *out, uint32_t out_stride, uint32_t col0, const float *down,
+                                      uint32_t part_out, uint32_t n_expert, uint32_t n_tokens) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)n_tokens * part_out;
+    if (gid >= n) return;
+    const uint32_t tok = (uint32_t)(gid / part_out);
+    const uint32_t row = (uint32_t)(gid - (uint64_t)tok * part_out);
+    float acc = 0.0f;
+    for (uint32_t e = 0; e < n_expert; e++) {
+        const float v = down[((uint64_t)tok * n_expert + e) * part_out + row];
+        if (isfinite(v)) acc += v;
+    }
+    out[(uint64_t)tok * out_stride + col0 + row] = acc;
+}
+
+static int64_t g_tp2_col_bound[2];   /* MMQ-T: the one-pass gate/up's bound, for its down */
+extern "C" int ds4_gpu_tp2_moe_batch_gate_up(ds4_gpu_tensor *mid_here, ds4_gpu_tensor *mid_there,
+                                             ds4_gpu_tensor *gate_buf, ds4_gpu_tensor *up_buf,
+                                             const ds4_gpu_tensor *x, const ds4_gpu_tensor *weights,
+                                             const int32_t *ids, uint32_t rows, const void *model_map,
+                                             uint64_t model_size, uint32_t layer, uint32_t n_total_expert,
+                                             uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+                                             uint64_t gate_expert_bytes, uint64_t down_expert_bytes, uint32_t part,
+                                             uint32_t in_dim, uint32_t mid_dim, float clamp) {
+    const uint32_t pairs = rows * 6u, half = mid_dim / 2u;
+    if (!g_tp2_on || part > 1u || !rows || !mid_here || !gate_buf || !up_buf || !x || !weights || !ids ||
+        (mid_dim % 256u) || g_stream_tier < 0 || g_stream_tier > 1 ||
+        mid_here->bytes < (uint64_t)pairs * mid_dim * sizeof(float) ||
+        (mid_there && mid_there->bytes < (uint64_t)pairs * mid_dim * sizeof(float)) ||
+        gate_buf->bytes < (uint64_t)pairs * half * sizeof(float) || up_buf->bytes < (uint64_t)pairs * half * sizeof(float))
+        return 0;
+    tp2_batch_state &bs = g_tp2_batch[g_stream_tier];
+    bs.valid = 0;
+    ds4_gpu_stream_expert_table table = {model_map, model_size, layer, n_total_expert, gate_offset, up_offset,
+                                         down_offset, gate_expert_bytes, down_expert_bytes, 2u, part};
+    if (!cuda_stream_selected_cache_begin_load(&table, ids, pairs, true)) return 0;   /* drains this card's stream */
+    auto &cache = g_stream_selected_cache;
+    const int32_t *d_ids = NULL, *d_slots = NULL;
+    uint32_t experts = 0;
+    if (!cache.valid || cache.slot_count != pairs || cache.gate_expert_bytes != cst_gate_bytes(&table) ||
+        !cuda_stream_slots_prefill(&d_ids, &d_slots, &experts)) return 0;
+    ds4_mmq_set_x_slot(d_slots);
+    const int64_t col_bound = cuda_ids_max_count(ids, pairs, n_total_expert);   /* MMQ-T */
+    ds4_mmq_set_col_bound(col_bound);
+    int rc = ds4_mmq_mxfp4_moe_pair(cache.gate_ptr, cache.up_ptr, (const float *)x->ptr, d_ids,
+        (float *)gate_buf->ptr, (float *)up_buf->ptr, (int)half, (int)in_dim, (int)rows, (int)experts, 6, (cudaStream_t)0);
+    ds4_mmq_set_x_slot(NULL);
+    ds4_mmq_set_col_bound(0);
+    if (rc != 0) return 0;
+    const uint64_t n = (uint64_t)pairs * half;
+    tp2_swiglu_kernel<<<(uint32_t)((n + 255u) / 256u), 256, 0, (cudaStream_t)0>>>((float *)mid_here->ptr,
+        mid_there ? (float *)mid_there->ptr : NULL, mid_dim, part * half, (const float *)gate_buf->ptr,
+        (const float *)up_buf->ptr, (const float *)weights->ptr, half, rows, 6u, clamp);
+    if (!cuda_ok(cudaGetLastError(), "tp2 swiglu")) return 0;
+    bs = {d_ids, d_slots, experts, pairs, 1};
+    g_tp2_col_bound[g_stream_tier] = col_bound;
+    return 1;
+}
+
+extern "C" int ds4_gpu_tp2_moe_batch_down(ds4_gpu_tensor *out, uint32_t out_stride, uint32_t col0,
+                                          ds4_gpu_tensor *down_buf, const ds4_gpu_tensor *mid_full, uint32_t rows,
+                                          uint32_t out_dim, uint32_t mid_dim) {
+    const uint32_t pairs = rows * 6u, half = out_dim / 2u;
+    if (!g_tp2_on || g_stream_tier < 0 || g_stream_tier > 1) return 0;
+    tp2_batch_state &bs = g_tp2_batch[g_stream_tier];
+    auto &cache = g_stream_selected_cache;
+    if (!bs.valid || bs.pairs != pairs || !cache.valid || !cache.down_ptr || !out || !down_buf || !mid_full ||
+        (out_dim % 2u) || col0 + half > out_stride ||
+        out->bytes < ((uint64_t)(rows - 1u) * out_stride + col0 + half) * sizeof(float) ||
+        down_buf->bytes < (uint64_t)pairs * half * sizeof(float) ||
+        mid_full->bytes < (uint64_t)pairs * mid_dim * sizeof(float)) return 0;
+    ds4_mmq_set_x_slot(bs.slots);
+    ds4_mmq_set_col_bound(g_tp2_col_bound[g_stream_tier]);   /* MMQ-T */
+    const int rc = ds4_mmq_mxfp4_moe(cache.down_ptr, (const float *)mid_full->ptr, bs.ids, (float *)down_buf->ptr,
+        (int)half, (int)mid_dim, (int)pairs, (int)bs.experts, 1, (cudaStream_t)0);
+    ds4_mmq_set_x_slot(NULL);
+    ds4_mmq_set_col_bound(0);
+    bs.valid = 0;
+    if (rc != 0) return 0;
+    const uint64_t n = (uint64_t)rows * half;
+    tp2_sum_kernel<<<(uint32_t)((n + 255u) / 256u), 256, 0, (cudaStream_t)0>>>((float *)out->ptr, out_stride, col0,
+        (const float *)down_buf->ptr, half, 6u, rows);
+    return cuda_ok(cudaGetLastError(), "tp2 sum");
+}
+
+
+/* TP2-E: see ds4_gpu.h. A slot holds one whole expert in card 0's memory; slots are used in turn and a slot is
+ * refilled only after both cards' work that copied from it has run. */
+static void tp2_xfer_report(void) {
+    if (g_tp2_xfer_reads)
+        fprintf(stderr, "ds4: TP2-E: %llu experts read once for both cards, %llu part uploads from host memory\n",
+                (unsigned long long)g_tp2_xfer_reads, (unsigned long long)g_tp2_xfer_hits);
+}
+
+
+/* TP2-E/I: the transfer slots on card 0 (the current card), made once. 0: no room (each card reads its part). */
+static int tp2_xfer_ensure(uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
+    static int failed = 0;
+    if (!g_tp2_xfer.empty()) return 1;
+    if (failed) return 0;
+    const uint64_t align = g_model_direct_align > 1 ? g_model_direct_align : 4096u;
+    g_tp2_xfer_gspan = cuda_round_up(gate_expert_bytes + align, align);
+    g_tp2_xfer_dspan = cuda_round_up(down_expert_bytes + align, align);
+    g_tp2_xfer.resize(tp2_xfer_count());
+    for (auto &s : g_tp2_xfer) {
+        void *mem = NULL;
+        if (cudaHostAlloc(&mem, (size_t)(2u * g_tp2_xfer_gspan + g_tp2_xfer_dspan), cudaHostAllocPortable) != cudaSuccess) {
+            (void)cudaGetLastError();
+            fprintf(stderr, "ds4: TP2-E: the transfer slots could not be pinned; each card reads its part\n");
+            for (auto &t : g_tp2_xfer) if (t.base) (void)cudaFreeHost(t.base);
+            g_tp2_xfer.clear();
+            failed = 1;
+            return 0;
+        }
+        s.base = (char *)mem;
+    }
+    atexit(tp2_xfer_report);
+    return 1;
+}
+
+/* TP2-J: read the jobs' ranges into their host stages with the expert reader threads (the caller reads one), no
+ * upload. 1: every read succeeded. */
+static int tp2_read_host(std::vector<cuda_tensor_read_job> &jobs) {
+    if (jobs.empty()) return 1;
+    if (!cuda_tensor_readers_ensure()) return 0;
+    const uint32_t helpers = (uint32_t)g_tensor_readers_started;
+    pthread_mutex_lock(&g_tensor_readers_lock);
+    for (size_t next = 0; next < jobs.size(); ) {
+        const uint32_t k = (uint32_t)std::min<size_t>(helpers, jobs.size() - next - 1u);
+        for (uint32_t i = 0; i < k; i++) {
+            g_tensor_readers[i].job = &jobs[next + 1u + i];
+            sem_post(&g_tensor_readers[i].start);
+        }
+        t_in_expert_read = 1;
+        jobs[next].ok = cuda_model_stage_read(jobs[next].stage, jobs[next].stage_bytes, jobs[next].offset,
+                                              jobs[next].bytes, &jobs[next].payload);
+        t_in_expert_read = 0;
+        for (uint32_t i = 0; i < k; i++) sem_wait(&g_tensor_readers[i].done);
+        next += 1u + k;
+    }
+    pthread_mutex_unlock(&g_tensor_readers_lock);
+    for (const auto &j : jobs)
+        if (!j.ok) return 0;
+    return 1;
+}
+/* TP2-E/I: read the selected experts that a card lacks and the RAM tier does not hold, whole, into free transfer slots
+ * on card 0 (the current card), as one pipelined upload batch drained once. read_out (optional) receives the experts
+ * read. Returns 0 on a bad ID; experts that find no free slot or fail to read are left to the cards' own loads. */
+static int tp2_xfer_alloc(void);
+static int tp2_xfer_read(const int32_t *ids, uint32_t n_ids, const void *model_map, uint64_t model_size,
+                         uint32_t n_total_expert, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+                         uint64_t gate_expert_bytes, uint64_t down_expert_bytes, std::vector<int32_t> *read_out) {
+    (void)model_map; (void)model_size;
+    std::vector<uint32_t> used;
+    std::vector<int32_t> exps;
+    std::vector<cuda_tensor_read_job> jobs;
+    for (uint32_t i = 0; i < n_ids; i++) {
+        const int32_t e = ids[i];
+        if (e < 0 || (uint32_t)e >= n_total_expert) return 0;
+        bool dup = false;
+        for (uint32_t j = 0; j < i && !dup; j++) dup = ids[j] == e;
+        if (dup) continue;
+        const uint64_t g = gate_offset + (uint64_t)e * gate_expert_bytes;
+        if (g_tp2_xfer_by_gate.count(g)) continue;   /* read lately */
+        if (g_host_tier_state > 0 && g_host_tier_by_gate.count(g)) continue;    /* the RAM tier has it */
+        bool missing = false;
+        for (int t = 0; t < 2; t++)
+            missing = missing || !g_stream_expert_by_gate_pt.v[t].count(g + (uint64_t)t * (gate_expert_bytes / 2u));
+        if (!missing) continue;
+        const int sa = tp2_xfer_alloc();
+        if (sa < 0) break;   /* every slot busy: the rest load as before */
+        const uint32_t si = (uint32_t)sa;
+        tp2_xfer_slot &s = g_tp2_xfer[si];
+        for (int t = 0; t < 2; t++)
+            if (s.marked && s.done[t] && !cuda_ok(cudaEventSynchronize(s.done[t]), "tp2 xfer slot wait")) return 0;
+        if (s.gate) g_tp2_xfer_by_gate.erase(s.gate);
+        s.gate = s.up = s.down = 0;
+        s.marked = 0;
+        const uint64_t offs[3] = {g, up_offset + (uint64_t)e * gate_expert_bytes, down_offset + (uint64_t)e * down_expert_bytes};
+        const uint64_t lens[3] = {gate_expert_bytes, gate_expert_bytes, down_expert_bytes};
+        const uint64_t spans[3] = {g_tp2_xfer_gspan, g_tp2_xfer_gspan, g_tp2_xfer_dspan};
+        char *bases[3] = {s.base, s.base + g_tp2_xfer_gspan, s.base + 2u * g_tp2_xfer_gspan};
+        for (int c = 0; c < 3; c++) {
+            cuda_tensor_read_job j;
+            memset(&j, 0, sizeof(j));
+            j.stage = bases[c];
+            j.stage_bytes = spans[c];
+            j.offset = offs[c];
+            j.bytes = lens[c];
+            j.device = -1;
+            jobs.push_back(j);
+        }
+        used.push_back(si);
+        exps.push_back(e);
+    }
+    if (jobs.empty()) return 1;
+    const int ok = tp2_read_host(jobs);
+    for (size_t k = 0; k < used.size(); k++) {
+        const cuda_tensor_read_job *j = &jobs[3u * k];
+        if (!ok && (!j[0].ok || !j[1].ok || !j[2].ok)) continue;   /* the cards read their parts as before */
+        tp2_xfer_slot &s = g_tp2_xfer[used[k]];
+        s.gate = j[0].offset; s.up = j[1].offset; s.down = j[2].offset;
+        s.pg = j[0].payload; s.pu = j[1].payload; s.pd = j[2].payload;
+        s.fresh = 1;
+        g_tp2_xfer_by_gate[s.gate] = used[k];
+        g_tp2_xfer_reads++;
+        if (read_out) read_out->push_back(exps[k]);
+    }
+    return 1;
+}
+
+extern "C" int ds4_gpu_tp2_moe_prefetch(const int32_t *ids, uint32_t n_ids, const void *model_map, uint64_t model_size,
+                                        uint32_t n_total_expert, uint64_t gate_offset, uint64_t up_offset,
+                                        uint64_t down_offset, uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
+    static int off = -1;
+    if (off < 0) { const char *e = getenv("DS4_TP2_XFER"); off = e && !strcmp(e, "0"); }
+    if (off || !g_tp2_on || model_map != g_model_fd_host_base) return 1;
+    if (!ids || !n_ids || n_ids > 16u || !gate_expert_bytes || !down_expert_bytes || (gate_expert_bytes & 1u) ||
+        (down_expert_bytes & 1u)) return 0;
+    const int saved = g_stream_tier;
+    if (ds4_gpu_set_current_device(0) != 0) return 0;
+    int rc = 1;
+    if (!tp2_xfer_ensure(gate_expert_bytes, down_expert_bytes)) { off = 1; (void)ds4_gpu_set_current_device(saved); return 1; }
+    if (g_upload_async_pending && g_stream_selected_upload_stream) {   /* the stage buffers may still upload */
+        (void)cudaStreamSynchronize(g_stream_selected_upload_stream);
+        g_upload_async_pending = 0;
+    }
+    rc = tp2_xfer_read(ids, n_ids, model_map, model_size, n_total_expert, gate_offset, up_offset, down_offset,
+                       gate_expert_bytes, down_expert_bytes, NULL);
+    (void)ds4_gpu_set_current_device(saved);
+    return rc;
+}
+
+extern "C" int ds4_gpu_tp2_moe_prefetch_mark(void) {
+    if (!g_tp2_on || g_tp2_xfer.empty()) return 1;
+    const int saved = g_stream_tier;
+    int ok = 1;
+    for (auto &s : g_tp2_xfer) {
+        if (!s.fresh) continue;
+        for (int t = 0; t < 2 && ok; t++) {
+            ok = ds4_gpu_set_current_device(t) == 0 &&
+                (s.done[t] || cuda_ok(cudaEventCreateWithFlags(&s.done[t], cudaEventDisableTiming), "tp2 xfer event")) &&
+                cuda_ok(cudaEventRecord(s.done[t], cuda_decode_stream()), "tp2 xfer mark");
+        }
+        s.fresh = 0;
+        s.marked = 1;
+    }
+    (void)ds4_gpu_set_current_device(saved);
+    return ok;
+}
+
+
+/* TP2-G: see ds4_gpu.h. Entries per card, layer and island: 0 empty, 1 warmed (ran eagerly once), 2 captured, 3 dead
+ * (capture failed: eager from then on). */
+#define TP2G_ISLANDS 8u
+struct tp2g_entry { cudaGraphExec_t exec; int state; uint64_t hits; };
+static tp2g_entry g_tp2g[2][CUDA_DECODE_GRAPH_LAYERS][TP2G_ISLANDS];
+static int g_tp2g_cap_il = -1, g_tp2g_cap_island = -1;
+static uint64_t g_tp2g_replays = 0, g_tp2g_captures = 0, g_tp2g_failures = 0, g_tp2g_drops = 0;
+
+static void tp2g_report(void) {
+    if (g_tp2g_captures || g_tp2g_failures)
+        fprintf(stderr, "ds4: TP2-G: %llu island graphs captured, %llu replays, %llu captures failed, dropped %llu times\n",
+                (unsigned long long)g_tp2g_captures, (unsigned long long)g_tp2g_replays,
+                (unsigned long long)g_tp2g_failures, (unsigned long long)g_tp2g_drops);
+}
+
+static void tp2g_kill(tp2g_entry &e) {
+    if (e.exec) (void)cudaGraphExecDestroy(e.exec);
+    e.exec = NULL;
+    e.state = 3;
+}
+
+extern "C" void ds4_gpu_tp2_graphs_invalidate(void) {
+    bool any = false;
+    for (int t = 0; t < 2; t++)
+        for (uint32_t il = 0; il < CUDA_DECODE_GRAPH_LAYERS; il++)
+            for (uint32_t is = 0; is < TP2G_ISLANDS; is++) {
+                tp2g_entry &e = g_tp2g[t][il][is];
+                if (e.exec) { (void)cudaGraphExecDestroy(e.exec); any = true; }
+                e.exec = NULL;
+                e.state = 0;
+                e.hits = 0;
+            }
+    if (any) g_tp2g_drops++;
+}
+
+extern "C" int ds4_gpu_tp2_graph_begin(uint32_t il, uint32_t island) {
+    static int off = -1;
+    if (off < 0) {
+        const char *e = getenv("DS4_TP2_GRAPHS");
+        off = e && !strcmp(e, "0");
+        if (!off) atexit(tp2g_report);
+    }
+    const int t = g_stream_tier;
+    if (off || !g_tp2_on || t < 0 || t > 1 || il >= CUDA_DECODE_GRAPH_LAYERS || island >= TP2G_ISLANDS ||
+        g_tp2g_capturing >= 0 || g_decode_graph_capturing || g_dsv41_shared.active) return -1;
+    tp2g_entry &e = g_tp2g[t][il][island];
+    if (e.state == 3) return -1;
+    if (e.state == 0) { e.state = 1; return -1; }   /* the warm pass sizes every lazy buffer */
+    if (e.state == 2) {
+        if (cudaGraphLaunch(e.exec, g_tp2g_stream[t]) != cudaSuccess) {
+            (void)cudaGetLastError();
+            fprintf(stderr, "ds4: TP2-G: replay failed (card %d, layer %u, island %u)\n", t, il, island);
+            tp2g_kill(e);
+            return -1;
+        }
+        e.hits++;
+        g_tp2g_replays++;
+        return 1;
+    }
+    if (!g_tp2g_stream[t] && !cuda_ok(cudaStreamCreate(&g_tp2g_stream[t]), "tp2 graph stream")) {
+        g_tp2g_stream[t] = NULL;
+        tp2g_kill(e);
+        return -1;
+    }
+    (void)cublasSetStream(cuda_cublas_main_for_tier(t), g_tp2g_stream[t]);   /* cuBLAS follows the capture */
+    if (!cuda_ok(cudaStreamBeginCapture(g_tp2g_stream[t], cudaStreamCaptureModeThreadLocal), "tp2 graph capture")) {
+        (void)cublasSetStream(cuda_cublas_main_for_tier(t), NULL);
+        tp2g_kill(e);
+        return -1;
+    }
+    g_tp2g_capturing = t;
+    g_tp2g_cap_il = (int)il;
+    g_tp2g_cap_island = (int)island;
+    return 0;
+}
+
+extern "C" int ds4_gpu_tp2_graph_end(uint32_t il, uint32_t island) {
+    const int t = g_tp2g_capturing;
+    if (t < 0 || g_tp2g_cap_il != (int)il || g_tp2g_cap_island != (int)island) return -1;
+    g_tp2g_capturing = -1;
+    cudaGraph_t graph = NULL;
+    cudaError_t err = cudaStreamEndCapture(g_tp2g_stream[t], &graph);
+    (void)cublasSetStream(cuda_cublas_main_for_tier(t), NULL);
+    tp2g_entry &e = g_tp2g[t][il][island];
+    cudaGraphExec_t exec = NULL;
+    if (err == cudaSuccess && graph) err = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
+    if (graph) (void)cudaGraphDestroy(graph);
+    if (err == cudaSuccess && exec) err = cudaGraphLaunch(exec, g_tp2g_stream[t]);   /* the capture ran nothing */
+    if (err != cudaSuccess || !exec) {
+        if (g_tp2g_failures++ < 8)
+            fprintf(stderr, "ds4: TP2-G: capture failed (card %d, layer %u, island %u): %s\n", t, il, island,
+                    cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        if (exec) (void)cudaGraphExecDestroy(exec);
+        tp2g_kill(e);
+        return -1;
+    }
+    e.exec = exec;
+    e.state = 2;
+    g_tp2g_captures++;
+    return 0;
+}
+
+extern "C" void ds4_gpu_tp2_graph_abort(void) {
+    const int t = g_tp2g_capturing;
+    if (t < 0) return;
+    g_tp2g_capturing = -1;
+    cudaGraph_t graph = NULL;
+    (void)cudaStreamEndCapture(g_tp2g_stream[t], &graph);
+    if (graph) (void)cudaGraphDestroy(graph);
+    (void)cublasSetStream(cuda_cublas_main_for_tier(t), NULL);
+    (void)cudaGetLastError();
+    if (g_tp2g_cap_il >= 0 && g_tp2g_cap_island >= 0) tp2g_kill(g_tp2g[t][g_tp2g_cap_il][g_tp2g_cap_island]);
+}
+
+
+
+/* ---- TP2-R: read-ahead ---------------------------------------------------------------------------------------- */
+struct tp2_ahead_job { uint32_t slot; int comp; uint32_t layer; };
+static std::mutex &g_tp2_ahead_mu = *new std::mutex;   /* TP2-U: never destroyed (the readers wait on them) */
+static std::condition_variable &g_tp2_ahead_cv = *new std::condition_variable;
+static std::deque<tp2_ahead_job> &g_tp2_ahead_q = *new std::deque<tp2_ahead_job>;
+static std::deque<tp2_ahead_job> &g_tp2_ahead_lq = *new std::deque<tp2_ahead_job>;   /* TP2-RA: low priority */
+
+static void tp2_ahead_thread(void) {
+    t_in_expert_read = 1;
+    for (;;) {
+        tp2_ahead_job j;
+        {
+            std::unique_lock<std::mutex> lk(g_tp2_ahead_mu);
+            g_tp2_ahead_cv.wait(lk, [] { return !g_tp2_ahead_q.empty() || !g_tp2_ahead_lq.empty(); });
+            std::deque<tp2_ahead_job> &q = !g_tp2_ahead_q.empty() ? g_tp2_ahead_q : g_tp2_ahead_lq;
+            j = q.front();
+            q.pop_front();
+        }
+        tp2_xfer_slot &s = g_tp2_xfer[j.slot];
+        const uint64_t span = j.comp < 2 ? g_tp2_xfer_gspan : g_tp2_xfer_dspan;
+        char *base = s.base + (j.comp == 0 ? 0u : j.comp == 1 ? g_tp2_xfer_gspan : 2u * g_tp2_xfer_gspan);
+        const char *pay = NULL;
+        const int ok = cuda_model_stage_read(base, span, s.soff[j.comp], s.slen[j.comp], &pay);
+        s.spay[j.comp] = pay;
+        if (!ok) g_tp2_spec_fail[j.slot].store(1, std::memory_order_relaxed);
+        g_tp2_left[j.slot].fetch_sub(1, std::memory_order_acq_rel);   /* publishes spay */
+    }
+}
+
+/* a slot that is free now: no read-ahead in flight or waiting to be taken, not serving this layer, its uploads done */
+static int tp2_xfer_alloc(void) {
+    const uint32_t n = (uint32_t)g_tp2_xfer.size();
+    for (uint32_t k = 0; k < n; k++) {
+        const uint32_t si = (g_tp2_xfer_next + k) % n;
+        tp2_xfer_slot &s = g_tp2_xfer[si];
+        if (s.spec || s.fresh) continue;
+        bool busy = false;
+        for (int t = 0; t < 2 && !busy; t++)
+            if (s.marked && s.done[t]) {
+                const cudaError_t q = cudaEventQuery(s.done[t]);
+                if (q == cudaErrorNotReady) busy = true;
+                else (void)cudaGetLastError();
+            }
+        if (busy) continue;
+        g_tp2_xfer_next = si + 1u;
+        return (int)si;
+    }
+    return -1;
+}
+
+
+
+
+/* ---- TP2-RA: prompt-pass read-ahead --------------------------------------------------------------------------- */
+struct tp2_ra_pred {
+    std::vector<int32_t> ids;
+    uint32_t n_total_expert = 0;
+    uint64_t gate_offset = 0, up_offset = 0, down_offset = 0, gate_expert_bytes = 0, down_expert_bytes = 0;
+};
+static std::unordered_map<uint32_t, tp2_ra_pred> g_tp2_ra_pred;
+static uint64_t g_tp2_ra_stats[6];   /* predictions, submitted, used, used while in flight, freed unused, demand at firsts */
+static void tp2_ra_report(void) {
+    const uint64_t *s = g_tp2_ra_stats;
+    if (s[0])
+        fprintf(stderr, "ds4: TP2-RA: %llu layers predicted, %llu experts read ahead, %llu used (%llu still in flight), "
+                "%llu unused; %llu demand drive reads left at the layers' first batches\n", (unsigned long long)s[0],
+                (unsigned long long)s[1], (unsigned long long)s[2], (unsigned long long)s[3], (unsigned long long)s[4],
+                (unsigned long long)s[5]);
+}
+extern "C" int ds4_gpu_tp2_ra_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DS4_TP2_RA"); on = !(e && !strcmp(e, "0")); if (on) atexit(tp2_ra_report); }
+    return on && g_tp2_on;
+}
+extern "C" void ds4_gpu_tp2_ra_set(uint32_t layer, const int32_t *ids, uint32_t n, uint32_t n_total_expert,
+                                   uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+                                   uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
+    if (!ds4_gpu_tp2_ra_on() || !ids || !n) return;
+    tp2_ra_pred &p = g_tp2_ra_pred[layer];
+    p.ids.assign(ids, ids + n);
+    p.n_total_expert = n_total_expert;
+    p.gate_offset = gate_offset; p.up_offset = up_offset; p.down_offset = down_offset;
+    p.gate_expert_bytes = gate_expert_bytes; p.down_expert_bytes = down_expert_bytes;
+    g_tp2_ra_stats[0]++;
+}
+/* a read-ahead slot's parts still queued move to the front of the demand queue */
+static void tp2_ra_promote(const std::vector<uint32_t> &slots) {
+    if (slots.empty()) return;
+    std::lock_guard<std::mutex> lk(g_tp2_ahead_mu);
+    std::vector<tp2_ahead_job> moved;
+    for (auto it = g_tp2_ahead_lq.begin(); it != g_tp2_ahead_lq.end(); ) {
+        if (std::find(slots.begin(), slots.end(), it->slot) != slots.end()) { moved.push_back(*it); it = g_tp2_ahead_lq.erase(it); }
+        else ++it;
+    }
+    for (auto it = moved.rbegin(); it != moved.rend(); ++it) g_tp2_ahead_q.push_front(*it);
+    if (!moved.empty()) g_tp2_ahead_cv.notify_all();
+}
+/* a read-ahead slot no one takes: its queued parts are dropped, started ones land, then it is a plain slot again */
+static void tp2_ra_free(uint32_t si) {
+    {
+        std::lock_guard<std::mutex> lk(g_tp2_ahead_mu);
+        for (auto it = g_tp2_ahead_lq.begin(); it != g_tp2_ahead_lq.end(); ) {
+            if (it->slot == si) { g_tp2_left[si].fetch_sub(1, std::memory_order_acq_rel); it = g_tp2_ahead_lq.erase(it); }
+            else ++it;
+        }
+    }
+    while (g_tp2_left[si].load(std::memory_order_acquire) != 0) std::this_thread::yield();
+    tp2_xfer_slot &s = g_tp2_xfer[si];
+    s.spec = 0;
+    g_tp2_spec_fail[si].store(0, std::memory_order_relaxed);
+    g_tp2_ra_stats[4]++;
+}
+
+/* ---- TP2-U: the prompt pass's drive reads as one pipeline ------------------------------------------------------ */
+static int g_tp2u_threads = 0;
+static void tp2u_readers_ensure(void) {
+    static int want = -1;
+    if (want < 0) { const char *e = getenv("DS4_TP2_READERS"); want = e && *e ? atoi(e) : 16; if (want < 1) want = 1; if (want > 64) want = 64; }
+    while (g_tp2u_threads < want) { std::thread(tp2_ahead_thread).detach(); g_tp2u_threads++; }
+}
+
+static int tp2u_prefetch(const int32_t *ids, uint32_t n_ids, const void *model_map, uint64_t model_size,
+                         uint32_t layer, uint32_t n_total_expert, uint64_t gate_offset, uint64_t up_offset,
+                         uint64_t down_offset, uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
+    if (!g_tp2_on || model_map != g_model_fd_host_base) return 1;
+    if (!ids || !n_ids || !gate_expert_bytes || !down_expert_bytes) return 0;
+    const int saved = g_stream_tier;
+    if (ds4_gpu_set_current_device(0) != 0) return 0;
+    if (!tp2_xfer_ensure(gate_expert_bytes, down_expert_bytes)) { (void)ds4_gpu_set_current_device(saved); return 1; }
+    std::vector<int32_t> uniq;
+    {
+        std::vector<char> seen(n_total_expert, 0);
+        for (uint32_t i = 0; i < n_ids; i++) {
+            const int32_t e = ids[i];
+            if (e < 0 || (uint32_t)e >= n_total_expert) { (void)ds4_gpu_set_current_device(saved); return 0; }
+            if (!seen[(uint32_t)e]) { seen[(uint32_t)e] = 1; uniq.push_back(e); }
+        }
+    }
+    /* the chunk's hits on each card are touched first: the installs below must not evict them */
+    for (int t = 0; t < 2; t++) {
+        auto &by = g_stream_expert_by_gate_pt.v[t];
+        auto &slots = g_stream_expert_slots_pt.v[t];
+        uint64_t &clock = g_stream_expert_clock_pt.v[t];
+        const uint64_t stamp = ++clock;
+        for (int32_t e : uniq) {
+            const auto it = by.find(gate_offset + (uint64_t)e * gate_expert_bytes + (uint64_t)t * (gate_expert_bytes / 2u));
+            if (it != by.end() && it->second < slots.size() && slots[it->second].used > 2u) slots[it->second].used = stamp;
+        }
+    }
+    /* every slot is taken over: earlier uploads from it have run first */
+    std::deque<uint32_t> free_slots;
+    std::unordered_map<uint64_t, uint32_t> ra_here;   /* TP2-RA: this layer's read-aheads, by gate offset */
+    for (uint32_t si = 0; si < (uint32_t)g_tp2_xfer.size(); si++) {
+        tp2_xfer_slot &s = g_tp2_xfer[si];
+        if (s.spec == 5) {
+            if (s.slayer > layer) continue;                                    /* a later layer's: kept */
+            if (s.slayer == layer) { ra_here[s.soff[0]] = si; continue; }     /* this layer's: taken or freed below */
+            tp2_ra_free(si);                                                   /* an earlier layer's: stale */
+        }
+        for (int t = 0; t < 2; t++)
+            if (s.marked && s.done[t]) (void)cudaEventSynchronize(s.done[t]);
+        if (s.gate) g_tp2_xfer_by_gate.erase(s.gate);
+        s.gate = s.up = s.down = 0;
+        s.fresh = s.marked = 0;
+        free_slots.push_back(si);
+    }
+    std::vector<int32_t> pool, disk;
+    for (int32_t e : uniq) {
+        const uint64_t g = gate_offset + (uint64_t)e * gate_expert_bytes;
+        bool missing = false;
+        for (int t = 0; t < 2; t++)
+            missing = missing || !g_stream_expert_by_gate_pt.v[t].count(g + (uint64_t)t * (gate_expert_bytes / 2u));
+        if (!missing) continue;
+        if (g_host_tier_state > 0 && g_host_tier_by_gate.count(g)) pool.push_back(e);
+        else disk.push_back(e);
+    }
+    /* TP2-RA: demand misses already read ahead go first, from their slots */
+    std::vector<uint32_t> ra_take;
+    {
+        static uint32_t ra_last_layer = UINT32_MAX;
+        const bool first_batch = layer != ra_last_layer;
+        ra_last_layer = layer;
+        if (!ra_here.empty()) {
+            std::vector<int32_t> taken_e, rest;
+            for (int32_t e : disk) {
+                const auto it = ra_here.find(gate_offset + (uint64_t)e * gate_expert_bytes);
+                if (it != ra_here.end()) { ra_take.push_back(it->second); taken_e.push_back(e); ra_here.erase(it); }
+                else rest.push_back(e);
+            }
+            for (uint32_t si : ra_take) if (g_tp2_left[si].load(std::memory_order_acquire) != 0) g_tp2_ra_stats[3]++;
+            g_tp2_ra_stats[2] += ra_take.size();
+            tp2_ra_promote(ra_take);
+            for (const auto &kv : ra_here) { tp2_ra_free(kv.second); free_slots.push_back(kv.second); }
+            ra_here.clear();
+            taken_e.insert(taken_e.end(), rest.begin(), rest.end());
+            disk.swap(taken_e);
+        }
+        if (first_batch) g_tp2_ra_stats[5] += disk.size() - ra_take.size();
+    }
+    int rc = 1;
+    std::vector<int> slot_of(disk.size(), -1);
+    size_t submitted = 0, installed = 0;
+    for (size_t k = 0; k < ra_take.size(); k++) slot_of[k] = (int)ra_take[k];
+    submitted = ra_take.size();
+    std::vector<tp2_ahead_job> jobs;
+    auto refill = [&](bool block) {   /* free slots (or slots whose uploads have run) take the next reads */
+        jobs.clear();
+        while (submitted < disk.size() && submitted - installed < 32u + (uint32_t)ra_take.size()) {
+            uint32_t si;
+            if (!free_slots.empty()) { si = free_slots.front(); free_slots.pop_front(); }
+            else break;
+            const int32_t e = disk[submitted];
+            tp2_xfer_slot &s = g_tp2_xfer[si];
+            if (s.marked) {   /* its uploads must have run on both cards */
+                bool done = true;
+                for (int t = 0; t < 2 && done; t++)
+                    if (s.done[t]) {
+                        const cudaError_t q = block ? cudaEventSynchronize(s.done[t]) : cudaEventQuery(s.done[t]);
+                        if (q == cudaErrorNotReady) done = false;
+                        else if (q != cudaSuccess) { (void)cudaGetLastError(); }
+                    }
+                if (!done) { free_slots.push_front(si); break; }
+                s.marked = 0;
+            }
+            block = false;
+            s.gate = s.up = s.down = 0;
+            s.fresh = 0;
+            s.soff[0] = gate_offset + (uint64_t)e * gate_expert_bytes; s.slen[0] = gate_expert_bytes;
+            s.soff[1] = up_offset + (uint64_t)e * gate_expert_bytes; s.slen[1] = gate_expert_bytes;
+            s.soff[2] = down_offset + (uint64_t)e * down_expert_bytes; s.slen[2] = down_expert_bytes;
+            s.spay[0] = s.spay[1] = s.spay[2] = NULL;
+            g_tp2_spec_fail[si].store(0, std::memory_order_relaxed);
+            g_tp2_left[si].store(3, std::memory_order_release);
+            s.spec = 2;   /* a prompt-pass read in flight */
+            slot_of[submitted++] = (int)si;
+            for (int comp = 0; comp < 3; comp++) jobs.push_back({si, comp, UINT32_MAX});
+        }
+        if (!jobs.empty()) {
+            std::lock_guard<std::mutex> lk(g_tp2_ahead_mu);
+            for (const auto &j : jobs) g_tp2_ahead_q.push_back(j);
+            g_tp2_ahead_cv.notify_all();
+        }
+    };
+    if (!disk.empty()) { tp2u_readers_ensure(); refill(false); }
+    {   /* TP2-RA: the next layer's predicted misses into the slots demand does not hold, low priority */
+        const auto pit = ds4_gpu_tp2_ra_on() ? g_tp2_ra_pred.find(layer + 1u) : g_tp2_ra_pred.end();
+        if (pit != g_tp2_ra_pred.end()) {
+            const tp2_ra_pred &p = pit->second;
+            std::vector<uint32_t> cnt(p.n_total_expert, 0u);
+            for (int32_t e : p.ids) if (e >= 0 && (uint32_t)e < p.n_total_expert) cnt[(uint32_t)e]++;
+            std::vector<int32_t> cand;
+            std::unordered_set<uint64_t> in_slot;
+            for (const auto &s : g_tp2_xfer) if (s.spec == 5) in_slot.insert(s.soff[0]);
+            for (uint32_t e = 0; e < p.n_total_expert; e++) {
+                if (!cnt[e]) continue;
+                const uint64_t g = p.gate_offset + (uint64_t)e * p.gate_expert_bytes;
+                bool missing = false;
+                for (int t = 0; t < 2; t++)
+                    missing = missing || !g_stream_expert_by_gate_pt.v[t].count(g + (uint64_t)t * (p.gate_expert_bytes / 2u));
+                if (!missing || (g_host_tier_state > 0 && g_host_tier_by_gate.count(g)) || in_slot.count(g)) continue;
+                cand.push_back((int32_t)e);
+            }
+            std::stable_sort(cand.begin(), cand.end(), [&](int32_t x, int32_t y) { return cnt[(uint32_t)x] > cnt[(uint32_t)y]; });
+            std::vector<tp2_ahead_job> lj;
+            size_t k = 0;
+            const size_t keep = disk.size() > submitted ? std::min<size_t>(disk.size() - submitted, 8u) : 0u;   /* demand refills */
+            while (k < cand.size() && free_slots.size() > keep) {
+                const uint32_t si = free_slots.back(); free_slots.pop_back();
+                tp2_xfer_slot &s = g_tp2_xfer[si];
+                if (s.marked) {   /* its last uploads must have run */
+                    for (int t = 0; t < 2; t++) if (s.done[t]) (void)cudaEventSynchronize(s.done[t]);
+                    s.marked = 0;
+                }
+                const int32_t e = cand[k++];
+                s.gate = s.up = s.down = 0; s.fresh = 0;
+                s.soff[0] = p.gate_offset + (uint64_t)e * p.gate_expert_bytes; s.slen[0] = p.gate_expert_bytes;
+                s.soff[1] = p.up_offset + (uint64_t)e * p.gate_expert_bytes; s.slen[1] = p.gate_expert_bytes;
+                s.soff[2] = p.down_offset + (uint64_t)e * p.down_expert_bytes; s.slen[2] = p.down_expert_bytes;
+                s.spay[0] = s.spay[1] = s.spay[2] = NULL;
+                g_tp2_spec_fail[si].store(0, std::memory_order_relaxed);
+                g_tp2_left[si].store(3, std::memory_order_release);
+                s.spec = 5; s.slayer = layer + 1u;
+                for (int comp = 0; comp < 3; comp++) lj.push_back({si, comp, UINT32_MAX});
+                g_tp2_ra_stats[1]++;
+            }
+            if (!lj.empty()) {
+                tp2u_readers_ensure();
+                std::lock_guard<std::mutex> lk(g_tp2_ahead_mu);
+                for (const auto &j : lj) g_tp2_ahead_lq.push_back(j);
+                g_tp2_ahead_cv.notify_all();
+            }
+            g_tp2_ra_pred.erase(pit);
+        }
+    }
+    if (!pool.empty()) {   /* the RAM tier's parts that a card lacks, while the drives read */
+        for (int t = 0; rc && t < 2; t++) {
+            if (ds4_gpu_set_current_device(t) != 0) { rc = 0; break; }
+            ds4_gpu_stream_expert_table table = {model_map, model_size, layer, n_total_expert, gate_offset, up_offset,
+                                                 down_offset, gate_expert_bytes, down_expert_bytes, 2u, (uint32_t)t};
+            for (size_t kk = 0; rc && kk < pool.size(); kk += 6) {
+                const uint32_t n = (uint32_t)std::min<size_t>(6, pool.size() - kk);
+                const int quick = g_tp2v_pinned[t];   /* TP2-W: a wave runs on this card */
+                g_begin_load_skip_sync = quick; g_begin_load_no_remap = quick; g_begin_load_share_apply = quick;
+                rc = cuda_stream_selected_cache_begin_load(&table, &pool[kk], n, false);
+                g_begin_load_skip_sync = 0; g_begin_load_no_remap = 0; g_begin_load_share_apply = 0;
+            }
+        }
+    }
+    std::vector<int32_t> batch;
+    std::vector<uint32_t> bslots;
+    while (installed < disk.size()) {
+        if (installed == submitted) {   /* nothing in flight: wait for the oldest uploads to free a slot */
+            refill(true);
+            if (installed == submitted) { rc = 0; break; }
+        }
+        const uint32_t si0 = (uint32_t)slot_of[installed];
+        while (g_tp2_left[si0].load(std::memory_order_acquire) != 0) std::this_thread::yield();
+        batch.clear(); bslots.clear();
+        while (installed < submitted && batch.size() < 6u) {   /* the landed reads, in read order */
+            const uint32_t si = (uint32_t)slot_of[installed];
+            if (g_tp2_left[si].load(std::memory_order_acquire) != 0) break;
+            tp2_xfer_slot &s = g_tp2_xfer[si];
+            s.spec = 0;
+            installed++;
+            if (g_tp2_spec_fail[si].load(std::memory_order_relaxed)) {   /* the cards read it themselves later */
+                g_tp2_spec_fail[si].store(0, std::memory_order_relaxed);
+                free_slots.push_back(si);
+                continue;
+            }
+            s.gate = s.soff[0]; s.up = s.soff[1]; s.down = s.soff[2];
+            s.pg = s.spay[0]; s.pu = s.spay[1]; s.pd = s.spay[2];
+            g_tp2_xfer_by_gate[s.gate] = si;
+            batch.push_back(disk[installed - 1u]);
+            bslots.push_back(si);
+            g_tp2_xfer_reads++;
+        }
+        if (rc && !batch.empty()) {   /* each card's parts through the cache's own load; the uploads run on */
+            for (int t = 0; rc && t < 2; t++) {
+                if (ds4_gpu_set_current_device(t) != 0) { rc = 0; break; }
+                ds4_gpu_stream_expert_table table = {model_map, model_size, layer, n_total_expert, gate_offset,
+                                                     up_offset, down_offset, gate_expert_bytes, down_expert_bytes, 2u,
+                                                     (uint32_t)t};
+                const int quick = g_tp2v_pinned[t];   /* TP2-W: a wave runs on this card */
+                g_begin_load_skip_sync = quick; g_begin_load_no_remap = quick; g_begin_load_share_apply = quick;
+                rc = cuda_stream_selected_cache_begin_load(&table, batch.data(), (uint32_t)batch.size(), false);
+                g_begin_load_skip_sync = 0; g_begin_load_no_remap = 0; g_begin_load_share_apply = 0;
+                for (uint32_t si : bslots) {
+                    tp2_xfer_slot &s = g_tp2_xfer[si];
+                    if (rc && !s.done[t])
+                        rc = cuda_ok(cudaEventCreateWithFlags(&s.done[t], cudaEventDisableTiming), "tp2u event");
+                    if (rc && g_stream_selected_upload_stream)
+                        rc = cuda_ok(cudaEventRecord(s.done[t], g_stream_selected_upload_stream), "tp2u mark");
+                }
+            }
+            for (uint32_t si : bslots) {   /* no later lookup may find these slots; they are free once uploaded */
+                tp2_xfer_slot &s = g_tp2_xfer[si];
+                g_tp2_xfer_by_gate.erase(s.gate);
+                s.gate = s.up = s.down = 0;
+                s.fresh = 0;
+                s.marked = 1;
+                free_slots.push_back(si);
+            }
+        }
+        if (!rc) break;
+        if (submitted < disk.size()) refill(false);
+    }
+    if (!rc) {   /* reads still in flight land before the slots are used again */
+        for (size_t k = installed; k < submitted; k++)
+            while (g_tp2_left[(uint32_t)slot_of[k]].load(std::memory_order_acquire) != 0) std::this_thread::yield();
+        for (size_t k = installed; k < submitted; k++) g_tp2_xfer[(uint32_t)slot_of[k]].spec = 0;
+    }
+    g_tp2_xfer_next = 0;
+    (void)ds4_gpu_set_current_device(saved);
+    return rc;
+}
+
+extern "C" int ds4_gpu_tp2_moe_batch_prefetch(const int32_t *ids, uint32_t n_ids, const void *model_map,
+                                              uint64_t model_size, uint32_t layer, uint32_t n_total_expert,
+                                              uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+                                              uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
+    static int off = -1;
+    if (off < 0) { const char *e = getenv("DS4_TP2_XFER"); off = e && !strcmp(e, "0"); }
+    if (off) return 1;
+    return tp2u_prefetch(ids, n_ids, model_map, model_size, layer, n_total_expert, gate_offset, up_offset,
+                         down_offset, gate_expert_bytes, down_expert_bytes);
+}
+
+
+/* ---- TP2-V: the prompt pass's routed experts in two waves ------------------------------------------------------ */
+struct tp2v_card {
+    int32_t *h = NULL;   /* pinned: wave 0 then wave 1, each pairs IDs then experts slots */
+    int32_t *d = NULL;   /* the same on the card */
+    size_t cap = 0;      /* entries per wave */
+};
+static tp2v_card g_tp2v[2];
+static std::vector<int32_t> g_tp2v_compact, g_tp2v_uniq;   /* per pair: compact expert (first appearance); its expert */
+static std::vector<uint8_t> g_tp2v_late;                   /* per compact expert: 1 = wave 2 */
+static uint32_t g_tp2v_pairs = 0;
+static int64_t g_tp2v_bound[2];   /* MMQ-T: the largest column count of an expert in each wave */
+static uint64_t g_tp2v_stats[4];   /* batches in two waves, in one pass, wave-1 experts, wave-2 experts */
+
+static void tp2v_report(void) {
+    if (g_tp2v_stats[0] || g_tp2v_stats[1])
+        fprintf(stderr, "ds4: TP2-V: %llu prompt-pass batches in two waves (%.1f experts in the first, %.1f in the "
+                "second), %llu in one pass\n", (unsigned long long)g_tp2v_stats[0],
+                g_tp2v_stats[0] ? (double)g_tp2v_stats[2] / g_tp2v_stats[0] : 0.0,
+                g_tp2v_stats[0] ? (double)g_tp2v_stats[3] / g_tp2v_stats[0] : 0.0, (unsigned long long)g_tp2v_stats[1]);
+}
+
+extern "C" int ds4_gpu_tp2_waves_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("DS4_TP2_WAVES"), *z = getenv("DS4_MMQ_OUT_MEMSET");
+        on = !(e && !strcmp(e, "0")) && !(z && z[0] == '1');
+        atexit(tp2v_report);
+    }
+    return on && g_tp2_on;
+}
+
+static int tp2v_pool_early(void) {   /* TP2-W3: RAM-tier experts in wave 1 (DS4_TP2_WAVES_POOL=0: wave 2) */
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DS4_TP2_WAVES_POOL"); on = !(e && !strcmp(e, "0")); }
+    return on;
+}
+
+static int tp2v_ensure(int t, size_t n) {   /* the current card is t */
+    if (g_tp2v[t].cap >= n) return 1;
+    const size_t cap = n + n / 2u + 1024u;
+    if (g_tp2v[t].h) (void)cudaFreeHost(g_tp2v[t].h);
+    if (g_tp2v[t].d) (void)cudaFree(g_tp2v[t].d);
+    g_tp2v[t] = tp2v_card();
+    void *hm = NULL, *dm = NULL;
+    if (!cuda_ok(cudaHostAlloc(&hm, 2u * cap * sizeof(int32_t), cudaHostAllocPortable), "tp2v host tables")) return 0;
+    if (!cuda_ok(cudaMalloc(&dm, 2u * cap * sizeof(int32_t)), "tp2v tables")) { (void)cudaFreeHost(hm); return 0; }
+    g_tp2v[t].h = (int32_t *)hm;
+    g_tp2v[t].d = (int32_t *)dm;
+    g_tp2v[t].cap = cap;
+    return 1;
+}
+
+extern "C" int ds4_gpu_tp2_waves_plan(const int32_t *ids, uint32_t pairs, uint32_t n_total_expert, uint64_t gate_offset,
+                                      uint64_t gate_expert_bytes) {
+    if (!ds4_gpu_tp2_waves_on() || !ids || !pairs) return 0;
+    g_tp2v_pairs = 0;
+    g_tp2v_compact.assign(pairs, -1);
+    g_tp2v_uniq.clear();
+    {
+        std::vector<int32_t> first(n_total_expert, -1);
+        for (uint32_t p = 0; p < pairs; p++) {
+            const int32_t e = ids[p];
+            if (e < 0 || (uint32_t)e >= n_total_expert) return 0;   /* the one-pass path reports it */
+            if (first[(uint32_t)e] < 0) { first[(uint32_t)e] = (int32_t)g_tp2v_uniq.size(); g_tp2v_uniq.push_back(e); }
+            g_tp2v_compact[p] = first[(uint32_t)e];
+        }
+    }
+    const uint32_t n = (uint32_t)g_tp2v_uniq.size();
+    g_tp2v_late.assign(n, 0);
+    uint32_t late = 0;
+    std::vector<int32_t> slot[2];
+    for (int t = 0; t < 2; t++) slot[t].assign(n, 0);
+    for (uint32_t k = 0; k < n; k++) {
+        const uint64_t g = gate_offset + (uint64_t)g_tp2v_uniq[k] * gate_expert_bytes;
+        if (!tp2v_pool_early() && g_host_tier_state > 0 && g_host_tier_by_gate.count(g)) g_tp2v_late[k] = 1;
+        for (int t = 0; t < 2 && !g_tp2v_late[k]; t++) {
+            const auto it = g_stream_expert_by_gate_pt.v[t].find(g + (uint64_t)t * (gate_expert_bytes / 2u));
+            if (it == g_stream_expert_by_gate_pt.v[t].end()) g_tp2v_late[k] = 1;
+            else slot[t][k] = (int32_t)it->second;
+        }
+        late += g_tp2v_late[k];
+    }
+    if (!late || late == n) { g_tp2v_stats[1]++; return 0; }
+    {   /* MMQ-T */
+        std::vector<uint32_t> cnt(n, 0u);
+        for (uint32_t p = 0; p < pairs; p++) cnt[(uint32_t)g_tp2v_compact[p]]++;
+        g_tp2v_bound[0] = g_tp2v_bound[1] = 0;
+        for (uint32_t k = 0; k < n; k++) {
+            int64_t &b = g_tp2v_bound[g_tp2v_late[k] ? 1 : 0];
+            if ((int64_t)cnt[k] > b) b = (int64_t)cnt[k];
+        }
+    }
+    const int saved = g_stream_tier;
+    for (int t = 0; t < 2; t++) {
+        if (ds4_gpu_set_current_device(t) != 0 || !tp2v_ensure(t, (size_t)pairs + n)) {
+            (void)ds4_gpu_set_current_device(saved);
+            return -1;
+        }
+        int32_t *hw = g_tp2v[t].h;
+        for (uint32_t p = 0; p < pairs; p++) {
+            const int32_t k = g_tp2v_compact[p];
+            hw[p] = g_tp2v_late[(uint32_t)k] ? -1 : k;
+        }
+        memcpy(hw + pairs, slot[t].data(), (size_t)n * sizeof(int32_t));
+        if (!cuda_ok(cudaMemcpyAsync(g_tp2v[t].d, hw, ((size_t)pairs + n) * sizeof(int32_t), cudaMemcpyHostToDevice,
+                                     (cudaStream_t)0), "tp2v wave 1 tables")) {
+            (void)ds4_gpu_set_current_device(saved);
+            return -1;
+        }
+    }
+    (void)ds4_gpu_set_current_device(saved);
+    for (int t = 0; t < 2; t++) {   /* TP2-W: wave 1's slots stay put until the card's wave-2 load has drained it */
+        auto &pin = g_tp2v_pin[t];
+        const size_t ns = g_stream_expert_slots_pt.v[t].size();
+        if (pin.size() != ns) pin.assign(ns, 0);
+        else std::fill(pin.begin(), pin.end(), (uint8_t)0);
+        for (uint32_t k = 0; k < n; k++)
+            if (!g_tp2v_late[k] && (size_t)slot[t][k] < ns) pin[(size_t)slot[t][k]] = 1;
+        g_tp2v_pinned[t] = 1;
+    }
+    g_tp2v_pairs = pairs;
+    g_tp2v_stats[0]++; g_tp2v_stats[2] += n - late; g_tp2v_stats[3] += late;
+    return 1;
+}
+
+extern "C" int ds4_gpu_tp2_wave2_prepare(const int32_t *ids, uint32_t pairs, const void *model_map, uint64_t model_size,
+                                         uint32_t layer, uint32_t n_total_expert, uint64_t gate_offset,
+                                         uint64_t up_offset, uint64_t down_offset, uint64_t gate_expert_bytes,
+                                         uint64_t down_expert_bytes, uint32_t part) {
+    const int t = g_stream_tier;
+    if (!g_tp2_on || t < 0 || t > 1 || part != (uint32_t)t || pairs != g_tp2v_pairs || !g_tp2v[t].d) return 0;
+    ds4_gpu_stream_expert_table table = {model_map, model_size, layer, n_total_expert, gate_offset, up_offset,
+                                         down_offset, gate_expert_bytes, down_expert_bytes, 2u, part};
+    /* TP2-W2: no drain, no remap: wave 1's slots are pinned, and whatever this load still installs is stamped by it */
+    g_begin_load_skip_sync = 1; g_begin_load_no_remap = 1; g_begin_load_share_apply = 1;
+    const int loaded = cuda_stream_selected_cache_begin_load(&table, ids, pairs, true);
+    g_begin_load_skip_sync = 0; g_begin_load_no_remap = 0; g_begin_load_share_apply = 0;
+    if (!loaded) return 0;
+    const uint32_t n = (uint32_t)g_tp2v_uniq.size();
+    if (g_stream_prefill_ids.size() != pairs || g_stream_prefill_slots.size() != n) {
+        fprintf(stderr, "ds4: TP2-V: the load's tables (%zu pairs, %zu experts) are not the plan's (%u, %u)\n",
+                g_stream_prefill_ids.size(), g_stream_prefill_slots.size(), pairs, n);
+        return 0;
+    }
+    const size_t w = g_tp2v[t].cap;
+    int32_t *hw = g_tp2v[t].h + w;
+    for (uint32_t p = 0; p < pairs; p++) {
+        const int32_t k = g_stream_prefill_ids[p];
+        if (k != g_tp2v_compact[p]) {
+            fprintf(stderr, "ds4: TP2-V: pair %u is expert %d in the load, %d in the plan\n", p, k, g_tp2v_compact[p]);
+            return 0;
+        }
+        hw[p] = g_tp2v_late[(uint32_t)k] ? k : -1;
+    }
+    for (uint32_t k = 0; k < n; k++) if (g_stream_prefill_slots[k] < 0) return 0;
+    memcpy(hw + pairs, g_stream_prefill_slots.data(), (size_t)n * sizeof(int32_t));
+    return cuda_ok(cudaMemcpyAsync(g_tp2v[t].d + w, hw, ((size_t)pairs + n) * sizeof(int32_t), cudaMemcpyHostToDevice,
+                                   (cudaStream_t)0), "tp2v wave 2 tables");
+}
+
+/* tp2_swiglu_kernel for the pairs of one wave (pair_ids >= 0) */
+__global__ static void tp2_swiglu_masked_kernel(float *mid_a, float *mid_b, uint32_t mid_stride, uint32_t col0,
+                                                const float *gate_buf, const float *up_buf, const float *weights,
+                                                const int32_t *pair_ids, uint32_t part_mid, uint32_t n_tokens,
+                                                uint32_t n_expert_used, float clamp) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)n_tokens * n_expert_used * part_mid;
+    if (gid >= n) return;
+    const uint64_t slot_pair = gid / part_mid;
+    if (pair_ids[slot_pair] < 0) return;
+    const uint32_t j = (uint32_t)(gid - slot_pair * part_mid);
+    const uint32_t tok = (uint32_t)(slot_pair / n_expert_used);
+    const uint32_t slot = (uint32_t)(slot_pair - (uint64_t)tok * n_expert_used);
+    const float w = weights[(uint64_t)tok * n_expert_used + slot];
+    float v = 0.0f;
+    if (w != 0.0f) {
+        float g = gate_buf[gid];
+        float u = up_buf[gid];
+        if (!isfinite(g)) g = 0.0f;
+        if (!isfinite(u)) u = 0.0f;
+        if (clamp > 1.0e-6f) {
+            if (g > clamp) g = clamp;
+            if (u > clamp) u = clamp;
+            if (u < -clamp) u = -clamp;
+        }
+        const float s = g / (1.0f + expf(-g));
+        v = s * u * w;
+    }
+    const uint64_t o = slot_pair * mid_stride + col0 + j;
+    mid_a[o] = v;
+    if (mid_b) mid_b[o] = v;
+}
+
+extern "C" int ds4_gpu_tp2_wave_gate_up(int wave, ds4_gpu_tensor *mid_here, ds4_gpu_tensor *mid_there,
+                                        ds4_gpu_tensor *gate_buf, ds4_gpu_tensor *up_buf, const ds4_gpu_tensor *x,
+                                        const ds4_gpu_tensor *weights, uint32_t rows, uint32_t in_dim, uint32_t mid_dim,
+                                        float clamp) {
+    const int t = g_stream_tier;
+    const uint32_t pairs = rows * 6u, half = mid_dim / 2u, n = (uint32_t)g_tp2v_uniq.size();
+    auto &cache = g_stream_selected_cache;
+    if (!g_tp2_on || t < 0 || t > 1 || (wave != 0 && wave != 1) || pairs != g_tp2v_pairs || !g_tp2v[t].d || !n ||
+        !cache.gate_ptr || !cache.up_ptr || !mid_here || !gate_buf || !up_buf || !x || !weights || (mid_dim % 256u) ||
+        mid_here->bytes < (uint64_t)pairs * mid_dim * sizeof(float) ||
+        (mid_there && mid_there->bytes < (uint64_t)pairs * mid_dim * sizeof(float)) ||
+        gate_buf->bytes < (uint64_t)pairs * half * sizeof(float) || up_buf->bytes < (uint64_t)pairs * half * sizeof(float))
+        return 0;
+    const int32_t *d_ids = g_tp2v[t].d + (size_t)wave * g_tp2v[t].cap, *d_slots = d_ids + pairs;
+    ds4_mmq_set_x_slot(d_slots);
+    ds4_mmq_set_col_bound(g_tp2v_bound[wave]);   /* MMQ-T */
+    const int rc = ds4_mmq_mxfp4_moe_pair(cache.gate_ptr, cache.up_ptr, (const float *)x->ptr, d_ids,
+        (float *)gate_buf->ptr, (float *)up_buf->ptr, (int)half, (int)in_dim, (int)rows, (int)n, 6, (cudaStream_t)0);
+    ds4_mmq_set_x_slot(NULL);
+    ds4_mmq_set_col_bound(0);
+    if (rc != 0) return 0;
+    const uint64_t m = (uint64_t)pairs * half;
+    tp2_swiglu_masked_kernel<<<(uint32_t)((m + 255u) / 256u), 256, 0, (cudaStream_t)0>>>((float *)mid_here->ptr,
+        mid_there ? (float *)mid_there->ptr : NULL, mid_dim, (uint32_t)t * half, (const float *)gate_buf->ptr,
+        (const float *)up_buf->ptr, (const float *)weights->ptr, d_ids, half, rows, 6u, clamp);
+    return cuda_ok(cudaGetLastError(), "tp2v swiglu");
+}
+
+extern "C" int ds4_gpu_tp2_wave_down(int wave, ds4_gpu_tensor *out, uint32_t out_stride, uint32_t col0,
+                                     ds4_gpu_tensor *down_buf, const ds4_gpu_tensor *mid_full, uint32_t rows,
+                                     uint32_t out_dim, uint32_t mid_dim, int sum) {
+    const int t = g_stream_tier;
+    const uint32_t pairs = rows * 6u, half = out_dim / 2u, n = (uint32_t)g_tp2v_uniq.size();
+    auto &cache = g_stream_selected_cache;
+    if (!g_tp2_on || t < 0 || t > 1 || (wave != 0 && wave != 1) || pairs != g_tp2v_pairs || !g_tp2v[t].d || !n ||
+        !cache.down_ptr || !out || !down_buf || !mid_full || (out_dim % 2u) || col0 + half > out_stride ||
+        out->bytes < ((uint64_t)(rows - 1u) * out_stride + col0 + half) * sizeof(float) ||
+        down_buf->bytes < (uint64_t)pairs * half * sizeof(float) ||
+        mid_full->bytes < (uint64_t)pairs * mid_dim * sizeof(float)) return 0;
+    const int32_t *d_ids = g_tp2v[t].d + (size_t)wave * g_tp2v[t].cap, *d_slots = d_ids + pairs;
+    ds4_mmq_set_x_slot(d_slots);
+    ds4_mmq_set_col_bound(g_tp2v_bound[wave]);   /* MMQ-T */
+    const int rc = ds4_mmq_mxfp4_moe(cache.down_ptr, (const float *)mid_full->ptr, d_ids, (float *)down_buf->ptr,
+        (int)half, (int)mid_dim, (int)pairs, (int)n, 1, (cudaStream_t)0);
+    ds4_mmq_set_x_slot(NULL);
+    ds4_mmq_set_col_bound(0);
+    if (rc != 0) return 0;
+    if (!sum) return 1;
+    const uint64_t m = (uint64_t)rows * half;
+    tp2_sum_kernel<<<(uint32_t)((m + 255u) / 256u), 256, 0, (cudaStream_t)0>>>((float *)out->ptr, out_stride, col0,
+        (const float *)down_buf->ptr, half, 6u, rows);
+    return cuda_ok(cudaGetLastError(), "tp2v sum");
+}
+
+/* TP2-W2: the batch's launches are queued; the next eviction follows the next router's IDs, read after both cards
+ * have run this batch */
+extern "C" void ds4_gpu_tp2_waves_end(void) {
+    g_tp2v_pinned[0] = g_tp2v_pinned[1] = 0;
+}
+
+/* TP2-X: see ds4_gpu.h; the one-card prompt pass's vector path for n_tokens <= 8 (same kernels, same IDs and expert
+ * count from the cache's load, the card's half of the rows) */
+extern "C" int ds4_gpu_tp2_moe_vec_rows(ds4_gpu_tensor *mid_part, const ds4_gpu_tensor *x, const ds4_gpu_tensor *weights,
+                                        uint32_t n_tokens, uint32_t in_dim, uint32_t mid_dim, float clamp) {
+    auto &cache = g_stream_selected_cache;
+    if (!g_tp2_on || !mid_part || !x || !weights || !n_tokens || n_tokens > 8u || !cache.valid || !cache.gate_ptr ||
+        !cache.up_ptr || !cache.slot_selected_ptr || cache.slot_count != n_tokens * 6u || (mid_dim % 2u) ||
+        mid_part->bytes < (uint64_t)n_tokens * 6u * (mid_dim / 2u) * sizeof(float)) return 0;
+    ds4_mmq_set_x_slot(NULL);
+    return ds4_mmq_mxfp4_moe_gate_up_mid_vec(cache.gate_ptr, cache.up_ptr, (const float *)x->ptr,
+        cache.slot_selected_ptr, (const float *)weights->ptr, (float *)mid_part->ptr, (int)(mid_dim / 2u),
+        (int)in_dim, (int)n_tokens, (int)cache.compact_count, 6, clamp, cuda_decode_stream()) == 0;
+}
+
+extern "C" int ds4_gpu_tp2_moe_vec_down_rows(ds4_gpu_tensor *out_part, const ds4_gpu_tensor *mid_full, uint32_t n_tokens,
+                                             uint32_t out_dim, uint32_t mid_dim) {
+    auto &cache = g_stream_selected_cache;
+    if (!g_tp2_on || !out_part || !mid_full || !n_tokens || n_tokens > 8u || !cache.valid || !cache.down_ptr ||
+        !cache.slot_selected_ptr || cache.slot_count != n_tokens * 6u || (out_dim % 2u) ||
+        out_part->bytes < (uint64_t)n_tokens * (out_dim / 2u) * sizeof(float) ||
+        mid_full->bytes < (uint64_t)n_tokens * 6u * mid_dim * sizeof(float)) return 0;
+    return ds4_mmq_mxfp4_moe_down_sum6_vec(cache.down_ptr, (const float *)mid_full->ptr, cache.slot_selected_ptr,
+        (float *)out_part->ptr, (int)(out_dim / 2u), (int)mid_dim, (int)n_tokens, (int)cache.compact_count, 6,
+        cuda_decode_stream()) == 0;
+}
+
+/* TP2-XP: see ds4_gpu.h */
+extern "C" int ds4_gpu_tp2_xfer_prepare(uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
+    if (!g_tp2_on || !gate_expert_bytes || !down_expert_bytes) return 1;
+    const double t0 = cuda_now_ms();
+    const int saved = g_stream_tier;
+    if (ds4_gpu_set_current_device(0) != 0) return 0;
+    const int ok = tp2_xfer_ensure(gate_expert_bytes, down_expert_bytes);
+    (void)ds4_gpu_set_current_device(saved < 0 ? 0 : saved);
+    fprintf(stderr, "ds4: TP2: %zu transfer slots (%.2f GB pinned, read alignment %llu) set up at start in %.0f ms\n",
+            g_tp2_xfer.size(), g_tp2_xfer.size() * (2.0 * g_tp2_xfer_gspan + g_tp2_xfer_dspan) / 1e9,
+            (unsigned long long)g_model_direct_align, cuda_now_ms() - t0);
+    return ok;
 }

@@ -4253,6 +4253,9 @@ struct mmq_args {
     // ds4 (K5): optional table compact expert -> slot of the expert cache that x points at; null = x holds the
     // experts in channel order. Trailing field, value-initialised by the existing aggregate initialisers.
     const int32_t * x_slot;
+    // ds4 (MMQ-T): the largest column count of any expert in this call (0 = unknown: ncols_max). Sizes the column
+    // tiles only; mmq_x is still chosen from ncols_max.
+    int64_t ncols_tile_max;
 };
 
 template<ggml_type type>
@@ -4282,8 +4285,23 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x,  true>), nbytes_shared);
 
     const int nty  = (args.nrows_x   + mmq_y - 1) / mmq_y;
-    const int ntx  = (args.ncols_max + mmq_x - 1) / mmq_x;
+    int       ntx  = (args.ncols_max + mmq_x - 1) / mmq_x;
     const int ntzw = args.nchannels_y * args.nsamples_y;
+    if (args.ncols_tile_max > 0 && args.ncols_tile_max < args.ncols_max) {
+        // ds4 (MMQ-T): no expert has columns past ncols_tile_max, so those tiles only exit. Taken when neither grid
+        // splits a tile's K range (one stream-k block per tile, no fixup): every element is then the same full-K sum.
+        const int ntx_tight = (int)((args.ncols_tile_max + mmq_x - 1) / mmq_x);
+        bool take = true;
+        if (args.use_stream_k) {
+            auto whole_tiles = [&](int ntx_) {
+                const int nt = ntx_ * nty * ntzw;
+                const int nw = (nt + nsm - 1) / nsm;
+                return GGML_CUDA_CC_IS_NVIDIA(cc) && 100 * nt / (nsm * nw) >= 90;
+            };
+            take = whole_tiles(ntx) && whole_tiles(ntx_tight);
+        }
+        if (take) ntx = ntx_tight;
+    }
     const dim3 block_nums_xy_tiling(nty, ntx, ntzw);
 
     GGML_ASSERT(args.nchannels_y % args.nchannels_x == 0);
