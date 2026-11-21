@@ -356,6 +356,37 @@ __global__ static void dsv41_rope_w_kernel(float *x, dsv41_rope_args a) {
     x[i + 1u] = dsv41_bf16(__fadd_rn(__fmul_rn(re, s), __fmul_rn(im, c)));
 }
 
+/* K4: a decode rope (one row) takes its cos/sin from a table made once per position, card and kind (compressed or
+ * not): dsv41_rope_table_kernel does the per-lane double cos/sin of dsv41_rope_kernel for row 0, and the rotation
+ * that reads it is unchanged, so the result is the same. */
+__global__ static void dsv41_rope_table_kernel(float2 *tab, dsv41_rope_args a) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const float theta = __fmul_rn(float(a.start), a.frequencies[lane]);
+    /* Avoid fast-math range reduction at long absolute positions. */
+    tab[lane] = make_float2((float)cos((double)theta), (float)sin((double)theta));
+}
+
+template <uint32_t W>
+__global__ static void dsv41_rope_tab_kernel(float *x, dsv41_rope_args a, const float2 *tab) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t head = (uint64_t)blockIdx.x * W + threadIdx.x / 32u;
+    if (head >= (uint64_t)a.heads) return;
+    const float2 cs = tab[lane];
+    const float c = cs.x;
+    const float s = (a.inverse ? -1.0f : 1.0f) * cs.y;
+    const uint64_t i = head * a.width + a.width - 64u + lane * 2u;
+    const float re = x[i], im = x[i + 1u];
+    x[i] = dsv41_bf16(__fsub_rn(__fmul_rn(re, c), __fmul_rn(im, s)));
+    x[i + 1u] = dsv41_bf16(__fadd_rn(__fmul_rn(re, s), __fmul_rn(im, c)));
+}
+
+struct dsv41_rope_tab_cache {
+    float2 *tab;        /* [2][32]: plain, compressed */
+    uint32_t pos[2];
+    int valid[2];
+};
+static dsv41_rope_tab_cache g_dsv41_rope_tab[DS4_MAX_GPUS];
+
 extern "C" int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width,
                                           uint32_t heads, uint32_t rows, uint32_t start,
                                           uint32_t stride, bool compressed, bool inverse) {
@@ -386,6 +417,27 @@ extern "C" int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width,
     static const frequencies table;
     dsv41_rope_args args = {width, heads, rows, start, stride, inverse, {0}};
     memcpy(args.frequencies, table.value[compressed ? 1 : 0], sizeof(args.frequencies));
+    if (cuda_kfast() && rows == 1u && heads <= 256u && !g_decode_graph_capturing) {   /* K4: the cos/sin table */
+        int dev = -1;
+        if (cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < DS4_MAX_GPUS) {
+            dsv41_rope_tab_cache &tc = g_dsv41_rope_tab[dev];
+            if (!tc.tab && cudaMalloc((void **)&tc.tab, 64u * sizeof(float2)) != cudaSuccess) {
+                (void)cudaGetLastError();
+                tc.tab = NULL;
+            }
+            if (tc.tab) {
+                const int kind = compressed ? 1 : 0;
+                float2 *tab = tc.tab + 32u * (uint32_t)kind;
+                if (!tc.valid[kind] || tc.pos[kind] != start) {
+                    dsv41_rope_table_kernel<<<1, 32, 0, cuda_decode_stream()>>>(tab, args);
+                    tc.valid[kind] = 1;
+                    tc.pos[kind] = start;
+                }
+                dsv41_rope_tab_kernel<1><<<heads, 32, 0, cuda_decode_stream()>>>((float *)x->ptr, args, tab);
+                return cuda_ok(cudaGetLastError(), "V4.1 RoPE");
+            }
+        }
+    }
     if (cuda_kfast() && (uint64_t)heads * rows <= 256u)   /* K1 */
         dsv41_rope_w_kernel<1><<<(unsigned)((uint64_t)heads * rows), 32, 0, cuda_decode_stream()>>>((float *)x->ptr, args);
     else

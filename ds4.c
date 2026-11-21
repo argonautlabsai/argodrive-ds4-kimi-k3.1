@@ -43367,6 +43367,12 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    /* E1: the IDs leave the card now, while it computes the shared expert, the CUDA counterpart of the
+     * decode pipeline below. */
+    if (g->streaming && g->tp_world == 1 && !g->quality && !g->imatrix)
+        (void)ds4_gpu_selected_ids_early(g->selected, DS4_N_EXPERT_USED);
+#endif
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     /* DS4_ARGODRIVE_DECODE_PIPELINE: the ids also go to a mailbox, so the routed step below need not
      * end the command buffer to read them and the shared expert runs meanwhile. Only the one-token
@@ -44777,7 +44783,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
 #endif
         if (ok && queue_layers && !drain && (g->tp_world != 2 || tp_inline_gates) && flush_layers &&
             (il == 0 || (il + 1u) % flush_layers == 0))
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+            ok = ds4_gpu_decode_flush_commands() != 0;   /* E3: no device drain on CUDA */
+#else
             ok = ds4_gpu_flush_commands() != 0;
+#endif
     }
     g->score_selected_blocks = false;
     g->scalar_decode = false;
@@ -79307,7 +79317,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
 #endif
         if (opt->backend == DS4_BACKEND_CUDA && gpu_cfg &&
-            gpu_cfg->n_gpus > 1) {
+            gpu_cfg->n_gpus > 1 && !getenv("DS4_CUDA_STREAM_SPLIT")) {   /* split: decided once the model is open */
             fprintf(stderr,
                     "ds4: GLM-5.3 CUDA/ROCm vision currently requires one GPU\n");
             free(e);
@@ -79402,13 +79412,22 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
-        opt->vision_path && opt->vision_path[0] && e->backend != DS4_BACKEND_METAL) {
-        fprintf(stderr, "ds4: V4.1 vision requires Metal\n");
+        opt->vision_path && opt->vision_path[0] && e->backend != DS4_BACKEND_METAL &&
+        e->backend != DS4_BACKEND_CUDA) {
+        fprintf(stderr, "ds4: V4.1 vision requires Metal or CUDA\n");
         ds4_engine_close(e);
         *out = NULL;
         return 1;
     }
     config_validate_model(&e->model);
+    /* the model family is known from here on */
+    if (opt->vision_path && opt->vision_path[0] && opt->backend == DS4_BACKEND_CUDA && gpu_cfg &&
+        gpu_cfg->n_gpus > 1 && DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41) {
+        fprintf(stderr, "ds4: GLM-5.3 CUDA/ROCm vision currently requires one GPU\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     /* V4.1's model views are read-only to the GPU: untracked by default */
     if (e->backend == DS4_BACKEND_METAL)
@@ -81294,6 +81313,10 @@ static int ds4_engine_vision_encode_image(
         token_count = patches.llm_grid_height * patches.llm_grid_width;
         embedding = malloc((size_t)token_count * DS4_N_EMBD * sizeof(float));
         if (embedding) {
+#ifdef DS41_SPLIT_BUILD
+            /* two cards: the encoder's buffers are card 0's, so it runs there (the graph re-selects its card) */
+            if (g_ds41_split_cut) (void)ds4_gpu_set_current_device(0);
+#endif
 #ifndef DS4_NO_GPU
             ok = ds4_gpu_deepseek4_vision_encode(
                     embedding, patches.patches,

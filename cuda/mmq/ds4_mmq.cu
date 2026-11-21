@@ -26,6 +26,9 @@
 #include "mmid.cuh"
 #include "ds4_mmq_d2r.cuh"
 
+static thread_local const int32_t *t_ds4_mmq_x_slot = NULL;   /* K5: set around the prompt pass's MoE calls */
+extern "C" void ds4_mmq_set_x_slot(const int32_t *slot) { t_ds4_mmq_x_slot = slot; }
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1668,6 +1671,7 @@ int ds4_mmq_moe_impl(
         /*ncols_max=*/ne_get_rows,
         /*x_soa=*/x_soa,
         /*soa_blocks=*/soa_blocks,
+        /*x_slot=*/t_ds4_mmq_x_slot,
     };
 
     mul_mat_q_case<type>(*ctx, args, stream);
@@ -2235,6 +2239,7 @@ int ds4_mmq_moe_pair_impl(
         /*ncols_max=*/routed_ncols_max,
         /*x_soa=*/xa_soa,
         /*soa_blocks=*/soa_blocks,
+        /*x_slot=*/t_ds4_mmq_x_slot,
     };
 
     {
@@ -3710,6 +3715,110 @@ static __device__ __forceinline__ float ds4_mmq_half_warp_sum_f32(float v) {
     return v;
 }
 
+/* K4: vec_dot_mxfp4_q8_1 with the lane's two weight ints taken from three aligned 32-bit loads and funnel shifts
+ * instead of eight byte loads: the same ints, dp4a chain and scale arithmetic. `last`: the block may end the buffer,
+ * where an aligned word could reach past it, so it keeps the byte loads. */
+static __device__ __forceinline__ float ds4_mxfp4_dot_q8_1_wide(const void * __restrict__ vbq,
+        const block_q8_1 * __restrict__ bq8_1, const int kbx, const int iqs, const bool last) {
+    const block_mxfp4 * bq4 = (const block_mxfp4 *) vbq + kbx;
+    const int * q8 = (const int *) bq8_1->qs + iqs;
+    int a0, a1;
+    if (!last) {
+        const uintptr_t start = (uintptr_t)(bq4->qs + 4 * iqs);
+        const uint32_t *wp = (const uint32_t *)(start & ~(uintptr_t)3);
+        const uint32_t sh = (uint32_t)(start & 3u) * 8u;
+        const uint32_t w0 = wp[0], w1 = wp[1], w2 = wp[2];
+        a0 = (int)__funnelshift_r(w0, w1, sh);
+        a1 = (int)__funnelshift_r(w1, w2, sh);
+    } else {
+        a0 = get_int_b1(bq4->qs, iqs + 0);
+        a1 = get_int_b1(bq4->qs, iqs + 1);
+    }
+    int sumi = 0;
+    {
+        const int2 v = get_int_from_table_16(a0, kvalues_mxfp4);
+        sumi = ggml_cuda_dp4a(v.x, q8[0], sumi);
+        sumi = ggml_cuda_dp4a(v.y, q8[4], sumi);
+    }
+    {
+        const int2 v = get_int_from_table_16(a1, kvalues_mxfp4);
+        sumi = ggml_cuda_dp4a(v.x, q8[1], sumi);
+        sumi = ggml_cuda_dp4a(v.y, q8[5], sumi);
+    }
+    const float d = ggml_cuda_e8m0_to_fp32(bq4->e) * 0.5f * __low2float(bq8_1->ds);
+    return d * sumi;
+}
+
+/* K4: ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel for MXFP4 with the wide weight loads. */
+template <int PASSES>
+static __global__ void ds4_mmq_moe_gate_up_mid_wide_kernel(
+        const void       * __restrict__ W_gate,
+        const void       * __restrict__ W_up,
+        const block_q8_1 * __restrict__ X_q8,
+        const int32_t    * __restrict__ ids,
+        const float      * __restrict__ weights,
+        float            * __restrict__ mid,
+        const uint32_t ncols_x,
+        const uint32_t nrows_x,
+        const uint32_t n_tokens,
+        const uint32_t n_experts,
+        const uint32_t stride_row_x,
+        const uint32_t stride_col_y,
+        const uint32_t stride_channel_x,
+        const float clamp) {
+    constexpr ggml_type type = GGML_TYPE_MXFP4;
+    constexpr int top_k = 6;
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    constexpr int q8_per_k = qk / QK8_1;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = ds4_mmq_vdr_mmvq_value<type>::value;
+    constexpr int lanes_per_k = qi / vdr;
+    constexpr int blocks_per_iter = vdr * 16 / qi;
+    const uint32_t lane = threadIdx.x & 15u;
+    const uint32_t row_lane = threadIdx.x >> 4u;
+    const uint32_t assignment = blockIdx.x;
+    const uint32_t row_block  = blockIdx.y;
+    const uint32_t tok = assignment / top_k;
+    const uint32_t slot = assignment - tok * top_k;
+    if (tok >= n_tokens) return;
+    const int32_t id_raw = ids[(uint64_t)tok * top_k + slot];
+    const bool invalid_id = id_raw < 0 || (uint32_t)id_raw >= n_experts;
+    const uint32_t expert = invalid_id ? 0u : (uint32_t)id_raw;
+    const block_q8_1 * xq = X_q8 + (uint64_t)tok * stride_col_y;
+    const uint32_t blocks_per_row_x = ncols_x / qk;
+    const uint32_t kbx0 = lane / lanes_per_k;
+    const int kqs = vdr * (lane % lanes_per_k);
+#pragma unroll
+    for (uint32_t rr = 0; rr < (uint32_t)PASSES; ++rr) {
+        const uint32_t row = row_block * (16u * PASSES) + row_lane + rr * 16u;
+        if (row >= nrows_x) continue;
+        const int kbx_base = (int)(expert * stride_channel_x + row * stride_row_x);
+        const bool last_row = expert + 1u == n_experts && row + 1u == nrows_x;
+        float gate = 0.0f;
+        float up = 0.0f;
+        for (uint32_t b = kbx0; !invalid_id && b < blocks_per_row_x; b += blocks_per_iter) {
+            const block_q8_1 * xb = xq + (uint64_t)b * q8_per_k;
+            const int kbx = kbx_base + (int)b;
+            const bool last = last_row && b + 1u == blocks_per_row_x;
+            gate += ds4_mxfp4_dot_q8_1_wide(W_gate, xb, kbx, kqs, last);
+            up   += ds4_mxfp4_dot_q8_1_wide(W_up,   xb, kbx, kqs, last);
+        }
+        gate = ds4_mmq_half_warp_sum_f32(gate);
+        up   = ds4_mmq_half_warp_sum_f32(up);
+        if (lane == 0) {
+            if (!isfinite(gate)) gate = 0.0f;
+            if (!isfinite(up)) up = 0.0f;
+            if (clamp > 1.0e-6f) {
+                if (gate > clamp) gate = clamp;
+                if (up > clamp) up = clamp;
+                if (up < -clamp) up = -clamp;
+            }
+            const float silu = gate / (1.0f + expf(-gate));
+            mid[(uint64_t)assignment * nrows_x + row] = silu * up * weights[(uint64_t)tok * top_k + slot];
+        }
+    }
+}
+
 static bool ds4_mmq_kfast(void) {   /* K1/K2: DS4_CUDA_KFAST=0 restores the old kernels */
     static int v = -1;
     if (v < 0) {
@@ -3762,15 +3871,18 @@ static __global__ void __launch_bounds__(96 * RB) down_sum6_slotpar_kernel(
         const uint32_t expert = invalid_id ? 0u : (uint32_t)id_raw;
         const block_q8_1 * xq = X_q8 + (uint64_t)assignment * stride_col_y;
         const int kbx_base = (int)(expert * stride_channel_x + row * stride_row_x);
+        const bool last_row = expert + 1u == n_experts && row + 1u == nrows_x;
         if (NB) {
 #pragma unroll
             for (uint32_t b = kbx0; b < (uint32_t)NB; b += blocks_per_iter) {
                 if (!invalid_id)
-                    acc += ds4_mmq_vec_dot_q8_1<type>(W, xq + (uint64_t)b * q8_per_k, kbx_base + (int)b, kqs);
+                    acc += ds4_mxfp4_dot_q8_1_wide(W, xq + (uint64_t)b * q8_per_k, kbx_base + (int)b, kqs,
+                                                   last_row && b + 1u == (uint32_t)NB);   /* K4 */
             }
         } else {
             for (uint32_t b = kbx0; !invalid_id && b < blocks_per_row_x; b += blocks_per_iter) {
-                acc += ds4_mmq_vec_dot_q8_1<type>(W, xq + (uint64_t)b * q8_per_k, kbx_base + (int)b, kqs);
+                acc += ds4_mxfp4_dot_q8_1_wide(W, xq + (uint64_t)b * q8_per_k, kbx_base + (int)b, kqs,
+                                               last_row && b + 1u == blocks_per_row_x);   /* K4 */
             }
         }
     }
@@ -4592,6 +4704,14 @@ int ds4_mmq_moe_gate_up_mid_vec_impl(
         W_gate, W_up, (const block_q8_1 *)src1_q8_1_ptr, ids, weights, mid_f32, \
         (uint32_t)K, (uint32_t)M, (uint32_t)n_tokens, (uint32_t)n_experts, \
         stride_row_x, stride_col_y, stride_channel_x, clamp)
+#ifndef GGML_USE_HIP
+    if (type == GGML_TYPE_MXFP4 && gate_passes == 1u && ds4_mmq_kfast()) {   /* K4: wide weight loads */
+        ds4_mmq_moe_gate_up_mid_wide_kernel<1><<<block_nums, block_dims, 0, stream>>>(
+            W_gate, W_up, (const block_q8_1 *)src1_q8_1_ptr, ids, weights, mid_f32,
+            (uint32_t)K, (uint32_t)M, (uint32_t)n_tokens, (uint32_t)n_experts,
+            stride_row_x, stride_col_y, stride_channel_x, clamp);
+    } else
+#endif
     if (gate_passes == 1u) { DS4_LAUNCH_GATE_UP(1); }
     else if (gate_passes == 2u) { DS4_LAUNCH_GATE_UP(2); }
     else { DS4_LAUNCH_GATE_UP(4); }

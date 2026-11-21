@@ -508,6 +508,11 @@ int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
 void ds4_gpu_stream_expert_lookahead_arm(const ds4_gpu_stream_expert_table *next,
                                          const ds4_gpu_tensor *pred, const ds4_gpu_tensor *pred_w,
                                          uint32_t n_pred);
+/* E1: a one-token layer's routed IDs start their copy to the host as soon as the router has written them, so the
+ * routed step's readback overlaps the shared expert (cuda_early_ids_* in ds4_cuda.cu). */
+int ds4_gpu_selected_ids_early(const ds4_gpu_tensor *selected, uint32_t n_selected);
+/* E3: the one-token decode's periodic flush; a no-op on CUDA (see ds4_cuda.cu). */
+int ds4_gpu_decode_flush_commands(void);
 #endif
 #ifdef __APPLE__
 /* The async selected-load worker registers itself so Metal cache paths never
