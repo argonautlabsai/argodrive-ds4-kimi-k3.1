@@ -7067,6 +7067,29 @@ __global__ static void matmul_f32_kernel(
     if (threadIdx.x == 0) out[tok * out_dim + row] = sum;
 }
 
+/* K2: matmul_f32_kernel with every load of a thread in flight (PER = in_dim / 256): the same per-thread order and
+ * block tree, bit-identical (router 5120 x 384: 10.4 -> 6.7 us). */
+template <uint32_t PER>
+__global__ static void __launch_bounds__(256) matmul_f32_reg_kernel(float *out, const float *w, const float *x,
+                                                                    uint64_t in_dim, uint64_t out_dim, uint64_t n_tok) {
+    const uint64_t row = (uint64_t)blockIdx.x;
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    if (row >= out_dim || tok >= n_tok) return;
+    const float *wr = w + row * in_dim;
+    const float *xr = x + tok * in_dim;
+    float wv[PER], xv[PER];
+#pragma unroll
+    for (uint32_t j = 0; j < PER; j++) wv[j] = wr[threadIdx.x + j * 256u];
+#pragma unroll
+    for (uint32_t j = 0; j < PER; j++) xv[j] = xr[threadIdx.x + j * 256u];
+    float sum = 0.0f;
+#pragma unroll
+    for (uint32_t j = 0; j < PER; j++) sum += wv[j] * xv[j];
+    __shared__ float partial[256];
+    sum = block_sum_f32_256(sum, partial);
+    if (threadIdx.x == 0) out[tok * out_dim + row] = sum;
+}
+
 __global__ static void repeat_hc_kernel(float *out, const float *row, uint32_t n_embd, uint32_t n_hc) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_embd * n_hc;
@@ -8891,6 +8914,123 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
         orow[i] = BF16 ? dsv41_bf16(value) : value;
     }
 }
+
+/* K1 (21 Nov 2026): exact faster decode kernels. The norms below issue every load of the row at once (PER = n / 256
+ * values per thread held in registers); the per-thread order (ascending i, stride 256), the block trees and the
+ * expressions are those of rms_norm_weight_kernel and rms_norm_plain_batch8_kernel, so the results are bit-identical
+ * (fuzzed against the old kernels, 0 of 7.3M values differ); the 5120-wide norm takes 2.2 us instead of 12-17.
+ * DS4_CUDA_KFAST=0 restores the old kernels. */
+static bool cuda_kfast(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_CUDA_KFAST");
+        v = !(e && strcmp(e, "0") == 0);
+    }
+    return v != 0;
+}
+
+template <bool BF16, uint32_t PER>
+__global__ static void __launch_bounds__(256) rms_norm_weight_reg_kernel(float *out, const float *x, const float *w,
+                                                                         uint32_t n, uint32_t rows, float eps) {
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float *xr = x + (uint64_t)row * n;
+    float *orow = out + (uint64_t)row * n;
+    float v[PER], wv[PER];
+#pragma unroll
+    for (uint32_t j = 0; j < PER; j++) v[j] = xr[threadIdx.x + j * 256u];
+#pragma unroll
+    for (uint32_t j = 0; j < PER; j++) wv[j] = w[threadIdx.x + j * 256u];
+    float sum = 0.0f;
+#pragma unroll
+    for (uint32_t j = 0; j < PER; j++) sum += v[j] * v[j];
+    __shared__ float partial[256];
+    sum = block_sum_f32_256(sum, partial);
+    const float scale = rsqrtf(sum / (float)n + eps);
+#pragma unroll
+    for (uint32_t j = 0; j < PER; j++) {
+        const float value = v[j] * scale * wv[j];
+        orow[threadIdx.x + j * 256u] = BF16 ? dsv41_bf16(value) : value;
+    }
+}
+
+template <uint32_t PER>
+__global__ static void __launch_bounds__(256) rms_norm_plain_reg_kernel(float *out, const float *x, uint32_t n,
+                                                                        uint32_t rows, float eps) {
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float *xr = x + (uint64_t)row * n;
+    float *orow = out + (uint64_t)row * n;
+    float v[PER];
+#pragma unroll
+    for (uint32_t j = 0; j < PER; j++) v[j] = xr[threadIdx.x + j * 256u];
+    float sum = 0.0f;
+#pragma unroll
+    for (uint32_t j = 0; j < PER; j++) sum += v[j] * v[j];
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / (float)n + eps);
+#pragma unroll
+    for (uint32_t j = 0; j < PER; j++) orow[threadIdx.x + j * 256u] = v[j] * scale;
+}
+
+/* rms_norm_weight_kernel<BF16> over `rows` rows: the register kernel for the V4.1 widths. */
+template <bool BF16>
+static void cuda_rms_norm_weight_launch(float *out, const float *x, const float *w, uint32_t n, uint32_t rows,
+                                        float eps, cudaStream_t stream) {
+    if (cuda_kfast()) {
+        switch (n) {
+        case 5120u: rms_norm_weight_reg_kernel<BF16, 20><<<rows, 256, 0, stream>>>(out, x, w, n, rows, eps); return;
+        case 1280u: rms_norm_weight_reg_kernel<BF16, 5><<<rows, 256, 0, stream>>>(out, x, w, n, rows, eps); return;
+        case 512u: rms_norm_weight_reg_kernel<BF16, 2><<<rows, 256, 0, stream>>>(out, x, w, n, rows, eps); return;
+        default: break;
+        }
+    }
+    rms_norm_weight_kernel<BF16><<<rows, 256, 0, stream>>>(out, x, w, n, rows, eps);
+}
+
+/* matmul_q8_0_preq_warp8_kernel with dsv41_bf16_kernel's rounding at the store: the same sums, one launch fewer for
+ * every rounded single-row projection (ds4_gpu_matmul_q8_0_bf16_tensor asks for it through g_q8_round_request). */
+__global__ static void matmul_q8_0_preq_warp8_bf16_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks,
+        int use_dp4a) {
+    uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + row * blocks * 34;
+    const int8_t *xqr = xq + tok * blocks * 32u;
+    const float *xsr = xscale + tok * blocks;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        uint64_t i0 = b * 32;
+        uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
+        const __half *scale_h = (const __half *)(wr + b * 34);
+        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+        const int8_t *xqb = xqr + b * 32;
+        int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+        acc += __half2float(*scale_h) * xsr[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) out[tok * out_dim + row] = dsv41_bf16(acc);
+}
+static bool g_q8_round_request = false;
+static bool g_q8_round_done = false;
+/* K3: a caller that rounded and quantized x itself (dsv41_bf16_quantize_q8_0_kernel) into the prequant scratch tells
+ * the single-row Q8 path so, which then skips its quantize launch; one call only. */
+static const void *g_q8_preq_x = NULL;
+static const void *g_q8_preq_tmp = NULL;
 
 __global__ static void dsv4_qkv_rms_norm_rows_kernel(
         float *q_out,
@@ -10869,6 +11009,195 @@ __global__ static void attention_decode_score_split_finalize_kernel(
     }
 }
 
+/* K2: attention_decode_score_split_finalize_kernel in two launches. Its 64 blocks (one per head) each read every
+ * value row, so it used 64 of 188 SMs; F1 keeps its softmax unchanged (one head per block, 256 score threads, the same
+ * trees) and writes the exp scores back over the head's scores; F2 spreads the value sums over 512 one-warp blocks of
+ * two heads and 32 dimensions, each (head, dimension) the same FMA chain in the same row order. Bit-identical (fuzzed:
+ * 0 of 11M values differ); 478 rows 18.8 -> 13.5 us, 640 rows 23.6 -> 14.4 us. */
+/* K2 F1: the softmax half of attention_decode_score_split_finalize_kernel, unchanged, one head per block; the exp
+ * scores go back over the head's scores and the denominator to denom[h]. */
+__global__ static void attention_finalize_softmax_kernel(
+        float *score_io, float *denom_out, const float *sinks,
+        uint32_t pos0, uint32_t n_raw, uint32_t n_comp, uint32_t window, uint32_t ratio, uint32_t n_head) {
+    const uint32_t h = blockIdx.y;
+    if (h >= n_head) return;
+    const bool single_all = (ratio == 0u);
+    const uint32_t qpos = pos0;
+    const uint32_t first_raw_pos = pos0 + 1u - n_raw;
+    uint32_t visible_comp = single_all ? n_comp : (n_comp ? (qpos + 1u) / ratio : 0u);
+    if (visible_comp > n_comp) visible_comp = n_comp;
+    __shared__ float scores[DS4_CUDA_ATTENTION_SCORE_CAP];
+    __shared__ float partial[256];
+    __shared__ float max_s;
+    __shared__ uint32_t raw_count_s;
+    const uint32_t score_threads = blockDim.x > 256u ? 256u : blockDim.x;
+    const bool score_thread = threadIdx.x < score_threads;
+    if (threadIdx.x == 0) {
+        raw_count_s = 0;
+        if (n_raw != 0) {
+            const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+            if (single_all) {
+                raw_count_s = n_raw > 256u ? 256u : n_raw;
+            } else if (qpos >= first_raw_pos) {
+                uint32_t lo = first_raw_pos;
+                if (window != 0 && qpos + 1u > window) {
+                    const uint32_t wlo = qpos + 1u - window;
+                    if (wlo > lo) lo = wlo;
+                }
+                const uint32_t hi = qpos < raw_last_pos ? qpos : raw_last_pos;
+                if (hi >= lo) {
+                    raw_count_s = hi - lo + 1u;
+                    if (raw_count_s > 256u) raw_count_s = 256u;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    const uint32_t n_score = raw_count_s + visible_comp;
+    float *row_scores = score_io + (uint64_t)h * n_score;
+    float local_max = sinks[h];
+    if (score_thread) {
+        for (uint32_t i = threadIdx.x; i < n_score; i += score_threads) {
+            const float s = row_scores[i];
+            scores[i] = s;
+            local_max = fmaxf(local_max, s);
+        }
+    }
+    if (score_thread) partial[threadIdx.x] = local_max;
+    __syncthreads();
+    for (uint32_t stride = score_threads >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] =
+                fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) max_s = partial[0];
+    __syncthreads();
+    float den_local = 0.0f;
+    if (score_thread) {
+        for (uint32_t i = threadIdx.x; i < n_score; i += score_threads) {
+            scores[i] = expf(scores[i] - max_s);
+            den_local += scores[i];
+            row_scores[i] = scores[i];
+        }
+    }
+    if (score_thread) partial[threadIdx.x] = den_local;
+    __syncthreads();
+    for (uint32_t stride = score_threads >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) denom_out[h] = partial[0] + expf(sinks[h] - max_s);
+}
+
+/* K2 F2: the value half for H heads and DT dimensions per block: per (head, dimension) the same chain
+ * acc += kv[d] * s over the raw rows then the compressed rows, then acc / denom. SM: the H rows of exp scores staged
+ * in shared memory (dynamic, H * n_score floats), else read through the read-only cache. U rows of loads per step. */
+template <uint32_t H, uint32_t DT, uint32_t U, bool SM>
+__global__ static void __launch_bounds__(DT) attention_finalize_values_kernel(
+        float *heads, const float *exp_scores, const float *denom, const float *raw_kv, const float *comp_kv,
+        uint32_t pos0, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start, uint32_t n_comp,
+        uint32_t window, uint32_t ratio, uint32_t n_head, uint32_t head_dim) {
+    extern __shared__ float ses[];
+    const uint32_t h0 = blockIdx.y * H;
+    const uint32_t d = blockIdx.x * DT + threadIdx.x;
+    if (h0 >= n_head) return;
+    const bool single_all = (ratio == 0u);
+    const uint32_t qpos = pos0;
+    const uint32_t first_raw_pos = pos0 + 1u - n_raw;
+    uint32_t visible_comp = single_all ? n_comp : (n_comp ? (qpos + 1u) / ratio : 0u);
+    if (visible_comp > n_comp) visible_comp = n_comp;
+    uint32_t raw_count = 0, raw_first_idx = 0;
+    if (n_raw != 0) {
+        const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+        if (single_all) {
+            raw_count = n_raw > 256u ? 256u : n_raw;
+        } else if (qpos >= first_raw_pos) {
+            uint32_t lo = first_raw_pos;
+            if (window != 0 && qpos + 1u > window) {
+                const uint32_t wlo = qpos + 1u - window;
+                if (wlo > lo) lo = wlo;
+            }
+            const uint32_t hi = qpos < raw_last_pos ? qpos : raw_last_pos;
+            if (hi >= lo) {
+                raw_first_idx = lo - first_raw_pos;
+                raw_count = hi - lo + 1u;
+                if (raw_count > 256u) raw_count = 256u;
+            }
+        }
+    }
+    const uint32_t n_score = raw_count + visible_comp;
+    const float *es = exp_scores + (uint64_t)h0 * n_score;
+    const float *sc = es;
+    if (SM) {
+        const uint32_t total = H * n_score;
+        uint32_t i = threadIdx.x;
+        for (; i + 7u * DT < total; i += 8u * DT) {
+            float t[8];
+#pragma unroll
+            for (uint32_t k = 0; k < 8u; k++) t[k] = es[i + k * DT];
+#pragma unroll
+            for (uint32_t k = 0; k < 8u; k++) ses[i + k * DT] = t[k];
+        }
+        for (; i < total; i += DT) ses[i] = es[i];
+        __syncthreads();
+        sc = ses;
+    }
+    if (d >= head_dim) return;
+    float acc[H];
+#pragma unroll
+    for (uint32_t j = 0; j < H; j++) acc[j] = 0.0f;
+    const uint32_t base = (raw_start + raw_first_idx) % raw_cap;
+    uint32_t r = 0;
+    for (; r + U <= raw_count; r += U) {
+        float v[U], s[U][H];
+#pragma unroll
+        for (uint32_t u = 0; u < U; u++) {
+            uint32_t idx = base + r + u;
+            if (idx >= raw_cap) idx -= raw_cap;
+            v[u] = raw_kv[(uint64_t)idx * head_dim + d];
+#pragma unroll
+            for (uint32_t j = 0; j < H; j++) s[u][j] = SM ? sc[j * n_score + r + u] : __ldg(sc + j * n_score + r + u);
+        }
+#pragma unroll
+        for (uint32_t u = 0; u < U; u++)
+#pragma unroll
+            for (uint32_t j = 0; j < H; j++) acc[j] += v[u] * s[u][j];
+    }
+    for (; r < raw_count; r++) {
+        uint32_t idx = base + r;
+        if (idx >= raw_cap) idx -= raw_cap;
+        const float v = raw_kv[(uint64_t)idx * head_dim + d];
+#pragma unroll
+        for (uint32_t j = 0; j < H; j++) acc[j] += v * sc[j * n_score + r];
+    }
+    const float *cs = sc + raw_count;
+    uint32_t c = 0;
+    for (; c + U <= visible_comp; c += U) {
+        float v[U], s[U][H];
+#pragma unroll
+        for (uint32_t u = 0; u < U; u++) {
+            v[u] = comp_kv[(uint64_t)(c + u) * head_dim + d];
+#pragma unroll
+            for (uint32_t j = 0; j < H; j++) s[u][j] = SM ? cs[j * n_score + c + u] : __ldg(cs + j * n_score + c + u);
+        }
+#pragma unroll
+        for (uint32_t u = 0; u < U; u++)
+#pragma unroll
+            for (uint32_t j = 0; j < H; j++) acc[j] += v[u] * s[u][j];
+    }
+    for (; c < visible_comp; c++) {
+        const float v = comp_kv[(uint64_t)c * head_dim + d];
+#pragma unroll
+        for (uint32_t j = 0; j < H; j++) acc[j] += v * cs[j * n_score + c];
+    }
+#pragma unroll
+    for (uint32_t j = 0; j < H; j++)
+        if (h0 + j < n_head) heads[(uint64_t)(h0 + j) * head_dim + d] = acc[j] / denom[h0 + j];
+}
+
+
 __global__ static void attention_decode_score_split_finalize_rows_kernel(
         float *heads,
         const float *sinks,
@@ -11527,7 +11856,7 @@ static int attention_decode_score_split_launch(
 
     const uint64_t score_count = (uint64_t)n_head * n_score;
     float *scores = (float *)cuda_tmp_alloc_on(logical_tier,
-                                               score_count * sizeof(float),
+                                               (score_count + n_head) * sizeof(float),   /* K2: + the F1 denominators */
                                                "attention exact score split");
     if (!scores) return 0;
     const bool use_ldg_scores = g_cuda_exact_score_split_ldg;
@@ -11631,6 +11960,17 @@ static int attention_decode_score_split_launch(
                 pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
                 n_head, head_dim);
         if (!cuda_ok(cudaGetLastError(), "attention exact score split dim2 finalize launch")) return -1;
+    } else if (cuda_kfast() && head_dim == 512u && final_threads >= 512u && (n_head & 1u) == 0u &&
+               (uint64_t)2u * n_score * sizeof(float) <= 48u * 1024u) {   /* K2 */
+        float *denom = scores + score_count;
+        attention_finalize_softmax_kernel<<<dim3(1, n_head, 1), 256>>>(
+                scores, denom, sinks, pos0, n_raw, n_comp, window, ratio, n_head);
+        if (!cuda_ok(cudaGetLastError(), "attention finalize softmax launch")) return -1;
+        attention_finalize_values_kernel<2, 32, 32, true><<<dim3(head_dim / 32u, n_head / 2u, 1), 32,
+                                                             2u * n_score * sizeof(float)>>>(
+                heads, scores, denom, raw_kv, comp_kv, pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
+                n_head, head_dim);
+        if (!cuda_ok(cudaGetLastError(), "attention finalize values launch")) return -1;
     } else {
         dim3 final_grid(1, n_head, 1);
         attention_decode_score_split_finalize_kernel<<<final_grid, final_threads>>>(
@@ -18347,8 +18687,19 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
     dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
-    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, cuda_decode_stream()>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
-    if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
+    if (n_tok == 1u && g_q8_preq_x == x->ptr && g_q8_preq_tmp == tmp) {
+        g_q8_preq_x = NULL;   /* K3: rounded and quantized into this scratch by the caller */
+    } else {
+        quantize_q8_0_f32_kernel<<<qgrid, 32, 0, cuda_decode_stream()>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+        if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
+    }
+    if (n_tok == 1 && g_q8_round_request && cuda_kfast()) {   /* K1: the BF16 rounding at the store */
+        matmul_q8_0_preq_warp8_bf16_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, cuda_decode_stream()>>>(
+                (float *)out->ptr, reinterpret_cast<const unsigned char *>(wptr), xq, xscale, in_dim, out_dim, blocks, use_dp4a);
+        if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 warp bf16 launch")) return 0;
+        g_q8_round_done = true;
+        return 1;
+    }
     if (n_tok == 1) {
         matmul_q8_0_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, cuda_decode_stream()>>>(
                 (float *)out->ptr,
@@ -19851,6 +20202,11 @@ extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_
         return cublas_ok(st, "f32 matmul");
     }
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
+    if (in_dim == 5120u && cuda_kfast()) {   /* K2 */
+        matmul_f32_reg_kernel<20><<<grid, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, w, (const float *)x->ptr,
+                                                                          in_dim, out_dim, n_tok);
+        return cuda_ok(cudaGetLastError(), "matmul_f32 reg launch");
+    }
     matmul_f32_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
             (float *)out->ptr,
             w,
@@ -20058,6 +20414,8 @@ extern "C" int ds4_gpu_rms_norm_plain_tensor(ds4_gpu_tensor *out, const ds4_gpu_
         x->bytes < (uint64_t)n * sizeof(float)) return 0;
     if (n == 4096u) {
         rms_norm_plain_fast4096_kernel<<<1, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)x->ptr, n, 1, eps);
+    } else if (n == 20480u && cuda_kfast()) {   /* K1 */
+        rms_norm_plain_reg_kernel<80><<<1, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)x->ptr, n, 1, eps);
     } else if ((n & 2047u) == 0u) {
         rms_norm_plain_batch8_kernel<<<1, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)x->ptr, n, 1, eps);
     } else {
@@ -20070,6 +20428,8 @@ extern "C" int ds4_gpu_rms_norm_plain_rows_tensor(ds4_gpu_tensor *out, const ds4
         x->bytes < (uint64_t)n * rows * sizeof(float)) return 0;
     if (n == 4096u) {
         rms_norm_plain_fast4096_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, n, rows, eps);
+    } else if (n == 20480u && cuda_kfast()) {   /* K1 */
+        rms_norm_plain_reg_kernel<80><<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, n, rows, eps);
     } else if ((n & 2047u) == 0u) {
         rms_norm_plain_batch8_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, n, rows, eps);
     } else {
@@ -20086,7 +20446,7 @@ extern "C" int ds4_gpu_rms_norm_weight_tensor(ds4_gpu_tensor *out, const ds4_gpu
     const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, (uint64_t)n * sizeof(float), logical_tier, "rms_weight");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
-    rms_norm_weight_kernel<<<1, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)x->ptr, w, n, 1, eps);
+    cuda_rms_norm_weight_launch<false>((float *)out->ptr, (const float *)x->ptr, w, n, 1, eps, cuda_decode_stream());
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
 extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
@@ -20098,7 +20458,7 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds
     const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, (uint64_t)n * sizeof(float), logical_tier, "rms_weight");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
-    rms_norm_weight_kernel<<<rows, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
+    cuda_rms_norm_weight_launch<false>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps, cuda_decode_stream());
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
 extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(

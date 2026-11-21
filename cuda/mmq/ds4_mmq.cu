@@ -3710,6 +3710,84 @@ static __device__ __forceinline__ float ds4_mmq_half_warp_sum_f32(float v) {
     return v;
 }
 
+static bool ds4_mmq_kfast(void) {   /* K1/K2: DS4_CUDA_KFAST=0 restores the old kernels */
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_CUDA_KFAST");
+        v = !(e && strcmp(e, "0") == 0);
+    }
+    return v != 0;
+}
+
+/* K2: down_sum6 with the six slots of a row on six half-warps: each slot's dot (same lane mapping, same per-lane order,
+ * same half-warp tree, same finite check) lands in shared memory and lane 0 of slot 0 adds them in slot order from
+ * 0.0f, as the old kernel's lane 0 does. RB rows per block. NB: blocks per row known at compile time (0: runtime). */
+template <int RB, int NB>
+static __global__ void __launch_bounds__(96 * RB) down_sum6_slotpar_kernel(
+        const void       * __restrict__ W,
+        const block_q8_1 * __restrict__ X_q8,
+        const int32_t    * __restrict__ ids,
+        float            * __restrict__ out,
+        const uint32_t ncols_x,
+        const uint32_t nrows_x,
+        const uint32_t n_tokens,
+        const uint32_t n_experts,
+        const uint32_t stride_row_x,
+        const uint32_t stride_col_y,
+        const uint32_t stride_channel_x) {
+    constexpr ggml_type type = GGML_TYPE_MXFP4;
+    constexpr int top_k = 6;
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    constexpr int q8_per_k = qk / QK8_1;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = ds4_mmq_vdr_mmvq_value<type>::value;
+    constexpr int lanes_per_k = qi / vdr;
+    constexpr int blocks_per_iter = vdr * 16 / qi;
+    __shared__ float part[RB][top_k];
+    const uint32_t lane = threadIdx.x & 15u;
+    const uint32_t hw = threadIdx.x >> 4u;
+    const uint32_t slot = hw % (uint32_t)top_k;
+    const uint32_t rl = hw / (uint32_t)top_k;
+    const uint32_t tok = blockIdx.x;
+    const uint32_t row = blockIdx.y * (uint32_t)RB + rl;
+    if (tok >= n_tokens) return;
+    const uint32_t blocks_per_row_x = NB ? (uint32_t)NB : ncols_x / qk;
+    const uint32_t kbx0 = lane / lanes_per_k;
+    const int kqs = vdr * (lane % lanes_per_k);
+    float acc = 0.0f;
+    if (row < nrows_x) {
+        const uint32_t assignment = tok * top_k + slot;
+        const int32_t id_raw = ids[assignment];
+        const bool invalid_id = id_raw < 0 || (uint32_t)id_raw >= n_experts;
+        const uint32_t expert = invalid_id ? 0u : (uint32_t)id_raw;
+        const block_q8_1 * xq = X_q8 + (uint64_t)assignment * stride_col_y;
+        const int kbx_base = (int)(expert * stride_channel_x + row * stride_row_x);
+        if (NB) {
+#pragma unroll
+            for (uint32_t b = kbx0; b < (uint32_t)NB; b += blocks_per_iter) {
+                if (!invalid_id)
+                    acc += ds4_mmq_vec_dot_q8_1<type>(W, xq + (uint64_t)b * q8_per_k, kbx_base + (int)b, kqs);
+            }
+        } else {
+            for (uint32_t b = kbx0; !invalid_id && b < blocks_per_row_x; b += blocks_per_iter) {
+                acc += ds4_mmq_vec_dot_q8_1<type>(W, xq + (uint64_t)b * q8_per_k, kbx_base + (int)b, kqs);
+            }
+        }
+    }
+    acc = ds4_mmq_half_warp_sum_f32(acc);
+    if (lane == 0) {
+        if (!isfinite(acc)) acc = 0.0f;
+        part[rl][slot] = acc;
+    }
+    __syncthreads();
+    if (slot == 0 && lane == 0 && row < nrows_x) {
+        float total = 0.0f;
+#pragma unroll
+        for (int s = 0; s < top_k; s++) total += part[rl][s];
+        out[(uint64_t)tok * nrows_x + row] = total;
+    }
+}
+
 template <ggml_type type, int ROWS = 8>
 static __global__ void ds4_mmq_moe_down_sum6_q8_1_qwarp32_kernel(
         const void       * __restrict__ W,
@@ -4180,6 +4258,27 @@ int ds4_mmq_moe_down_sum6_vec_impl(
         dim3((unsigned)n_tokens, row_blocks) : dim3(row_blocks, (unsigned)n_tokens);
     const dim3 block_dims(128);
 
+#ifndef GGML_USE_HIP
+    if constexpr (type == GGML_TYPE_MXFP4) {   /* K2: the six slots of a row in parallel, added in slot order */
+        if (ds4_mmq_kfast() && !small_tiles && n_tokens <= 65535) {
+            const dim3 slot_grid((unsigned)n_tokens, (unsigned)((M + 1) / 2));
+            if (K == 2304)
+                down_sum6_slotpar_kernel<2, 72><<<slot_grid, 192, 0, stream>>>(
+                    W, (const block_q8_1 *)src1_q8_1_ptr, ids, out_f32, (uint32_t)K, (uint32_t)M, (uint32_t)n_tokens,
+                    (uint32_t)n_experts, stride_row_x, stride_col_y, stride_channel_x);
+            else
+                down_sum6_slotpar_kernel<2, 0><<<slot_grid, 192, 0, stream>>>(
+                    W, (const block_q8_1 *)src1_q8_1_ptr, ids, out_f32, (uint32_t)K, (uint32_t)M, (uint32_t)n_tokens,
+                    (uint32_t)n_experts, stride_row_x, stride_col_y, stride_channel_x);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                fprintf(stderr, "%s: slot-parallel down+sum launch failed: %s\n", tag, cudaGetErrorString(err));
+                return -3;
+            }
+            return 0;
+        }
+    }
+#endif
 #define DS4_LAUNCH_DOWN_ROWS(R) \
     ds4_mmq_moe_down_sum6_q8_1_qwarp32_kernel<type, R><<<block_nums, block_dims, 0, stream>>>( \
         W, (const block_q8_1 *)src1_q8_1_ptr, ids, out_f32, \
