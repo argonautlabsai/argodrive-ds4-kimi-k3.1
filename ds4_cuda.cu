@@ -10641,6 +10641,161 @@ __global__ static void attention_decode_score_split_scores_tile512_kernel(
     row_scores[g] = s;
 }
 
+/* K10: attention_decode_score_split_scores_tile512_kernel with its tile loads issued together (see the launch). */
+__global__ static void attention_decode_score_split_scores_tile512_k10_kernel(
+        float *score_out,
+        const float *q,
+        const float *raw_kv,
+        const float *comp_kv,
+        const float *comp_mask,
+        uint32_t use_comp_mask,
+        uint32_t pos0,
+        uint32_t n_raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_comp,
+        uint32_t window,
+        uint32_t ratio,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    const bool single_all = (ratio == 0u);
+    const uint32_t qpos = pos0;
+    const uint32_t first_raw_pos = pos0 + 1u - n_raw;
+    uint32_t visible_comp = single_all ? n_comp : (n_comp ? (qpos + 1u) / ratio : 0u);
+    if (visible_comp > n_comp) visible_comp = n_comp;
+
+    uint32_t raw_count = 0;
+    uint32_t raw_first_idx = 0;
+    if (n_raw != 0) {
+        const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+        if (single_all) {
+            raw_count = n_raw > 256u ? 256u : n_raw;
+        } else if (qpos >= first_raw_pos) {
+            uint32_t lo = first_raw_pos;
+            if (window != 0 && qpos + 1u > window) {
+                const uint32_t wlo = qpos + 1u - window;
+                if (wlo > lo) lo = wlo;
+            }
+            const uint32_t hi = qpos < raw_last_pos ? qpos : raw_last_pos;
+            if (hi >= lo) {
+                raw_first_idx = lo - first_raw_pos;
+                raw_count = hi - lo + 1u;
+                if (raw_count > 256u) raw_count = 256u;
+            }
+        }
+    }
+    const uint32_t n_score = raw_count + visible_comp;
+    if (n_score == 0u) return;
+
+    extern __shared__ float score_tile_shared[];
+    float *sh_q = score_tile_shared; /* 16 x 516 */
+    float *sh_kv = sh_q + DS4_SCORE_TILE_HEADS * DS4_SCORE_TILE_STRIDE; /* 16 x 516 */
+    __shared__ float sh_add[DS4_SCORE_TILE_ROWS];
+
+    const uint32_t g_base = blockIdx.x * DS4_SCORE_TILE_ROWS;
+    const uint32_t h_base = blockIdx.y * DS4_SCORE_TILE_HEADS;
+    if (g_base >= n_score || h_base >= n_head) return;
+
+    /* K10: every Q and KV float4 this thread stages, loaded before any is stored (one round trip, not one per loop
+     * pass). A KV row is loaded whether or not its mask hides it: a hidden row's score never reads the tile. */
+    {
+        const float4 *q4 = (const float4 *)(q + (uint64_t)h_base * 512u);
+        const uint32_t tile_heads =
+            n_head - h_base < DS4_SCORE_TILE_HEADS ? n_head - h_base : DS4_SCORE_TILE_HEADS;
+        const uint32_t rr0 = threadIdx.x >> 7u;
+        const uint32_t dd = threadIdx.x & 127u;
+        float4 qv[DS4_SCORE_TILE_HEADS / 2u], kv[DS4_SCORE_TILE_ROWS / 2u];
+#pragma unroll
+        for (uint32_t k = 0; k < DS4_SCORE_TILE_HEADS / 2u; k++) {
+            const uint32_t idx = threadIdx.x + k * 256u;
+            if (idx < tile_heads * 128u) qv[k] = q4[(idx >> 7u) * 128u + (idx & 127u)];
+        }
+#pragma unroll
+        for (uint32_t k = 0; k < DS4_SCORE_TILE_ROWS / 2u; k++) {
+            const uint32_t g = g_base + rr0 + 2u * k;
+            if (g < n_score) {
+                const float4 *src = g < raw_count
+                    ? (const float4 *)(raw_kv + (uint64_t)((raw_start + raw_first_idx + g) % raw_cap) * 512u)
+                    : (const float4 *)(comp_kv + (uint64_t)(g - raw_count) * 512u);
+                kv[k] = src[dd];
+            }
+        }
+        if (threadIdx.x < DS4_SCORE_TILE_ROWS) {   /* row classification + mask staging (thread per row) */
+            const uint32_t g = g_base + threadIdx.x;
+            float add = -INFINITY;
+            if (g < n_score) {
+                if (g < raw_count) add = 0.0f;
+                else add = use_comp_mask ? comp_mask[(uint64_t)(g - raw_count)] : 0.0f;
+            }
+            sh_add[threadIdx.x] = add;
+        }
+#pragma unroll
+        for (uint32_t k = 0; k < DS4_SCORE_TILE_HEADS / 2u; k++) {
+            const uint32_t idx = threadIdx.x + k * 256u;
+            if (idx < tile_heads * 128u) {
+                float *dst = sh_q + (idx >> 7u) * DS4_SCORE_TILE_STRIDE + (idx & 127u) * 4u;
+                dst[0] = qv[k].x; dst[1] = qv[k].y; dst[2] = qv[k].z; dst[3] = qv[k].w;
+            }
+        }
+#pragma unroll
+        for (uint32_t k = 0; k < DS4_SCORE_TILE_ROWS / 2u; k++) {
+            const uint32_t r = rr0 + 2u * k;
+            if (g_base + r < n_score) {
+                float *dst = sh_kv + r * DS4_SCORE_TILE_STRIDE + dd * 4u;
+                dst[0] = kv[k].x; dst[1] = kv[k].y; dst[2] = kv[k].z; dst[3] = kv[k].w;
+            }
+        }
+    }
+    __syncthreads();
+
+    /* One score per thread: r = tid&15 (consecutive threads, coalesced score
+     * writes), h = tid>>4. The dot keeps the reference kernel's exact scalar
+     * ascending-d accumulation. */
+    const uint32_t r = threadIdx.x & (DS4_SCORE_TILE_ROWS - 1u);
+    const uint32_t h = h_base + (threadIdx.x >> 4u);
+    const uint32_t g = g_base + r;
+    if (h >= n_head || g >= n_score) return;
+    const float scale = rsqrtf((float)head_dim);
+    float *row_scores = score_out + (uint64_t)h * n_score;
+    const float *qh = sh_q + (uint64_t)(threadIdx.x >> 4u) * DS4_SCORE_TILE_STRIDE;
+    const float *kvrow = sh_kv + (uint64_t)r * DS4_SCORE_TILE_STRIDE;
+    float s = -INFINITY;
+    const bool need_dot = g < raw_count || sh_add[r] > -1.0e20f;
+    if (need_dot) {
+        /* The reference kernel's runtime-trip loop compiles to one sequential
+         * FFMA chain. Keep exactly that accumulation order here: batched loads
+         * for latency hiding, but a single explicit ascending fma chain. */
+        float dot = 0.0f;
+#pragma unroll 1
+        for (uint32_t d = 0; d < 512u; d += 8u) {
+            const float a0 = qh[d + 0u], a1 = qh[d + 1u];
+            const float a2 = qh[d + 2u], a3 = qh[d + 3u];
+            const float a4 = qh[d + 4u], a5 = qh[d + 5u];
+            const float a6 = qh[d + 6u], a7 = qh[d + 7u];
+            const float b0 = kvrow[d + 0u], b1 = kvrow[d + 1u];
+            const float b2 = kvrow[d + 2u], b3 = kvrow[d + 3u];
+            const float b4 = kvrow[d + 4u], b5 = kvrow[d + 5u];
+            const float b6 = kvrow[d + 6u], b7 = kvrow[d + 7u];
+            dot = __fmaf_rn(a0, b0, dot);
+            dot = __fmaf_rn(a1, b1, dot);
+            dot = __fmaf_rn(a2, b2, dot);
+            dot = __fmaf_rn(a3, b3, dot);
+            dot = __fmaf_rn(a4, b4, dot);
+            dot = __fmaf_rn(a5, b5, dot);
+            dot = __fmaf_rn(a6, b6, dot);
+            dot = __fmaf_rn(a7, b7, dot);
+        }
+        if (g < raw_count) {
+            s = dot * scale;
+        } else {
+            /* The reference expression `dot * scale + add` contracts to one
+             * FFMA; keep that exact contraction explicit. */
+            s = __fmaf_rn(dot, scale, sh_add[r]);
+        }
+    }
+    row_scores[g] = s;
+}
+
 /* Multi-session form of the exact tiled score kernel. Each z-slice selects a
  * private KV table entry, while every individual score keeps the same scalar
  * ascending-d FMA chain as the one-session kernel. */
@@ -12017,7 +12172,12 @@ static int attention_decode_score_split_launch(
                              attention_decode_score_split_scores_tile512_kernel,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int)tile_shmem),
-                         "attention score tile shared-memory opt-in")) {
+                         "attention score tile shared-memory opt-in") ||
+                !cuda_ok(cudaFuncSetAttribute(
+                             attention_decode_score_split_scores_tile512_k10_kernel,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)tile_shmem),
+                         "attention score tile shared-memory opt-in (K10)")) {
                 score_tile_disabled = 1;
             }
             tile_shmem_ready[tile_dev] = 1;
@@ -12028,6 +12188,14 @@ static int attention_decode_score_split_launch(
         dim3 tile_grid((n_score + DS4_SCORE_TILE_ROWS - 1u) / DS4_SCORE_TILE_ROWS,
                        (n_head + DS4_SCORE_TILE_HEADS - 1u) / DS4_SCORE_TILE_HEADS,
                        1);
+        static int k10 = -1;
+        if (k10 < 0) { const char *e = getenv("DS4_CUDA_K10"); k10 = !(e && !strcmp(e, "0")); }
+        if (k10 && cuda_kfast())
+            attention_decode_score_split_scores_tile512_k10_kernel<<<tile_grid, 256, tile_shmem>>>(
+                    scores, q, raw_kv, comp_kv, comp_mask, use_comp_mask,
+                    pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
+                    n_head, head_dim);
+        else
         attention_decode_score_split_scores_tile512_kernel<<<tile_grid, 256, tile_shmem>>>(
                 scores, q, raw_kv, comp_kv, comp_mask, use_comp_mask,
                 pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
@@ -17307,6 +17475,107 @@ __global__ static void indexer_topk_pow2_kernel(
     }
 }
 
+/* K12: the indexer top-k bitonic network with the steps whose partners are under 32 apart run in registers (a warp's
+ * lanes hold consecutive elements, so the partner of element e = tid + THREADS*m at stride j < 32 is lane tid ^ j's
+ * element m): every step leaves the same arrangement as the shared-memory step it replaces (the comparison is a strict
+ * total order on (score, index); equal padding entries are interchangeable), and a block-wide barrier is needed only
+ * around the long steps. Each thread writes its own top_k outputs. */
+template <uint32_t SORT_N, uint32_t THREADS>
+__device__ __forceinline__ static void k12_bitonic_regs(float (&v)[SORT_N / THREADS], uint32_t (&x)[SORT_N / THREADS],
+                                                       uint32_t k, uint32_t j_first) {
+    constexpr uint32_t E = SORT_N / THREADS;
+    const uint32_t tid = threadIdx.x;
+    for (uint32_t j = j_first; j > 0u; j >>= 1u) {
+#pragma unroll
+        for (uint32_t m = 0; m < E; m++) {
+            const uint32_t e = tid + THREADS * m;
+            const float pv = __shfl_xor_sync(0xffffffffu, v[m], (int)j);
+            const uint32_t pi = __shfl_xor_sync(0xffffffffu, x[m], (int)j);
+            const bool is_lo = (e & j) == 0u;
+            const bool desc = (e & k) == 0u;
+            /* the shared-memory step swaps the pair (lo, hi) when desc ? better(hi, lo) : better(lo, hi); seen from
+             * either end: take the partner's entry when (is_lo == desc) ? better(partner, own) : better(own, partner) */
+            const bool a = topk_score_better(v[m], x[m], pv, pi);
+            const bool b = topk_score_better(pv, pi, v[m], x[m]);
+            if ((is_lo == desc) ? b : a) { v[m] = pv; x[m] = pi; }
+        }
+    }
+}
+template <uint32_t SORT_N, uint32_t THREADS>
+__device__ __forceinline__ static void k12_bitonic_sort(float *vals, uint32_t *idxs, float (&v)[SORT_N / THREADS],
+                                                       uint32_t (&x)[SORT_N / THREADS]) {
+    constexpr uint32_t E = SORT_N / THREADS;
+    const uint32_t tid = threadIdx.x;
+#pragma unroll
+    for (uint32_t m = 0; m < E; m++) { v[m] = vals[tid + THREADS * m]; x[m] = idxs[tid + THREADS * m]; }
+    for (uint32_t k = 2u; k <= SORT_N; k <<= 1u) {
+        uint32_t j = k >> 1u;
+        if (j >= 32u) {
+#pragma unroll
+            for (uint32_t m = 0; m < E; m++) { vals[tid + THREADS * m] = v[m]; idxs[tid + THREADS * m] = x[m]; }
+            __syncthreads();
+            for (; j >= 32u; j >>= 1u) {
+                for (uint32_t i = tid; i < SORT_N; i += THREADS) {
+                    const uint32_t other = i ^ j;
+                    if (other > i && other < SORT_N) {
+                        const float av = vals[i], bv = vals[other];
+                        const uint32_t ai = idxs[i], bi = idxs[other];
+                        const bool desc_half = (i & k) == 0u;
+                        const bool swap = desc_half ? topk_score_better(bv, bi, av, ai) : topk_score_better(av, ai, bv, bi);
+                        if (swap) { vals[i] = bv; idxs[i] = bi; vals[other] = av; idxs[other] = ai; }
+                    }
+                }
+                __syncthreads();
+            }
+#pragma unroll
+            for (uint32_t m = 0; m < E; m++) { v[m] = vals[tid + THREADS * m]; x[m] = idxs[tid + THREADS * m]; }
+            __syncthreads();   /* every read before the next stage's stores */
+        }
+        k12_bitonic_regs<SORT_N, THREADS>(v, x, k, j);
+    }
+}
+
+template <uint32_t SORT_N, uint32_t THREADS>
+__global__ static void __launch_bounds__(THREADS) indexer_topk_k12_kernel(uint32_t *selected, const float *scores,
+        uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
+    const uint32_t t = blockIdx.x, tid = threadIdx.x;
+    if (t >= n_tokens) return;
+    __shared__ float vals[SORT_N];
+    __shared__ uint32_t idxs[SORT_N];
+    const float *row = scores + (uint64_t)t * n_comp;
+    for (uint32_t i = tid; i < SORT_N; i += THREADS) {
+        if (i < n_comp) { vals[i] = row[i]; idxs[i] = i; } else { vals[i] = -INFINITY; idxs[i] = UINT32_MAX; }
+    }
+    __syncthreads();
+    float v[SORT_N / THREADS];
+    uint32_t x[SORT_N / THREADS];
+    k12_bitonic_sort<SORT_N, THREADS>(vals, idxs, v, x);
+#pragma unroll
+    for (uint32_t m = 0; m < SORT_N / THREADS; m++) {
+        const uint32_t e = tid + THREADS * m;
+        if (e < top_k) selected[(uint64_t)t * top_k + e] = x[m];
+    }
+}
+static int cuda_k12_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DS4_CUDA_K12"); on = !(e && !strcmp(e, "0")); }
+    return on && cuda_kfast();
+}
+/* K12: the launches of indexer_topk_pow2_kernel / indexer_topk_1024_kernel, same grid, block and stream */
+template <uint32_t SORT_N, uint32_t THREADS>
+static void k12_topk_launch(uint32_t *selected, const float *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
+    if (cuda_k12_on())
+        indexer_topk_k12_kernel<SORT_N, THREADS><<<n_tokens, THREADS>>>(selected, scores, n_comp, n_tokens, top_k);
+    else
+        indexer_topk_pow2_kernel<SORT_N><<<n_tokens, THREADS>>>(selected, scores, n_comp, n_tokens, top_k);
+}
+static void k12_topk1024_launch(uint32_t *selected, const float *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
+    if (cuda_k12_on())
+        indexer_topk_k12_kernel<1024, 1024><<<n_tokens, 1024>>>(selected, scores, n_comp, n_tokens, top_k);
+    else
+        indexer_topk_1024_kernel<<<n_tokens, 1024>>>(selected, scores, n_comp, n_tokens, top_k);
+}
+
 template <uint32_t SORT_N>
 __global__ static void indexer_topk_pow2_u16_kernel(
         uint32_t *selected,
@@ -18008,7 +18277,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
     }
     if (top_k == 2048u && n_comp <= 4096u &&
         getenv("DS4_CUDA_NO_TOPK2048_WIDE") == NULL) {
-        indexer_topk_pow2_kernel<4096><<<n_tokens, 1024>>>(
+        k12_topk_launch<4096, 1024>(
                 (uint32_t *)selected->ptr,
                 (const float *)scores->ptr,
                 n_comp, n_tokens, top_k);
@@ -18086,14 +18355,14 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
     }
     if (top_k == 512u && n_comp <= 1024u &&
         getenv("DS4_CUDA_NO_TOPK1024") == NULL) {
-        indexer_topk_1024_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+        k12_topk1024_launch((uint32_t *)selected->ptr,
                                                      (const float *)scores->ptr,
                                                      n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 1024 launch");
     }
     if (top_k == 512u && n_comp <= 2048u &&
         getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
-        indexer_topk_pow2_kernel<2048><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+        k12_topk_launch<2048, 1024>((uint32_t *)selected->ptr,
                                                            (const float *)scores->ptr,
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 2048 launch");
@@ -18123,7 +18392,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                 }
             }
         }
-        indexer_topk_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+        k12_topk_launch<4096, 1024>((uint32_t *)selected->ptr,
                                                            (const float *)scores->ptr,
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 4096 launch");
@@ -18235,13 +18504,13 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         uint32_t *out = (uint32_t *)selected->ptr;
         const float *in = (const float *)scores->ptr;
         if (n_comp <= 256u)
-            indexer_topk_pow2_kernel<256><<<n_tokens, 256>>>(out, in, n_comp, n_tokens, top_k);
+            k12_topk_launch<256, 256>(out, in, n_comp, n_tokens, top_k);
         else if (n_comp <= 1024u)
-            indexer_topk_pow2_kernel<1024><<<n_tokens, 256>>>(out, in, n_comp, n_tokens, top_k);
+            k12_topk_launch<1024, 256>(out, in, n_comp, n_tokens, top_k);
         else if (n_comp <= 2048u)
-            indexer_topk_pow2_kernel<2048><<<n_tokens, 512>>>(out, in, n_comp, n_tokens, top_k);
+            k12_topk_launch<2048, 512>(out, in, n_comp, n_tokens, top_k);
         else if (n_comp <= 4096u)
-            indexer_topk_pow2_kernel<4096><<<n_tokens, 1024>>>(out, in, n_comp, n_tokens, top_k);
+            k12_topk_launch<4096, 1024>(out, in, n_comp, n_tokens, top_k);
         else
             indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024>>>(out, in, n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer general small topk launch");
@@ -33001,6 +33270,12 @@ static int cuda_stream_selected_cache_begin_load(
                 } else {
                     const double t_s0 = cuda_now_ms();
                     cuda_stream_upload_batch seed;
+                    static int seed_rank_age = -1;   /* SRA */
+                    if (seed_rank_age < 0) {   /* N: one stamp per N lines, so the spread can stay inside DS4_CUDA_POOL_EVICT_BIAS */
+                        const char *e = getenv("DS4_CUDA_SEED_RANK_AGE");
+                        const long v = e && *e ? strtol(e, NULL, 10) : 0;
+                        seed_rank_age = v > 0 && v < 1000000 ? (int)v : 0;
+                    }
                     char line[256];
                     uint64_t filled = 0;
                     const uint64_t room = g_stream_expert_slots.size();
@@ -33040,12 +33315,14 @@ static int cuda_stream_selected_cache_begin_load(
                                     "seed down", seed.chunks)) break;
                         }
                         g_stream_expert_slots[idx] = {(uint64_t)lg, (uint64_t)lu, (uint64_t)ld,
-                                                     g_stream_expert_clock};
+                                                     seed_rank_age ? g_stream_expert_clock + (room - idx) / (uint64_t)seed_rank_age
+                                                                   : g_stream_expert_clock};
                         g_stream_expert_by_gate[(uint64_t)lg] = idx;
                         g_slot_table_rebuild = 1;
                         filled++;
                     }
                     (void)fclose(f);
+                    if (seed_rank_age) g_stream_expert_clock += room / (uint64_t)seed_rank_age + 1u;   /* SRA: later stamps are younger than every seed */
                     if (!seed.finish()) {
                         cuda_spec_reap(1);
                         g_stream_expert_by_gate.clear();
@@ -46443,7 +46720,7 @@ extern "C" int ds4_gpu_tp2_moe_prefetch_mark(void) {
 
 /* TP2-G: see ds4_gpu.h. Entries per card, layer and island: 0 empty, 1 warmed (ran eagerly once), 2 captured, 3 dead
  * (capture failed: eager from then on). */
-#define TP2G_ISLANDS 8u
+#define TP2G_ISLANDS 9u   /* TP2-EN: island 8, the Engram projection */
 struct tp2g_entry { cudaGraphExec_t exec; int state; uint64_t hits; };
 static tp2g_entry g_tp2g[2][CUDA_DECODE_GRAPH_LAYERS][TP2G_ISLANDS];
 static int g_tp2g_cap_il = -1, g_tp2g_cap_island = -1;

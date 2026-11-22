@@ -535,6 +535,50 @@ __global__ static void dsv41_engram_batch_kernel(float *residual, const float *k
         residual[offset + i] = dsv41_bf16(residual[offset + i] + gate * dsv41_bf16(kv[value + i]));
 }
 
+/* K11: dsv41_engram_kernel's arithmetic on one block of 256 threads per (row, stream): the stream's residual, key and
+ * qw*kw products land in shared memory in one round trip, warp 0 runs each lane's chains over i = lane + 32k in order
+ * (the same expressions), and every thread applies the gate to its own elements. The product qw*kw is the kernel's own
+ * first multiply, made once per element. */
+__global__ static void __launch_bounds__(256) dsv41_engram_k11_kernel(float * __restrict__ residual,
+        const float * __restrict__ kv, const float * __restrict__ qw, const float * __restrict__ kw,
+        const uint8_t * __restrict__ mask, uint32_t width, float eps) {
+    extern __shared__ float sm[];
+    const uint32_t row = blockIdx.x >> 2u, head = blockIdx.x & 3u;
+    if (mask && !mask[row]) return;
+    float *sh = sm, *sk = sm + width, *sp = sm + 2u * width;
+    __shared__ float gate_s;
+    const uint64_t offset = ((uint64_t)row * 4u + head) * width;
+    const uint64_t key = ((uint64_t)row * 5u + head) * width;
+    const uint64_t value = ((uint64_t)row * 5u + 4u) * width;
+    for (uint32_t i = threadIdx.x; i < width; i += 256u) {
+        const uint32_t wi = head * width + i;
+        sh[i] = residual[offset + i];
+        sk[i] = kv[key + i];
+        sp[i] = qw[wi] * kw[wi];
+    }
+    __syncthreads();
+    if (threadIdx.x < 32u) {
+        const uint32_t lane = threadIdx.x;
+        float h2 = 0, k2 = 0, dot = 0;
+        for (uint32_t i = lane; i < width; i += 32u) {
+            const float hh = sh[i], k = dsv41_bf16(sk[i]);
+            h2 += hh * hh;
+            k2 += k * k;
+            dot += hh * sp[i] * k;
+        }
+        h2 = dsv41_broadcast(warp_sum_f32(h2));
+        k2 = dsv41_broadcast(warp_sum_f32(k2));
+        dot = dsv41_broadcast(warp_sum_f32(dot)) *
+            rsqrtf(h2 / width + eps) * rsqrtf(k2 / width + eps) * rsqrtf(float(width));
+        const float gate = 1.0f / (1.0f + expf(-copysignf(sqrtf(fmaxf(fabsf(dot), 1.0e-6f)), dot)));
+        if (lane == 0) gate_s = gate;
+    }
+    __syncthreads();
+    const float gate = gate_s;
+    for (uint32_t i = threadIdx.x; i < width; i += 256u)
+        residual[offset + i] = dsv41_bf16(sh[i] + gate * dsv41_bf16(kv[value + i]));
+}
+
 extern "C" int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual, const ds4_gpu_tensor *kv,
                                          const ds4_gpu_tensor *qw, const ds4_gpu_tensor *kw,
                                          const ds4_gpu_tensor *mask, uint32_t width,
@@ -544,6 +588,25 @@ extern "C" int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual, const ds4_gpu_
         count > UINT64_MAX / 5u || !dsv41_has_floats(residual, count * 4u) ||
         !dsv41_has_floats(kv, count * 5u) || !dsv41_has_floats(qw, (uint64_t)width * 4u) ||
         !dsv41_has_floats(kw, (uint64_t)width * 4u) || (mask && mask->bytes < rows)) return 0;
+    static int k11 = -1;
+    if (k11 < 0) { const char *e = getenv("DS4_CUDA_K11"); k11 = !(e && !strcmp(e, "0")); }
+    const size_t k11_shm = (size_t)3u * width * sizeof(float);
+    if (k11 && cuda_kfast() && rows <= 16u && k11_shm <= 96u * 1024u) {   /* K11 */
+        static int ready[DS4_MAX_GPUS];
+        int dev = -1;
+        if (cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < DS4_MAX_GPUS) {
+            if (!ready[dev])
+                ready[dev] = cudaFuncSetAttribute(dsv41_engram_k11_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                  96 * 1024) == cudaSuccess ? 1 : -1;
+            if (ready[dev] == 1) {
+                dsv41_engram_k11_kernel<<<rows * 4u, 256, k11_shm, cuda_decode_stream()>>>((float *)residual->ptr,
+                    (const float *)kv->ptr, (const float *)qw->ptr, (const float *)kw->ptr,
+                    mask ? (const uint8_t *)mask->ptr : NULL, width, eps);
+                return cuda_ok(cudaGetLastError(), "V4.1 Engram gate (K11)");
+            }
+        }
+        (void)cudaGetLastError();
+    }
     if (cuda_kfast())   /* K1 */
         dsv41_engram_batch_kernel<16><<<rows, 128, 0, cuda_decode_stream()>>>((float *)residual->ptr,
             (const float *)kv->ptr, (const float *)qw->ptr, (const float *)kw->ptr,
@@ -858,12 +921,74 @@ __device__ __forceinline__ static float block_sum_f32_256_bar1(float v, float *p
     asm volatile("bar.sync 1, 256;" ::: "memory");
     return partial[0];
 }
+/* K7: hc4_split_one on lanes 0-15 of a warp, lane = r * 4 + col of the comb matrix (lanes 0-7 also make the pre and
+ * post weights). Every value is the operation hc4_split_one does on the same operands in its order: a row's or
+ * column's four terms are gathered by shuffles and added in hc4_split_one's order, and the four lanes of that row
+ * (column) divide by the same sum. Lanes 16-31 return at once. */
+__device__ __forceinline__ static float hc4_gather_sum(float s, float c, uint32_t l0, uint32_t step) {
+    const unsigned mask = 0x0000ffffu;
+    const float v0 = __shfl_sync(mask, c, l0), v1 = __shfl_sync(mask, c, l0 + step),
+                v2 = __shfl_sync(mask, c, l0 + 2u * step), v3 = __shfl_sync(mask, c, l0 + 3u * step);
+    s += v0;
+    s += v1;
+    s += v2;
+    s += v3;
+    return s;
+}
+__device__ __forceinline__ static void hc4_split_lanes16(float *out, const float *mix, const float *scale,
+        const float *base, uint32_t sinkhorn_iters, float epsv) {
+    const uint32_t lane = threadIdx.x & 31u;
+    if (lane >= 16u) return;
+    const unsigned mask = 0x0000ffffu;
+    const uint32_t row0 = lane & ~3u, col0 = lane & 3u;
+    const float pre_scale = scale[0];
+    const float post_scale = scale[1];
+    const float comb_scale = scale[2];
+    if (lane < 4u) {
+        float z = mix[lane] * pre_scale + base[lane];
+        out[lane] = 1.0f / (1.0f + expf(-z)) + epsv;
+    } else if (lane < 8u) {
+        float z = mix[lane] * post_scale + base[lane];
+        out[lane] = 2.0f / (1.0f + expf(-z));
+    }
+    float c = mix[8 + lane] * comb_scale + base[8 + lane];
+    {
+        const float v0 = __shfl_sync(mask, c, row0), v1 = __shfl_sync(mask, c, row0 + 1u),
+                    v2 = __shfl_sync(mask, c, row0 + 2u), v3 = __shfl_sync(mask, c, row0 + 3u);
+        float m = -INFINITY;
+        m = fmaxf(m, v0);
+        m = fmaxf(m, v1);
+        m = fmaxf(m, v2);
+        m = fmaxf(m, v3);
+        c = expf(c - m);
+        const float s = hc4_gather_sum(0.0f, c, row0, 1u);
+        c = c / s + epsv;
+    }
+    {
+        const float s = hc4_gather_sum(epsv, c, col0, 4u);
+        c /= s;
+    }
+    for (uint32_t iter = 1; iter < sinkhorn_iters; iter++) {
+        const float sr = hc4_gather_sum(epsv, c, row0, 1u);
+        c /= sr;
+        const float sc = hc4_gather_sum(epsv, c, col0, 4u);
+        c /= sc;
+    }
+    out[8 + lane] = c;
+}
+static int dsv41_k7_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DS4_CUDA_K7"); on = !(e && !strcmp(e, "0")); }
+    return on;
+}
+
 template <uint32_t PER>
 __global__ static void __launch_bounds__(288) dsv41_hc_input_kernel(float *x_out, float *norm_out, float *split,
         const float *mix, const float *residual_hc, const float *pre, const float *scale, const float *base,
-        const float *norm_w, uint32_t n_embd, uint32_t sinkhorn_iters, float hc_eps, float rms_eps) {
+        const float *norm_w, uint32_t n_embd, uint32_t sinkhorn_iters, float hc_eps, float rms_eps, int k7) {
     if (threadIdx.x >= 256u) {
-        if (threadIdx.x == 256u) hc4_split_one(split, mix, scale, base, sinkhorn_iters, hc_eps);
+        if (k7) hc4_split_lanes16(split, mix, scale, base, sinkhorn_iters, hc_eps);
+        else if (threadIdx.x == 256u) hc4_split_one(split, mix, scale, base, sinkhorn_iters, hc_eps);
         return;
     }
     const float w0 = pre[0], w1 = pre[1], w2 = pre[2], w3 = pre[3];
@@ -889,6 +1014,106 @@ __global__ static void __launch_bounds__(288) dsv41_hc_input_kernel(float *x_out
     const float scl = rsqrtf(sum / (float)n_embd + rms_eps);
 #pragma unroll
     for (uint32_t j = 0; j < PER; j++) norm_out[threadIdx.x + j * 256u] = dsv41_bf16(v[j] * scl * wv[j]);
+}
+
+/* K8: the kernel above on 8 + 1 blocks (see ds4_gpu_dsv41_hc_input). */
+struct dsv41_k8_sync { unsigned arrive, gen; float scale, pad; float partial[256]; };
+static dsv41_k8_sync *g_dsv41_k8_sync[DS4_MAX_GPUS];
+template <uint32_t PER, uint32_t G>
+__global__ static void __launch_bounds__(256) dsv41_hc_input_k8_kernel(float * __restrict__ x_out,
+        float * __restrict__ norm_out, float * __restrict__ split, const float * __restrict__ mix,
+        const float * __restrict__ residual_hc, const float * __restrict__ pre, const float * __restrict__ scale,
+        const float * __restrict__ base, const float * __restrict__ norm_w, uint32_t n_embd, uint32_t sinkhorn_iters,
+        float hc_eps, float rms_eps, dsv41_k8_sync * __restrict__ sy) {
+    if (blockIdx.x == G) {   /* the Sinkhorn split, which the rest does not read */
+        if (threadIdx.x < 32u) hc4_split_lanes16(split, mix, scale, base, sinkhorn_iters, hc_eps);
+        return;
+    }
+    constexpr uint32_t T = 256u / G, ROWS = 256u / T;
+    __shared__ float s[PER][T];
+    __shared__ unsigned my_gen, last_s;
+    __shared__ float scale_s;
+    const uint32_t lane = threadIdx.x % T, r = threadIdx.x / T, t0 = blockIdx.x * T;
+    const float w0 = pre[0], w1 = pre[1], w2 = pre[2], w3 = pre[3];
+    for (uint32_t j = r; j < PER; j += ROWS) {   /* the one-block kernel's element (t0 + lane, j) */
+        const uint32_t i = t0 + lane + 256u * j;
+        float acc = 0.0f;
+        acc = __fmaf_rn(residual_hc[i], w0, acc);
+        acc = __fmaf_rn(residual_hc[(uint64_t)n_embd + i], w1, acc);
+        acc = __fmaf_rn(residual_hc[2ull * n_embd + i], w2, acc);
+        acc = __fmaf_rn(residual_hc[3ull * n_embd + i], w3, acc);
+        const float v = dsv41_bf16(acc);
+        x_out[i] = v;
+        s[j][lane] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < T) {   /* that thread's sum of squares, in its order */
+        float sum = 0.0f;
+#pragma unroll
+        for (uint32_t j = 0; j < PER; j++) sum += s[j][threadIdx.x] * s[j][threadIdx.x];
+        sy->partial[t0 + threadIdx.x] = sum;
+    }
+    if (threadIdx.x == 0) my_gen = *(volatile unsigned *)&sy->gen;
+    __syncthreads();
+    __threadfence();
+    if (threadIdx.x == 0) last_s = atomicAdd(&sy->arrive, 1u) == G - 1u;
+    __syncthreads();
+    if (last_s) {   /* block_sum_f32_256_bar1's tree over the 256 sums */
+        __shared__ float partial[256];
+        partial[threadIdx.x] = *(volatile float *)&sy->partial[threadIdx.x];
+        __syncthreads();
+        if (threadIdx.x < 32u) {
+            const uint32_t t = threadIdx.x;
+            float v = ((partial[t] + partial[t + 128u]) + (partial[t + 64u] + partial[t + 192u])) +
+                      ((partial[t + 32u] + partial[t + 160u]) + (partial[t + 96u] + partial[t + 224u]));
+            for (uint32_t s2 = 16u; s2; s2 >>= 1u) v += __shfl_down_sync(0xffffffffu, v, s2);
+            if (t == 0u) partial[0] = v;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            const float scl = rsqrtf(partial[0] / (float)n_embd + rms_eps);
+            sy->scale = scl;
+            sy->arrive = 0u;
+            __threadfence();
+            atomicAdd(&sy->gen, 1u);
+            scale_s = scl;
+        }
+    } else if (threadIdx.x == 0) {
+        while (*(volatile unsigned *)&sy->gen == my_gen) { }
+        __threadfence();
+        scale_s = *(volatile float *)&sy->scale;
+    }
+    __syncthreads();
+    const float scl = scale_s;
+    for (uint32_t j = r; j < PER; j += ROWS) {
+        const uint32_t i = t0 + lane + 256u * j;
+        norm_out[i] = dsv41_bf16(s[j][lane] * scl * norm_w[i]);
+    }
+}
+static int dsv41_k8_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DS4_CUDA_K8"); on = !(e && !strcmp(e, "0")); }
+    return on;
+}
+/* The device's K8 state; made outside a capture (the first, eager pass of every decode island). */
+static dsv41_k8_sync *dsv41_k8_state(void) {
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= DS4_MAX_GPUS) { (void)cudaGetLastError(); return NULL; }
+    if (g_dsv41_k8_sync[dev]) return g_dsv41_k8_sync[dev];
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cuda_decode_stream(), &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone) {
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    dsv41_k8_sync *p = NULL;
+    if (cudaMalloc((void **)&p, sizeof(*p)) != cudaSuccess || cudaMemset(p, 0, sizeof(*p)) != cudaSuccess ||
+        cudaDeviceSynchronize() != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (p) (void)cudaFree(p);
+        return NULL;
+    }
+    g_dsv41_k8_sync[dev] = p;
+    return p;
 }
 
 /* K3 add + BF16 + HC expansion + BF16 (add_kernel, dsv41_bf16_kernel, hc_expand_kernel<false>, dsv41_bf16_kernel)
@@ -1089,9 +1314,16 @@ extern "C" int ds4_gpu_dsv41_hc_input(ds4_gpu_tensor *x, ds4_gpu_tensor *norm, d
     const float *nw = (const float *)cuda_resolve_weight_ptr(model_map, norm_offset, (uint64_t)n_embd * 4u,
                                                              ds4_tensor_device_idx(norm), "V4.1 norm");
     if (!scale || !base || !nw) return 0;
+    dsv41_k8_sync *k8 = dsv41_k8_on() && dsv41_k7_on() ? dsv41_k8_state() : NULL;
+    if (k8) {   /* K8 */
+        dsv41_hc_input_k8_kernel<20, 8><<<9, 256, 0, cuda_decode_stream()>>>((float *)x->ptr, (float *)norm->ptr,
+            (float *)split->ptr, (const float *)mix->ptr, (const float *)residual->ptr, (const float *)pre->ptr,
+            scale, base, nw, n_embd, sinkhorn_iters, hc_eps, norm_eps, k8);
+        return cuda_ok(cudaGetLastError(), "V4.1 HC input (K8)");
+    }
     dsv41_hc_input_kernel<20><<<1, 288, 0, cuda_decode_stream()>>>((float *)x->ptr, (float *)norm->ptr,
         (float *)split->ptr, (const float *)mix->ptr, (const float *)residual->ptr, (const float *)pre->ptr,
-        scale, base, nw, n_embd, sinkhorn_iters, hc_eps, norm_eps);
+        scale, base, nw, n_embd, sinkhorn_iters, hc_eps, norm_eps, dsv41_k7_on());
     return cuda_ok(cudaGetLastError(), "V4.1 HC input");
 }
 #endif
