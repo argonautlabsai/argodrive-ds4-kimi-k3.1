@@ -449,8 +449,8 @@ exchange finished halves, never partial sums.
   routed experts by output rows. The HC mixes, the norms, the router and the KV stores run on both cards from the same
   inputs. A layer has four exchanges, each closed by an event barrier between the cards, and each card replays its
   part of a layer from CUDA graphs.
-- **Experts.** Each card caches the row half of the experts it holds (gate and up rows 0–1,023 on one card and
-  1,024–2,047 on the other, down rows 0–2,559 and 2,560–5,119), for all 40 layers, with the same number of slots on
+- **Experts.** Each card caches the row half of the experts it holds (gate and up rows 0–1,151 on one card and
+  1,152–2,303 on the other, down rows 0–2,559 and 2,560–5,119), for all 40 layers, with the same number of slots on
   both so that their evictions stay in step. A missing expert is read once from the drive into pinned host memory, and
   each card uploads its half over its own link.
 - **Prompt pass.** The routed experts are divided by rows over both cards; the rest of a layer stays on the card the
@@ -501,7 +501,7 @@ projections (cuBLAS then picks other kernels and the result differs in the last 
 out of the eviction scan until their layer (no change); running the prompt pass's dense projections and attention on
 both cards as well (estimated at about zero: the exchanges cost what the split saves).
 
-**Limits.** DSpark does not run with `DS4_CUDA_TP2`. Decode rows that carry an image run without the CUDA graphs.
+**Limits.** Decode rows that carry an image run without the CUDA graphs.
 Requests are served one at a time. Each card holds the dense weights of all 40 layers, so the two caches hold about
 6 % fewer experts than with the layers split. Prompts beyond about 6,000 tokens have not been run with `DS4_CUDA_TP2`.
 
@@ -575,6 +575,70 @@ per exchange: the PCIe round trip sets the cost either way); programmatic depend
 (routers run that early name only 11 to 29 % of the experts decode then reads from the drives); keeping the preloaded
 experts ahead of the prompt's own (decode reuses the prompt's experts, and 1,556-token runs got slower).
 
+### The DSpark drafter on both cards (22 November)
+
+DeepSeek's own drafter, DSpark, now runs with both cards on every layer. It is made from the checkpoint's `mtp.*`
+weights (`gguf-tools/deepseek41_dspark.py`, shards 44 to 46 of `deepseek-ai/DeepSeek-V4.1-Flash-1017`): its three
+stages guess up to five tokens, and the model checks them in one pass over several rows. The check computes every row
+with the arithmetic of one-token decode, so the answer is the one you get without the drafter, token for token and
+logit for logit. Every run below was compared that way, position by position.
+
+A guess only pays if the check costs less than the tokens it confirms, and a check began at about 110 ms for six rows
+against 13 to 17 ms for one token. These changes bring it to about 53 ms:
+
+- **Both cards check.** The rows run through each layer on both cards with the same four exchanges as decode; the
+  drafter itself runs on one card.
+- **One attention launch for all rows.** The multi-row form of decode's exact score kernel, each row with its own
+  window and its own compressed keys. The rows' keys first go into a straight copy of the 128-key window: written into
+  the ring, a later row's key would hide an older key from an earlier row.
+- **Weights read once for all rows.** The Q8 projections take up to seven rows in one pass with the per-row
+  reductions of one row; the router's F32 rows run as one launch of the one-row kernel; the hyper-connection mixes go
+  to cuBLAS as one call where that was checked bit for bit against one call per row (`DS4_F16_ROW_GROUP=8`; a shape
+  that differs, like the Engram projection's, stays one row per call).
+- **Each card its own index lists.** The shared list lived in the other card's memory.
+- **The drafter's experts on demand.** 148 slots on one card (2.6 GiB) instead of all 384 experts (6.4 GiB) leave
+  that much more room for the model's own expert cache. `DS4_DSPARK_EXPERT_PRELOAD` fills them at start from a usage list, most used first, which
+  `DS4_DSPARK_EXPERT_USAGE` writes; `dspark-experts-example.txt` here was made from JSON-extraction and commentary
+  requests.
+- **A time rule.** Every four drafted steps are compared with what the same tokens cost without the drafter, and a
+  losing window pauses it for 32 tokens, four times longer after each further loss, up to 1,024. Prose usually ends up
+  paused; structured output keeps drafting.
+
+| switch | effect |
+|---|---|
+| `--dspark --mtp-model FILE` | the drafter, for `ds4`, `ds4-server` and `ds4-bench` |
+| `DS4_F16_ROW_GROUP=8` | F16 row projections in one cuBLAS call for up to 8 rows, only where checked bit for bit |
+| `DS4_DSPARK_EXPERT_SLOTS=N` | the drafter's expert slots (default 128; 148 below) |
+| `DS4_DSPARK_EXPERT_PRELOAD=FILE`, `DS4_DSPARK_EXPERT_USAGE=FILE` | fill the slots at start from lines `stage expert count`; append such lines at exit |
+| `DS4_DT_SKIP_FIRST=16`, `DS4_DT_PAUSE0=32`, `DS4_DT_PAUSE_MAX=1024` | the time rule (defaults 3, 16 and 256); `DS4_DT_SCHED=0` turns it off |
+| `DS4_DS41_LOGITS_HASH=1` | prints a hash of the full logits of every position, plain and checked, to compare runs |
+| `DS4_DT_CHECK2=0`, `DS4_DT_ROWS_ATTN=0`, `DS4_DT10=0`, `DS4_DT_F32_ROWS=0` | the check on one card; row-by-row attention, gathers and router |
+
+**Measured on 22 November 2026** through `ds4-server` (32,768-token context, image input on, the preload lists and
+RAM tier of the tables above, `DS4_CUDA_VRAM_RESERVE_MB=5120`), the drafter with the settings in the table, both rows
+in one session. Prompts of about 6,000 tokens, a table of daily figures; the answers were the same text with and
+without the drafter.
+
+| 6,000-token prompt | prefill tok/s | decode tok/s |
+|---|---|---|
+| JSON extraction, 600 tokens | 1,515 | 76.4 |
+| the same with the drafter | 1,428 | **103.4** |
+| commentary, 400 tokens | 1,490 | 56.9 |
+| the same with the drafter | 1,477 | 56.9 |
+
+Shorter prompts through the server, decode without and with the drafter: a JSON list of cities 69.2 and 91.0 tok/s,
+Python code 53.0 and 56.2, an English essay 54.0 and 52.8, Italian prose 66.9 and 63.3, an invoice image (869 tokens)
+21.9 s and 20.8 s for the whole request. On `ds4-bench`'s novel prompt the drafter mostly pauses: 512 + 200 decodes at
+67.3 against 70.9 tok/s and 1,556 + 300 at 63.3 against 65.9, so the bench tables above are left as they are.
+
+**Limits.** The drafter's own memory, about 2.6 GiB on each card, comes out of the expert
+cache, so text that drafts poorly decodes 0 to 7 % slower; the 5 GiB reserve instead of 8 gives the cache that room
+back (at least 1.8 GB stayed free with a 25,000-token prompt). Requests are served one at a time.
+
+**Measured and left out.** A lower confidence threshold than the CUDA default of 0.7 (0.5, 0.3 and 0: more rows
+checked, more of them rejected, slower on prose); splitting each expert read into 3 or 6 parts over 16 threads (a read
+still takes about 1.2 ms); the multi-row tensor-core path for the Q8 rows (exact, but slower at these sizes).
+
 ## What was measured and left out
 
 - A host-RAM tier filled on demand on CUDA, not from a list: no hit in 8,310 loads with a 24 GiB tier, because
@@ -596,7 +660,7 @@ experts ahead of the prompt's own (decode reuses the prompt's experts, and 1,556
   experts it would have fetched went unused.
 - More staging lanes than 8, more decode reader threads than the default 9, and decode splits other than the prompt
   pass's: no gain.
-- DSpark, the draft-and-verify decode: with the MXFP4-experts file and SSD streaming on Metal its verify step stops
+- DSpark on Metal (on CUDA with two cards it runs, see above): with the MXFP4-experts file and SSD streaming its verify step stops
   with "model range is not covered by mapped model views", in unmodified ds4 of 3 November as well as in this tree
   (the batched verify reads cached experts only for the Q2 file). ds4 also states that DSpark's output can differ
   from one-token decode, and `--dspark-strict` keeps target-only decode, so it lies outside the same-output rule

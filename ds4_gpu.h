@@ -564,6 +564,17 @@ int ds4_gpu_tp2_graph_begin(uint32_t il, uint32_t island);
 int ds4_gpu_tp2_graph_end(uint32_t il, uint32_t island);
 void ds4_gpu_tp2_graph_abort(void);
 void ds4_gpu_tp2_graphs_invalidate(void);
+/* DT1: how often a buffer that a captured graph may name was freed and made again */
+uint64_t ds4_gpu_buffer_moves(void);
+/* DT5: the DSpark drafter's routed experts on demand: a cache of `slots` experts on card `tier` (keys = stages x experts
+ * per stage), filled from the mapped support file; its MoE through the MXFP4 vector kernels (6 slots per row, the
+ * unused ones with weight 0). */
+int ds4_gpu_dspark_dec_init(int tier, uint32_t slots, uint32_t keys, uint64_t gate_bytes, uint64_t down_bytes);
+int ds4_gpu_dspark_dec_on(void);
+int ds4_gpu_dspark_dec_moe(ds4_gpu_tensor *out, ds4_gpu_tensor *mid, const ds4_gpu_tensor *x,
+                           const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, const void *map,
+                           uint64_t map_size, uint64_t gate_off, uint64_t up_off, uint64_t down_off, uint32_t stage,
+                           uint32_t rows, uint32_t n_used, uint32_t n_experts, uint32_t E, uint32_t F, float clamp);
 /* the prompt pass's counterpart of ds4_gpu_tp2_moe_prefetch: ids are the chunk's rows x 6 selected experts */
 int ds4_gpu_tp2_moe_batch_prefetch(const int32_t *ids, uint32_t n_ids, const void *model_map, uint64_t model_size,
                                    uint32_t layer, uint32_t n_total_expert, uint64_t gate_offset, uint64_t up_offset,
@@ -2468,6 +2479,23 @@ int ds4_gpu_attention_decode_heads_rope_tensor(
 /* Multi-session decode over contiguous Q/head rows and private KV caches.
  * The row table is copied into CUDA launch parameters, so no device-side
  * descriptor upload or synchronization is required. */
+/* DT13: the drafter's expert cache filled at start (see ds4_cuda.cu) */
+int ds4_gpu_dspark_dec_preload(uint32_t stage, uint32_t e, uint32_t n_experts, const void *map, uint64_t map_size,
+                               uint64_t gate_off, uint64_t up_off, uint64_t down_off);
+/* DT10: a check's rows (see ds4_cuda.cu) */
+typedef struct { uint32_t source_rows[8], selected[8]; } ds4_gpu_dt10_rows;
+int ds4_gpu_matmul_f32_rows_exact_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+                                         const ds4_gpu_tensor *x, uint64_t rows);
+int ds4_gpu_dsv41_gather_kv_rows(ds4_gpu_tensor *out, const ds4_gpu_tensor *source, const ds4_gpu_tensor *ids,
+                                 uint32_t top, const ds4_gpu_dt10_rows *r, uint32_t rows);
+int ds4_gpu_dsv41_rows_window(ds4_gpu_tensor *lin, ds4_gpu_tensor *ring, const ds4_gpu_tensor *kv,
+                              uint32_t first, uint32_t n_old, uint32_t p, uint32_t rows);
+/* DT9: the rows' exact attention without the V4 inverse rope (see ds4_cuda.cu) */
+int ds4_gpu_attention_decode_rows_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+                                         uint64_t sinks_offset, const ds4_gpu_tensor *q,
+                                         const ds4_gpu_attention_decode_row *rows, uint32_t n_rows, uint32_t n_head,
+                                         uint32_t head_dim);
 int ds4_gpu_attention_decode_rows_rope_tensor(
         ds4_gpu_tensor                       *heads,
         const void                           *model_map,

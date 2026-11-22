@@ -1118,6 +1118,7 @@ static const uint64_t CUDA_DSV41_SHARED_SCRATCH = 65536u;
  * regions; same math mode and default workspace as the main handle. */
 static cublasHandle_t g_side_cublas;
 
+static uint64_t g_cuda_buffer_moves = 0;   /* DT1: buffers a captured graph may name were freed and made again */
 static void *cuda_tmp_alloc_on(int logical_tier, uint64_t bytes, const char *what) {
     if (g_dsv41_shared.active)
         return logical_tier == 0 && bytes <= CUDA_DSV41_SHARED_SCRATCH
@@ -1154,6 +1155,7 @@ static void *cuda_tmp_alloc_on(int logical_tier, uint64_t bytes, const char *wha
         return NULL;
     }
     if (ctx->scratch) {
+        g_cuda_buffer_moves++;   /* DT1 */
         (void)cudaFree(ctx->scratch);
         ctx->scratch = NULL;
         ctx->scratch_bytes = 0;
@@ -19962,6 +19964,20 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair warp launch");
 }
 
+/* DT4: 2 to 7 rows of an exact Q8 matvec through the multi-row kernel (each weight block loaded once for the rows) */
+static int cuda_q8_rows_on(uint32_t n_rows) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DS4_CUDA_Q8_ROWS"); on = !(e && !strcmp(e, "0")); }
+    return on && n_rows >= 2u && n_rows < 8u;
+}
+static int cuda_q8_rows_launch(float *out, const unsigned char *w, const int8_t *xq, const float *xscale,
+                               uint64_t in_dim, uint64_t out_dim, uint64_t blocks, uint32_t n_rows) {
+    dim3 grid(((unsigned)out_dim + 7u) / 8u, (n_rows + K3_Q8_ROWS_TILE - 1u) / K3_Q8_ROWS_TILE, 1u);
+    k3_q8_0_preq_warp8_rows_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(out, w, xq, xscale, in_dim, out_dim, blocks,
+                                                                          n_rows, cuda_q8_use_dp4a());
+    return cuda_ok(cudaGetLastError(), "q8_0 rows (DT4) launch");
+}
+
 extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -20010,6 +20026,9 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
                  "q8_0 decode rows exact quantize launch")) {
         return 0;
     }
+    if (cuda_q8_rows_on(n_rows))   /* DT4 */
+        return cuda_q8_rows_launch((float *)out->ptr, (const unsigned char *)wptr, xq, xscale, in_dim, out_dim,
+                                   blocks, n_rows);
     const int mma_rc = cuda_q8_mma_try_launch(
         (float *)out->ptr, (const unsigned char *)wptr, xq, xscale,
         in_dim, out_dim, n_rows, blocks, blocks, out_dim, 32u);
@@ -20084,6 +20103,11 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
                  "q8_0 pair decode rows exact quantize launch")) {
         return 0;
     }
+    if (cuda_q8_rows_on(n_rows))   /* DT4: each matrix through the multi-row kernel */
+        return cuda_q8_rows_launch((float *)out0->ptr, (const unsigned char *)w0, xq, xscale, in_dim, out0_dim, blocks,
+                                   n_rows) &&
+            cuda_q8_rows_launch((float *)out1->ptr, (const unsigned char *)w1, xq, xscale, in_dim, out1_dim, blocks,
+                                n_rows);
     const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
     dim3 grid(((unsigned)max_out + 7u) / 8u, n_rows, 1u);
     matmul_q8_0_pair_preq_warp8_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
@@ -32042,10 +32066,13 @@ extern "C" int ds4_gpu_args_probe_auto_cuda(const int      *device_filter,
     return 0;
 }
 
+extern "C" uint64_t ds4_gpu_buffer_moves(void) { return g_cuda_buffer_moves; }
+
 static int cuda_stream_selected_ensure_bytes(
         char **ptr, uint64_t *capacity, uint64_t bytes, const char *label) {
     if (*ptr && *capacity >= bytes) return 1;
     if (*ptr) {
+        g_cuda_buffer_moves++;
         (void)cudaFree(*ptr);
         *ptr = NULL;
         *capacity = 0;
@@ -33211,7 +33238,9 @@ static int cuda_stream_selected_cache_begin_load(
                     (void)cudaSetDevice(g_gpu[g_stream_tier].device_id);
                     (void)cudaGetLastError();
                     shared_cap = cap > 64u ? cap - 8u : cap;   /* TP2-EQ: room for a late small allocation */
-                    fprintf(stderr, "ds4: TP2: each card's expert cache takes %llu parts\n", (unsigned long long)shared_cap);
+                    fprintf(stderr, "ds4: TP2: each card's expert cache takes %llu parts (free: card %d %.2f GiB, card %d "
+                            "%.2f GiB; part %.2f MiB)\n", (unsigned long long)shared_cap, g_stream_tier,
+                            free_bytes / 1073741824.0, other, f / 1073741824.0, expert_bytes / 1048576.0);
                 }
                 capacity = std::min(capacity, shared_cap);
                 const uint64_t other_n = (uint64_t)g_stream_expert_slots_pt.v[1 - g_stream_tier].size();
@@ -46365,7 +46394,7 @@ extern "C" int ds4_gpu_tp2_moe_load(const int32_t *ids, uint32_t n_ids, const vo
                                     uint32_t layer, uint32_t n_total_expert, uint64_t gate_offset, uint64_t up_offset,
                                     uint64_t down_offset, uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
                                     uint32_t part) {
-    if (!g_tp2_on || !ids || n_ids != 6u || part > 1u) return 0;
+    if (!g_tp2_on || !ids || !n_ids || n_ids > 48u || n_ids % 6u || part > 1u) return 0;   /* DT1: 1 to 8 rows */
     ds4_gpu_stream_expert_table table = {model_map, model_size, layer, n_total_expert, gate_offset, up_offset,
                                          down_offset, gate_expert_bytes, down_expert_bytes, 2u, part};
     int dev = -1;
@@ -46683,8 +46712,8 @@ extern "C" int ds4_gpu_tp2_moe_prefetch(const int32_t *ids, uint32_t n_ids, cons
     static int off = -1;
     if (off < 0) { const char *e = getenv("DS4_TP2_XFER"); off = e && !strcmp(e, "0"); }
     if (off || !g_tp2_on || model_map != g_model_fd_host_base) return 1;
-    if (!ids || !n_ids || n_ids > 16u || !gate_expert_bytes || !down_expert_bytes || (gate_expert_bytes & 1u) ||
-        (down_expert_bytes & 1u)) return 0;
+    if (!ids || !n_ids || n_ids > 48u || !gate_expert_bytes || !down_expert_bytes || (gate_expert_bytes & 1u) ||
+        (down_expert_bytes & 1u)) return 0;   /* DT2: a check's rows, up to 8 */
     const int saved = g_stream_tier;
     if (ds4_gpu_set_current_device(0) != 0) return 0;
     int rc = 1;
@@ -47514,4 +47543,438 @@ extern "C" int ds4_gpu_tp2_xfer_prepare(uint64_t gate_expert_bytes, uint64_t dow
             g_tp2_xfer.size(), g_tp2_xfer.size() * (2.0 * g_tp2_xfer_gspan + g_tp2_xfer_dspan) / 1e9,
             (unsigned long long)g_model_direct_align, cuda_now_ms() - t0);
     return ok;
+}
+
+/* DT5: the DSpark drafter's routed experts on demand (see ds4_gpu.h) */
+struct dspark_dec_state {
+    int tier = -1;
+    uint32_t slots = 0, keys = 0;
+    uint64_t gb = 0, db = 0;
+    char *gate = NULL, *up = NULL, *down = NULL;
+    int32_t *d_ids = NULL;
+    float *d_w = NULL, *x = NULL, *mid = NULL, *out = NULL;   /* DT7: on the cache's card */
+    std::vector<int32_t> slot_of, key_of;
+    std::vector<uint64_t> last, stamp;
+    uint64_t tick = 0, call = 0, uses = 0, misses = 0;
+    double upload_ms = 0.0;
+    std::vector<uint64_t> key_uses;   /* DT14: uses per stage and expert */
+    uint32_t n_experts = 0;
+};
+static dspark_dec_state g_dec;
+
+static void dspark_dec_report(void) {
+    const char *usage = getenv("DS4_DSPARK_EXPERT_USAGE");   /* DT14 */
+    FILE *uf = usage && *usage && g_dec.uses && g_dec.n_experts ? fopen(usage, "a") : NULL;
+    for (size_t k = 0; uf && k < g_dec.key_uses.size(); k++)
+        if (g_dec.key_uses[k]) fprintf(uf, "%u %u %llu\n", (unsigned)(k / g_dec.n_experts), (unsigned)(k % g_dec.n_experts),
+                                       (unsigned long long)g_dec.key_uses[k]);
+    if (uf) fclose(uf);
+    if (g_dec.uses)
+        fprintf(stderr, "ds4: DSpark expert cache: %llu uses, %llu loaded (%.1f %%), %.0f ms of uploads, %u slots\n",
+                (unsigned long long)g_dec.uses, (unsigned long long)g_dec.misses,
+                100.0 * (double)g_dec.misses / (double)g_dec.uses, g_dec.upload_ms, g_dec.slots);
+}
+
+extern "C" int ds4_gpu_dspark_dec_init(int tier, uint32_t slots, uint32_t keys, uint64_t gate_bytes,
+                                       uint64_t down_bytes) {
+    if (g_dec.slots || tier < 0 || tier >= g_n_gpus || !slots || !keys || !gate_bytes || !down_bytes) return 0;
+    int prev = -1;
+    if (cudaGetDevice(&prev) != cudaSuccess || cudaSetDevice(g_gpu[tier].device_id) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    bool ok = cudaMalloc((void **)&g_dec.gate, (size_t)(slots * gate_bytes)) == cudaSuccess &&
+        cudaMalloc((void **)&g_dec.up, (size_t)(slots * gate_bytes)) == cudaSuccess &&
+        cudaMalloc((void **)&g_dec.down, (size_t)(slots * down_bytes)) == cudaSuccess &&
+        cudaMalloc((void **)&g_dec.d_ids, 8u * 6u * sizeof(int32_t)) == cudaSuccess &&
+        cudaMalloc((void **)&g_dec.d_w, 8u * 6u * sizeof(float)) == cudaSuccess &&
+        cudaMalloc((void **)&g_dec.x, 8u * 8192u * sizeof(float)) == cudaSuccess &&
+        cudaMalloc((void **)&g_dec.mid, 8u * 6u * 4096u * sizeof(float)) == cudaSuccess &&
+        cudaMalloc((void **)&g_dec.out, 8u * 8192u * sizeof(float)) == cudaSuccess;
+    if (prev >= 0) (void)cudaSetDevice(prev);
+    if (!ok) {
+        (void)cudaGetLastError();
+        fprintf(stderr, "ds4: DSpark expert cache: %u slots did not fit\n", slots);
+        return 0;
+    }
+    g_dec.tier = tier;
+    g_dec.slots = slots;
+    g_dec.keys = keys;
+    g_dec.gb = gate_bytes;
+    g_dec.db = down_bytes;
+    g_dec.slot_of.assign(keys, -1);
+    g_dec.key_uses.assign(keys, 0);
+    g_dec.key_of.assign(slots, -1);
+    g_dec.last.assign(slots, 0);
+    g_dec.stamp.assign(slots, 0);
+    atexit(dspark_dec_report);
+    fprintf(stderr, "ds4: DSpark expert cache: %u slots on card %d (%.2f GiB), filled on demand\n", slots, tier,
+            (double)slots * (2.0 * gate_bytes + down_bytes) / 1073741824.0);
+    return 1;
+}
+
+extern "C" int ds4_gpu_dspark_dec_on(void) { return g_dec.slots != 0; }
+
+/* DT13: one expert into a free slot at start (not a miss); 0 when the cache is full or the expert is not valid */
+extern "C" int ds4_gpu_dspark_dec_preload(uint32_t stage, uint32_t e, uint32_t n_experts, const void *map,
+                                          uint64_t map_size, uint64_t gate_off, uint64_t up_off, uint64_t down_off) {
+    if (!g_dec.slots || !map || e >= n_experts || (uint64_t)(stage + 1u) * n_experts > g_dec.keys) return 0;
+    const uint32_t key = stage * n_experts + e;
+    if (g_dec.slot_of[key] >= 0) return 1;
+    int32_t v = -1;
+    for (uint32_t i = 0; i < g_dec.slots && v < 0; i++) if (g_dec.key_of[i] < 0) v = (int32_t)i;
+    if (v < 0) return 0;
+    const uint64_t og = gate_off + (uint64_t)e * g_dec.gb, ou = up_off + (uint64_t)e * g_dec.gb,
+                   od = down_off + (uint64_t)e * g_dec.db;
+    if (og + g_dec.gb > map_size || ou + g_dec.gb > map_size || od + g_dec.db > map_size) return 0;
+    int prev = -1;
+    if (cudaGetDevice(&prev) != cudaSuccess || cudaSetDevice(g_gpu[g_dec.tier].device_id) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    const bool ok = cudaMemcpy(g_dec.gate + (uint64_t)v * g_dec.gb, (const char *)map + og, g_dec.gb,
+                               cudaMemcpyHostToDevice) == cudaSuccess &&
+        cudaMemcpy(g_dec.up + (uint64_t)v * g_dec.gb, (const char *)map + ou, g_dec.gb,
+                   cudaMemcpyHostToDevice) == cudaSuccess &&
+        cudaMemcpy(g_dec.down + (uint64_t)v * g_dec.db, (const char *)map + od, g_dec.db,
+                   cudaMemcpyHostToDevice) == cudaSuccess;
+    if (prev >= 0) (void)cudaSetDevice(prev);
+    if (!ok) { (void)cudaGetLastError(); return 0; }
+    g_dec.key_of[v] = (int32_t)key;
+    g_dec.slot_of[key] = v;
+    g_dec.last[v] = ++g_dec.tick;
+    return 1;
+}
+
+extern "C" int ds4_gpu_dspark_dec_moe(ds4_gpu_tensor *out, ds4_gpu_tensor *mid, const ds4_gpu_tensor *x,
+                                      const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+                                      const void *map, uint64_t map_size, uint64_t gate_off, uint64_t up_off,
+                                      uint64_t down_off, uint32_t stage, uint32_t rows, uint32_t n_used,
+                                      uint32_t n_experts, uint32_t E, uint32_t F, float clamp) {
+    if (!g_dec.slots || !out || !mid || !x || !selected || !weights || !map || !rows || rows > 8u || !n_used ||
+        n_used > 6u || !n_experts || (uint64_t)(stage + 1u) * n_experts > g_dec.keys ||
+        out->bytes < (uint64_t)rows * E * sizeof(float) || mid->bytes < (uint64_t)rows * 6u * F * sizeof(float) ||
+        selected->bytes < (uint64_t)rows * n_used * sizeof(int32_t) ||
+        weights->bytes < (uint64_t)rows * n_used * sizeof(float)) return 0;
+    if (E > 8192u || F > 4096u) return 0;
+    const int caller = g_stream_tier;
+    const bool remote = caller != g_dec.tier;   /* DT7: the cache on the other card */
+    if (remote && (caller < 0 || caller >= g_n_gpus || ds4_tensor_device_idx(out) != caller)) return 0;
+    const cudaStream_t cst = cuda_decode_stream();
+    int32_t sel[48];
+    float w[48];
+    if (!cuda_ok(cudaMemcpyAsync(sel, selected->ptr, (size_t)rows * n_used * sizeof(int32_t), cudaMemcpyDeviceToHost,
+                                 cst), "dspark dec ids") ||
+        !cuda_ok(cudaMemcpyAsync(w, weights->ptr, (size_t)rows * n_used * sizeof(float), cudaMemcpyDeviceToHost, cst),
+                 "dspark dec weights") ||
+        !cuda_ok(cudaStreamSynchronize(cst), "dspark dec read")) return 0;   /* x is ready too: the router read it */
+    if (remote && ds4_gpu_set_current_device(g_dec.tier) != 0) return 0;
+    const cudaStream_t st = cuda_decode_stream();
+    const float *xin = (const float *)x->ptr;
+    float *mid_ptr = (float *)mid->ptr, *out_ptr = (float *)out->ptr;
+    if (remote) {
+        if (!cuda_ok(cudaMemcpyPeerAsync(g_dec.x, g_gpu[g_dec.tier].device_id, x->ptr, g_gpu[caller].device_id,
+                                         (size_t)rows * E * sizeof(float), st), "dspark dec x")) {
+            (void)ds4_gpu_set_current_device(caller);
+            return 0;
+        }
+        xin = g_dec.x; mid_ptr = g_dec.mid; out_ptr = g_dec.out;
+    }
+    g_dec.call++;
+    int32_t ids[48];
+    float pw[48];
+    for (uint32_t r = 0; r < rows; r++)
+        for (uint32_t k = 0; k < 6u; k++) {
+            if (k >= n_used) { ids[r * 6u + k] = ids[r * 6u]; pw[r * 6u + k] = 0.0f; continue; }
+            const int32_t e = sel[r * n_used + k];
+            if (e < 0 || (uint32_t)e >= n_experts) return 0;
+            const uint32_t key = stage * n_experts + (uint32_t)e;
+            int32_t s = g_dec.slot_of[key];
+            if (s < 0) {   /* a miss: the least recently used slot this call has not taken */
+                uint32_t v = 0;
+                uint64_t best = UINT64_MAX;
+                for (uint32_t i = 0; i < g_dec.slots; i++) {
+                    if (g_dec.stamp[i] == g_dec.call) continue;
+                    const uint64_t age = g_dec.key_of[i] < 0 ? 0 : g_dec.last[i] + 1u;
+                    if (age < best) { best = age; v = i; }
+                }
+                if (best == UINT64_MAX) return 0;
+                if (g_dec.key_of[v] >= 0) g_dec.slot_of[g_dec.key_of[v]] = -1;
+                const uint64_t og = gate_off + (uint64_t)e * g_dec.gb, ou = up_off + (uint64_t)e * g_dec.gb,
+                               od = down_off + (uint64_t)e * g_dec.db;
+                if (og + g_dec.gb > map_size || ou + g_dec.gb > map_size || od + g_dec.db > map_size) return 0;
+                const double t0 = cuda_now_ms();
+                if (!cuda_ok(cudaMemcpyAsync(g_dec.gate + (uint64_t)v * g_dec.gb, (const char *)map + og, g_dec.gb,
+                                             cudaMemcpyHostToDevice, st), "dspark dec gate") ||
+                    !cuda_ok(cudaMemcpyAsync(g_dec.up + (uint64_t)v * g_dec.gb, (const char *)map + ou, g_dec.gb,
+                                             cudaMemcpyHostToDevice, st), "dspark dec up") ||
+                    !cuda_ok(cudaMemcpyAsync(g_dec.down + (uint64_t)v * g_dec.db, (const char *)map + od, g_dec.db,
+                                             cudaMemcpyHostToDevice, st), "dspark dec down")) return 0;
+                g_dec.upload_ms += cuda_now_ms() - t0;
+                g_dec.misses++;
+                g_dec.key_of[v] = (int32_t)key;
+                g_dec.slot_of[key] = (int32_t)v;
+                s = (int32_t)v;
+            }
+            g_dec.stamp[s] = g_dec.call;
+            g_dec.last[s] = ++g_dec.tick;
+            g_dec.uses++;
+            g_dec.key_uses[key]++;
+            g_dec.n_experts = n_experts;
+            ids[r * 6u + k] = s;
+            pw[r * 6u + k] = w[r * n_used + k];
+        }
+    if (!cuda_ok(cudaMemcpyAsync(g_dec.d_ids, ids, (size_t)rows * 6u * sizeof(int32_t), cudaMemcpyHostToDevice, st),
+                 "dspark dec slot ids") ||
+        !cuda_ok(cudaMemcpyAsync(g_dec.d_w, pw, (size_t)rows * 6u * sizeof(float), cudaMemcpyHostToDevice, st),
+                 "dspark dec slot weights")) return 0;
+    ds4_mmq_set_x_slot(NULL);
+    bool ok = ds4_mmq_mxfp4_moe_gate_up_mid_vec(g_dec.gate, g_dec.up, xin, g_dec.d_ids, g_dec.d_w,
+               mid_ptr, (int)F, (int)E, (int)rows, (int)g_dec.slots, 6, clamp, st) == 0 &&
+        ds4_mmq_mxfp4_moe_down_sum6_vec(g_dec.down, mid_ptr, g_dec.d_ids, out_ptr, (int)E,
+               (int)F, (int)rows, (int)g_dec.slots, 6, st) == 0;
+    if (remote) {   /* the output back to the drafter's card, finished before the drafter goes on */
+        ok = ok && cuda_ok(cudaMemcpyPeerAsync(out->ptr, g_gpu[caller].device_id, g_dec.out, g_gpu[g_dec.tier].device_id,
+                                               (size_t)rows * E * sizeof(float), st), "dspark dec out") &&
+            cuda_ok(cudaStreamSynchronize(st), "dspark dec done");
+        if (ds4_gpu_set_current_device(caller) != 0) ok = false;
+    }
+    return ok;
+}
+
+/* DT9: ds4_gpu_attention_decode_rows_rope_tensor's attention without its V4 inverse rope (V4.1 ropes its heads
+ * itself): the multi-session exact score split, rows described by their own window and compressed rows */
+extern "C" int ds4_gpu_attention_decode_rows_tensor(
+        ds4_gpu_tensor                       *heads,
+        const void                           *model_map,
+        uint64_t                              model_size,
+        uint64_t                              sinks_offset,
+        const ds4_gpu_tensor                 *q,
+        const ds4_gpu_attention_decode_row   *rows,
+        uint32_t                              n_rows,
+        uint32_t                              n_head,
+        uint32_t                              head_dim) {
+    if (!heads || !q || !rows || !model_map || n_rows < 2u ||
+        n_rows > DS4_GPU_ATTENTION_DECODE_BATCH_MAX || n_head == 0u ||
+        head_dim != 512u || sinks_offset > model_size ||
+        (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
+        heads->bytes < (uint64_t)n_rows * n_head * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_rows * n_head * head_dim * sizeof(float)) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(heads);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus ||
+        ds4_tensor_device_idx(q) != logical_tier) {
+        return 0;
+    }
+
+    /* This first grouped path mirrors the promoted default decode exactly.
+     * Alternative score kernels and graph/split-KV experiments retain the
+     * one-session dispatcher until they gain equivalent row-table variants. */
+    if (cuda_env_flag_enabled("DS4_CUDA_NO_EXACT_SCORE_SPLIT_DECODE", 0) ||
+        !cuda_env_flag_enabled("DS4_CUDA_EXACT_SCORE_SPLIT_DECODE", 1) ||
+        cuda_splitkv_decode_requested() ||
+        g_cuda_decode_heads8_online || g_cuda_decode_score4 ||
+        g_cuda_decode_score8 || g_cuda_no_decode_value512 ||
+        g_cuda_exact_score_split_graph || g_cuda_exact_score_split_ldg ||
+        g_cuda_exact_score_split_vec4 ||
+        g_cuda_exact_score_split_vec4_plain ||
+        g_cuda_exact_score_split_dim2 ||
+        g_cuda_exact_score_split_fuse_inv_rope ||
+        getenv("DS4_CUDA_NO_SCORE_TILE") != NULL ||
+        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_MIN_SCORE") != NULL ||
+        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_CHUNK") != NULL ||
+        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_S_FLOOR") != NULL ||
+        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_S_MAX") != NULL ||
+        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_S") != NULL) {
+        return 0;
+    }
+
+    cuda_attention_decode_row_table table;
+    memset(&table, 0, sizeof(table));
+    uint32_t max_dense_score = 0u;
+    bool have_dense = false;
+    bool have_indexed = false;
+    for (uint32_t i = 0; i < n_rows; i++) {
+        const ds4_gpu_attention_decode_row r = rows[i];
+        if (r.raw_kv == 0u || r.n_raw == 0u || r.raw_cap < r.n_raw ||
+            r.raw_start >= r.raw_cap || (r.n_comp != 0u && r.comp_kv == 0u)) {
+            return 0;
+        }
+        if (r.indexed) {
+            if (r.comp_kv == 0u || r.topk == 0u || r.n_comp == 0u ||
+                r.top_k == 0u || r.top_k > 512u || r.ratio == 0u) {
+                return 0;
+            }
+            have_indexed = true;
+        } else {
+            const uint32_t raw_count = r.n_raw > 256u ? 256u : r.n_raw;
+            const uint32_t n_score = raw_count + r.n_comp;
+            /* n_score==1 takes the legacy one-block kernel and is not a
+             * score-split shape. Decode after any nonempty prompt is >1. */
+            if (n_score <= 1u || n_score > DS4_CUDA_ATTENTION_SCORE_CAP) {
+                return 0;
+            }
+            if (n_score > max_dense_score) max_dense_score = n_score;
+            have_dense = true;
+        }
+        table.row[i] = r;
+    }
+
+    const float *sinks = (const float *)cuda_resolve_weight_ptr(
+        model_map, sinks_offset, (uint64_t)n_head * sizeof(float),
+        logical_tier, "attn_sinks_rows");
+    if (!sinks) return 0;
+
+    if (have_dense) {
+        if ((uint64_t)n_rows > UINT64_MAX / n_head ||
+            (uint64_t)n_rows * n_head > UINT64_MAX / max_dense_score) {
+            return 0;
+        }
+        const uint64_t score_count =
+            (uint64_t)n_rows * n_head * max_dense_score;
+        float *scores = (float *)cuda_tmp_alloc_on(
+            logical_tier, score_count * sizeof(float),
+            "attention exact decode rows");
+        if (!scores) return 0;
+
+        const size_t tile_shmem =
+            (size_t)(DS4_SCORE_TILE_HEADS + DS4_SCORE_TILE_ROWS) *
+            DS4_SCORE_TILE_STRIDE * sizeof(float);
+        static int tile_shmem_ready[DS4_MAX_GPUS] = {0};
+        int physical_device = 0;
+        if (cudaGetDevice(&physical_device) != cudaSuccess ||
+            physical_device < 0 || physical_device >= DS4_MAX_GPUS) {
+            return 0;
+        }
+        if (!tile_shmem_ready[physical_device]) {
+            if (!cuda_ok(cudaFuncSetAttribute(
+                    attention_decode_score_split_scores_tile512_rows_kernel,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    (int)tile_shmem),
+                    "attention score rows shared-memory opt-in")) {
+                return 0;
+            }
+            tile_shmem_ready[physical_device] = 1;
+        }
+        dim3 score_grid(
+            (max_dense_score + DS4_SCORE_TILE_ROWS - 1u) /
+                DS4_SCORE_TILE_ROWS,
+            (n_head + DS4_SCORE_TILE_HEADS - 1u) /
+                DS4_SCORE_TILE_HEADS,
+            n_rows);
+        attention_decode_score_split_scores_tile512_rows_kernel
+            <<<score_grid, 256, tile_shmem>>>(
+                scores, (const float *)q->ptr, table, n_rows,
+                max_dense_score, n_head, head_dim);
+        if (!cuda_ok(cudaGetLastError(),
+                     "attention exact score rows launch")) {
+            return 0;
+        }
+        dim3 final_grid(n_rows, n_head, 1u);
+        attention_decode_score_split_finalize_rows_kernel
+            <<<final_grid, 512>>>(
+                (float *)heads->ptr, sinks, scores, table, n_rows,
+                max_dense_score, n_head, head_dim);
+        if (!cuda_ok(cudaGetLastError(),
+                     "attention exact finalize rows launch")) {
+            return 0;
+        }
+    }
+    if (have_indexed) {
+        dim3 indexed_grid(n_rows, n_head, 1u);
+        attention_indexed_mixed_decode_rows_kernel<<<indexed_grid, 256>>>(
+            (float *)heads->ptr, sinks, (const float *)q->ptr, table,
+            n_rows, n_head, head_dim);
+        if (!cuda_ok(cudaGetLastError(),
+                     "attention indexed decode rows launch")) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+
+/* DT10: a check's rows. The F32 matvec of every row in one launch of the one-row kernel (grid.y = rows), the rows'
+ * sparse-KV gathers in one launch, and the rows' attention window. */
+extern "C" int ds4_gpu_matmul_f32_rows_exact_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                                    uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+                                                    const ds4_gpu_tensor *x, uint64_t rows) {
+    if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || rows == 0 || rows > 65535u) return 0;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
+    const uint64_t weight_elems = out_dim * in_dim;
+    if (weight_elems > UINT64_MAX / sizeof(float)) return 0;
+    const uint64_t weight_bytes = weight_elems * sizeof(float);
+    if (weight_bytes > model_size - weight_offset) return 0;
+    if (x->bytes < rows * in_dim * sizeof(float) || out->bytes < rows * out_dim * sizeof(float)) return 0;
+    const int logical_tier = ds4_tensor_device_idx(out);
+    const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes, logical_tier, "f32");
+    if (!wptr) return 0;
+    const float *w = (const float *)wptr;
+    dim3 grid((unsigned)out_dim, (unsigned)rows, 1);
+    if (in_dim == 5120u && cuda_kfast()) {   /* the one-row K2 kernel */
+        matmul_f32_reg_kernel<20><<<grid, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, w, (const float *)x->ptr,
+                                                                          in_dim, out_dim, rows);
+        return cuda_ok(cudaGetLastError(), "matmul_f32 rows reg launch");
+    }
+    matmul_f32_kernel<<<grid, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim,
+                                                             out_dim, rows);
+    return cuda_ok(cudaGetLastError(), "matmul_f32 rows launch");
+}
+
+typedef struct { uint32_t source_rows[8], selected[8]; } ds4_gpu_dt10_rows;   /* as in ds4_gpu.h */
+
+__global__ static void dt10_gather_rows_kernel(float *out, const float *source, const int32_t *ids, uint32_t top,
+                                               ds4_gpu_dt10_rows r) {
+    const uint32_t row = blockIdx.y, j = blockIdx.x;
+    if (j >= r.selected[row]) return;
+    const int32_t id = ids[(uint64_t)row * top + j];
+    float *o = out + ((uint64_t)row * top + j) * 512u;
+    for (uint32_t col = threadIdx.x; col < 512u; col += blockDim.x)
+        o[col] = id >= 0 && (uint32_t)id < r.source_rows[row] ? source[(uint64_t)id * 512u + col] : NAN;
+}
+
+extern "C" int ds4_gpu_dsv41_gather_kv_rows(ds4_gpu_tensor *out, const ds4_gpu_tensor *source, const ds4_gpu_tensor *ids,
+                                            uint32_t top, const ds4_gpu_dt10_rows *r, uint32_t rows) {
+    uint32_t most = 0, src = 0;
+    if (!out || !source || !ids || !r || !rows || rows > 8u || !top || top > 512u) return 0;
+    for (uint32_t i = 0; i < rows; i++) {
+        if (r->selected[i] > top || r->selected[i] > r->source_rows[i]) return 0;
+        most = r->selected[i] > most ? r->selected[i] : most;
+        src = r->source_rows[i] > src ? r->source_rows[i] : src;
+    }
+    if (!most) return 1;
+    if (!dsv41_has_floats(source, (uint64_t)src * 512u) || !dsv41_has_floats(out, (uint64_t)rows * top * 512u) ||
+        !dsv41_has_floats(ids, (uint64_t)rows * top)) return 0;
+    dt10_gather_rows_kernel<<<dim3(most, rows, 1), 256, 0, cuda_decode_stream()>>>((float *)out->ptr,
+        (const float *)source->ptr, (const int32_t *)ids->ptr, top, *r);
+    return cuda_ok(cudaGetLastError(), "V4.1 sparse KV gather rows");
+}
+
+__global__ static void dt10_window_lin_kernel(float *lin, const float *ring, const float *kv, uint32_t first,
+                                              uint32_t n_old) {
+    const uint32_t r = blockIdx.x;
+    const float *src = r < n_old ? ring + (uint64_t)((first + r) % 128u) * 512u : kv + (uint64_t)(r - n_old) * 512u;
+    for (uint32_t c = threadIdx.x; c < 512u; c += blockDim.x) lin[(uint64_t)r * 512u + c] = src[c];
+}
+
+__global__ static void dt10_window_store_kernel(float *ring, const float *kv, uint32_t p) {
+    const uint32_t i = blockIdx.x;
+    for (uint32_t c = threadIdx.x; c < 512u; c += blockDim.x)
+        ring[(uint64_t)((p + i) % 128u) * 512u + c] = kv[(uint64_t)i * 512u + c];
+}
+
+/* lin: the positions first .. first + n_old - 1 from the 128-slot ring, then the rows' keys; then the keys stored in
+ * the ring at p .. p + rows - 1 (after the first kernel: the stores may overwrite slots it reads) */
+extern "C" int ds4_gpu_dsv41_rows_window(ds4_gpu_tensor *lin, ds4_gpu_tensor *ring, const ds4_gpu_tensor *kv,
+                                         uint32_t first, uint32_t n_old, uint32_t p, uint32_t rows) {
+    if (!lin || !ring || !kv || !rows || rows > 8u || n_old > 127u || !dsv41_has_floats(ring, 128u * 512u) ||
+        !dsv41_has_floats(kv, (uint64_t)rows * 512u) || !dsv41_has_floats(lin, (uint64_t)(n_old + rows) * 512u))
+        return 0;
+    dt10_window_lin_kernel<<<n_old + rows, 128, 0, cuda_decode_stream()>>>((float *)lin->ptr, (const float *)ring->ptr,
+                                                                           (const float *)kv->ptr, first, n_old);
+    if (!cuda_ok(cudaGetLastError(), "V4.1 rows window")) return 0;
+    dt10_window_store_kernel<<<rows, 128, 0, cuda_decode_stream()>>>((float *)ring->ptr, (const float *)kv->ptr, p);
+    return cuda_ok(cudaGetLastError(), "V4.1 rows window store");
 }

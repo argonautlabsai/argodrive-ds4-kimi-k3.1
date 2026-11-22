@@ -22,7 +22,15 @@ struct ds41_dspark {
     ds41_gpu_graph verified[DS41_VERIFY_ROWS + 1u];
     float *host_verified;
     uint32_t verify_start, verify_count, rewind_end;
+    int tier;   /* DT1: the card the drafter runs on with two cards (-1: one card) */
 };
+
+static int ds41_dspark_tier_of(const ds41_dspark *d) { return d ? d->tier : -1; }
+static bool ds41_dspark_target_layer(const ds41_dspark *d, uint32_t layer) {
+    for (unsigned stage = 0; d && stage < 3; stage++)
+        if (d->weights->target_layers[stage] == layer) return true;
+    return false;
+}
 
 static void ds41_dspark_reset(ds41_dspark *d) {
     if (!d) return;
@@ -74,18 +82,19 @@ static DS4_MAYBE_UNUSED ds41_dspark *ds41_dspark_alloc(const ds4_dspark_weights 
     ds41_dspark *d = calloc(1, sizeof(*d));
     if (!d) return NULL;
     d->weights = dw;
+    d->tier = -1;
     const ds41_gpu_graph shape = {.ctx = DS41_DRAFT_WINDOW}, *g = &shape;
 #define DS41_DRAFT_ALLOC(name, width) \
-    if (!(d->batch.name = ds4_gpu_tensor_alloc((uint64_t)(width) * DS41_DRAFT_ROWS * sizeof(float)))) goto fail;
+    if (!(d->batch.name = ds41_alloc((uint64_t)(width) * DS41_DRAFT_ROWS * sizeof(float)))) goto fail;
     DS41_PREFILL_ROWS(DS41_DRAFT_ALLOC)
 #undef DS41_DRAFT_ALLOC
     for (unsigned i = 0; i < 3; i++) {
-        d->target[i] = ds4_gpu_tensor_alloc((uint64_t)DS41_DRAFT_WINDOW * DS4_N_EMBD * 4u);
-        d->window[i] = ds4_gpu_tensor_alloc((uint64_t)(DS41_DRAFT_WINDOW + DS41_DRAFT_ROWS) * DS4_N_HEAD_DIM * 4u);
+        d->target[i] = ds41_alloc((uint64_t)DS41_DRAFT_WINDOW * DS4_N_EMBD * 4u);
+        d->window[i] = ds41_alloc((uint64_t)(DS41_DRAFT_WINDOW + DS41_DRAFT_ROWS) * DS4_N_HEAD_DIM * 4u);
         if (!d->target[i] || !d->window[i]) goto fail;
     }
 #define DS41_DRAFT_A(name, count) \
-    if (!(d->name = ds4_gpu_tensor_alloc((uint64_t)(count) * sizeof(float)))) goto fail;
+    if (!(d->name = ds41_alloc((uint64_t)(count) * sizeof(float)))) goto fail;
     DS41_DRAFT_A(mean_weights, DS41_DRAFT_WINDOW * DS4_N_HC)
     DS41_DRAFT_A(mean, DS41_DRAFT_WINDOW * DS4_N_EMBD)
     DS41_DRAFT_A(input, DS41_DRAFT_WINDOW * 3u * DS4_N_EMBD)
@@ -266,7 +275,20 @@ static bool ds41_dspark_stage(ds41_dspark *d, const ds4_model *m, uint32_t stage
         ds41_dspark_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, n, true))) {
         fprintf(stderr, "ds4: V4.1 draft shared expert failed\n"); return false;
     }
-    if (!ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    const bool on_demand = ds4_gpu_dspark_dec_on() != 0;   /* DT5 */
+#else
+    const bool on_demand = false;
+#endif
+    if (on_demand ?
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        !ds4_gpu_dspark_dec_moe(b->routed, b->mid, b->norm, b->selected, b->route_weights, m->map, m->size,
+            l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset, l->ffn_down_exps->abs_offset, stage, n, active,
+            experts, DS4_N_EMBD, DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP) :
+#else
+        true :
+#endif
+        !ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
             l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
             gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
@@ -362,6 +384,12 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *
         gates != 2)) return false;
     const uint64_t kv = DS4_N_HEAD_DIM * 4u, feature = DS4_N_EMBD * 4u;
     ds41_gpu_graph *graphs[DS41_VERIFY_ROWS];
+#ifdef DS41_SPLIT_BUILD
+    /* DT1: with TP2 the rows' dense work runs on the drafter's card, their routed experts on both cards */
+    if (g->tp2 && (d->tier < 0 || (g->tier != d->tier && !ds41_tier_enter(g, d->tier, 0)) ||
+                   ds4_gpu_set_current_device(d->tier) != 0)) return false;
+    const uint64_t moves = ds4_gpu_buffer_moves();
+#endif
     bool ok = ds4_gpu_begin_commands();
     d->verify_start = g->pos;
     d->verify_count = 0;
@@ -417,8 +445,22 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *
                     ds4_gpu_tensor_copy(row->verify_previous_score[owner], 0, g->previous_score[owner], 0, kv);
         }
     }
+#ifdef DS41_SPLIT_BUILD
+    if (ok && g->tp2 && ds41_tp2c_on()) {   /* DT8: both cards */
+        graphs[0]->dspark_verify_logits = d->verify_logits;
+        ok = ds41_tp2_check_batch(graphs, tokens, (int)count, m, w);
+    } else
+#endif
     if (ok) ok = ds41_graph_step_batch(graphs, tokens, (int)count, count, m, w);
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+#ifdef DS41_SPLIT_BUILD
+    if (g->tp2) {   /* DT1: a moved buffer would leave the TP2 decode graphs naming freed memory */
+        static int always = -1;
+        if (always < 0) { const char *e = getenv("DS4_DT_INVALIDATE"); always = e && !strcmp(e, "1"); }
+        if (always || ds4_gpu_buffer_moves() != moves) ds4_gpu_tp2_graphs_invalidate();
+        if (ds4_gpu_set_current_device(d->tier) != 0) ok = false;
+    }
+#endif
     if (tp_block && (!ok || !ds4_tp_batch_block_end(g_tp_block_ctx))) {
         ds4_tp_mark_failed(g_tp_block_ctx);
         ok = false;
@@ -458,6 +500,10 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_commit(ds41_dspark *d, ds41_gpu_graph *
     if (ok) ok = ds4_gpu_tensor_copy(g->residual, 0, last->residual, 0, DS4_N_HC * feature) &&
         ds4_gpu_tensor_copy(g->pre, 0, last->pre, 0, DS4_N_HC * 4u) &&
         ds4_gpu_tensor_copy(g->logits, 0, last->logits, 0, (uint64_t)DS4_N_VOCAB * 4u);
+#ifdef DS41_SPLIT_BUILD
+    /* DT1: the other card's copies of the checked rows' KV entries, kept or restored alike */
+    if (ok && g->tp2) ok = ds41_tp2_rows_mirror(g, d->verify_start, d->verify_count);
+#endif
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (ok) {
         g->pos = last->pos;
