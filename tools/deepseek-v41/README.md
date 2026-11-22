@@ -505,6 +505,76 @@ both cards as well (estimated at about zero: the exchanges cost what the split s
 Requests are served one at a time. Each card holds the dense weights of all 40 layers, so the two caches hold about
 6 % fewer experts than with the layers split. Prompts beyond about 6,000 tokens have not been run with `DS4_CUDA_TP2`.
 
+### The decode work of 21 November (night)
+
+Decode with both cards on every layer was 66 to 69 tok/s on the evening of 21 November. The changes below take it to
+72 to 78 tok/s and make the prompt pass 55 to 90 % faster. None of them changes the arithmetic: each value is still
+computed whole, on one card, in the one-card build's order, and each change can be turned off.
+
+- **Preloaded experts age by their rank.** The VRAM preload list gave every expert it loads the same age. With both
+  cards on every layer a prompt pass installs its experts a few at a time, and with all ages equal the evictions went
+  down the list from the top, the most requested experts first; decode then read them back from the drives (72 to
+  83 % of its drive reads after 512- and 1,556-token prompts were preloaded experts). With
+  `DS4_CUDA_SEED_RANK_AGE=N` a preloaded expert's age follows its line in the list, one step per `N` lines, so the
+  least requested go first.
+- **The head on both cards.** Each card computes half of the vocabulary rows of the output head, with the one-card
+  kernel on the same normed input, and the host reads both halves.
+- **The Engram projection on both cards.** On the two Engram layers each card computes half of the projection's
+  output rows, and a fifth exchange gives each card the other half before the layer starts.
+- **Five exact kernels.** The HC Sinkhorn split on 16 lanes of a warp instead of one thread, each row's and column's
+  sum gathered by shuffles and added in the original order; the HC input's weighted sum and norm on 8 blocks plus one
+  for the split, where the last block to arrive adds the 256 partial sums with the one-block kernel's tree; the
+  attention score tile with all its loads issued before its first store; the Engram gate on 256 threads per row and
+  stream, its chains run by one warp in the original order; and the indexer's top-k bitonic sort with the steps under
+  32 elements apart done in registers.
+- **Scheduling.** Both cards start installing, and so uploading, a layer's missing experts before either runs its MoE
+  kernels, and each layer's HC expand runs at the start of the next layer's first graph, one graph fewer per layer.
+
+| switch | effect |
+|---|---|
+| `DS4_CUDA_SEED_RANK_AGE=N` | preloaded experts age by their line in the VRAM list, one step per `N` lines (off by default; 40 below) |
+| `DS4_TP2_ENGRAM_SPLIT=1` | the Engram projection on both cards (off by default) |
+| `DS4_TP2_HEAD_SPLIT=0`, `DS4_TP2_MERGE=0` | the head on one card; the HC expand as a graph of its own |
+| `DS4_CUDA_K7=0`, `DS4_CUDA_K8=0`, `DS4_CUDA_K10=0`, `DS4_CUDA_K11=0`, `DS4_CUDA_K12=0` | the previous kernel for the Sinkhorn split, the HC input, the score tile, the Engram gate, the top-k |
+
+`N` sets how far apart the preloaded experts' ages lie: a card's 8,616 slots span 8,616 / `N` steps, and the clock
+moves 40 steps per token. Keep that span well under `DS4_CUDA_POOL_EVICT_BIAS` (counted in tokens, 50 here), the head
+start the RAM tier's experts get: `N` from 8 to 40 measured alike, and `N = 1` was slower.
+
+**Measured on 21 November 2026 (night)**, same method as above: `ds4-bench`, every run a fresh process with the
+caches and the 48 GiB RAM tier preloaded, in one session three runs of the new build with `DS4_TP2_ENGRAM_SPLIT=1
+DS4_CUDA_SEED_RANK_AGE=40` and two of the evening's build (one at 3,000 tokens). Every decode step of every run has
+the logits of the one-card reference, compared by hash, and so does the prompt pass's own last position at 512 tokens.
+
+| setup | 512 + 200: prefill tok/s | decode tok/s | 1,556 + 300: prefill tok/s | decode tok/s | 3,000 + 48: prefill tok/s | decode tok/s |
+|---|---|---|---|---|---|---|
+| both cards on every layer, 21 November evening | 231.8–238.9 | 65.5–66.6 | 391.4–394.0 | 68.2–68.8 | 546.4 | 66.9 |
+| with the night's decode work | **370.9–386.5** | **75.8–77.6** | **729.6–741.2** | **71.9–72.7** | **927.6–944.3** | **68.2–68.4** |
+
+The preloaded experts' ages give most of the decode gain after a 512-token prompt and all of the prompt pass's. The
+same build with and without them, two runs each (512 and 1,556 tokens in one session, 3,000 in another):
+
+| `DS4_CUDA_SEED_RANK_AGE` | 512 + 200: prefill tok/s | decode tok/s | 1,556 + 300: prefill tok/s | decode tok/s | 3,000 + 48: prefill tok/s | decode tok/s |
+|---|---|---|---|---|---|---|
+| off | 230.4–233.0 | 68.9–69.9 | 390.8–391.2 | 72.1–72.4 | 546.5–551.1 | 71.3–72.4 |
+| 8 | 366.9–393.2 | 76.1–77.9 | 736.5–739.1 | 72.1–72.3 | 937.5–942.8 | 68.7–69.0 |
+
+Through `ds4-server`, the four requests of about 6,000 tokens described above decode at 74.6–75.0 tok/s (the JSON
+extractions) and 56.9–57.9 (the commentaries) against 70.7–71.1 and 53.9–55.4 for the evening's build, and finish in
+10.5 to 11.7 s instead of 11.2 to 12.4 s, with the same answers. Their prompt passes gain little (first token after
+3.6 to 3.8 s against 3.7 to 4.1 s): the server's preload lists were made from requests like these, so a prompt pass
+finds most of its experts loaded and evicts few.
+
+**Limits.** After a 3,000-token prompt the preloaded experts' ages cost decode about 4 % (68.7–69.0 against
+71.3–72.4 tok/s) while the prompt pass is 70 % faster: a long prompt evicts more of the list, and decode needs some of
+what it evicted. That is why the switch is off by default.
+
+**Measured and left out.** Flags in device memory instead of events for the exchanges (3.5 to 3.9 µs against 4.4 µs
+per exchange: the PCIe round trip sets the cost either way); programmatic dependent launch inside the decode graphs
+(it runs, with no gain); reading ahead in decode two or three layers early, which would give a read the time it needs
+(routers run that early name only 11 to 29 % of the experts decode then reads from the drives); keeping the preloaded
+experts ahead of the prompt's own (decode reuses the prompt's experts, and 1,556-token runs got slower).
+
 ## What was measured and left out
 
 - A host-RAM tier filled on demand on CUDA, not from a list: no hit in 8,310 loads with a 24 GiB tier, because

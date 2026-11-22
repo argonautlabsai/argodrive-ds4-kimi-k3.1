@@ -182,7 +182,8 @@ RAID0 of three NVMe drives, fresh processes, three runs per row:
 | two cards, the caches and a 48 GiB host-RAM tier preloaded at start-up (18 November) | 144.8–149.0 | 47.7–47.8 | 219.0–220.2 | 49.1–49.2 |
 | the same with the exact decode kernels (21 November) | 141.7–154.6 | 54.8–56.0 | 230.0–236.7 | 58.1–58.4 |
 | the same with the later decode kernels and their scheduling (21 November, evening) | 145.6–147.3 | 58.7–58.8 | 232.2–232.5 | 62.1–62.4 |
-| both cards on every layer, `DS4_CUDA_TP2=1` (21 November, evening) | **234.4–243.3** | **66.6–67.1** | **386.7–395.9** | **68.1–68.6** |
+| both cards on every layer, `DS4_CUDA_TP2=1` (21 November, evening) | 234.4–243.3 | 66.6–67.1 | 386.7–395.9 | 68.1–68.6 |
+| the same with the decode work of the night (21 November, night) | **370.9–386.5** | **75.8–77.6** | **729.6–741.2** | **71.9–72.7** |
 
 The last row was measured in one session with runs of the previous kernels in between (`DS4_CUDA_KFAST=0`): prefill
 154.8–155.1 and 236.5–236.7 tok/s, decode 48.2–48.4 and 50.0–50.1 tok/s. The new kernels add about 16 % to decode; the
@@ -200,6 +201,16 @@ than with the layers split (the last two rows; two runs of the split, three of T
 6,000 tokens in a row finished in 11.3 to 12.5 s instead of 13.7 to 15.4 s. Every decode step, and the prompt pass's
 own last position, has the logits of the one-card build. How it stays exact, the switches and the limits:
 [two GPUs, both on every layer](tools/deepseek-v41/README.md#cuda-two-gpus-both-on-every-layer).
+
+**Decode up to 77.6 tok/s (21 November, night).** More exact work on the two-card decode takes it to 75.8–77.6 tok/s
+after a 512-token prompt and 71.9–72.7 after 1,556 tokens, against 65.5–66.6 and 68.2–68.8 for the evening's build
+in the same session (the last row; three runs of the new build, two of the evening's). The prompt pass is 55 to 90 %
+faster as well, mostly because of one change: a prompt pass now evicts the least requested of the preloaded experts
+first, where before it evicted the most requested and decode had to read them back from the drives. Through the
+server, the four 6,000-token requests decode at 74.6–75.0 tok/s (JSON) and 56.9–57.9 (commentary) against 70.7–71.1
+and 53.9–55.4. After a 3,000-token prompt decode gains only 2 % (68.2–68.4 against 66.9). Every decode step, and the
+prompt pass's own last position at 512 tokens, has the logits of the one-card build. What changed, the switches and
+the limits: [the decode work of 21 November](tools/deepseek-v41/README.md#the-decode-work-of-21-november-night).
 
 ### Architecture and validation
 
