@@ -13,7 +13,7 @@ This is a **source release**. Model weights, NVIDIA drivers, CUDA build tools (o
 - **Kimi K3.1 Pro:** [installation guide](https://argonautlabs.ai/guides/install-kimi-k31.html) · [CUDA and Metal configuration](tools/kimi-k3/README.md)
 - **DeepSeek V4.1 Flash 1017:** [setup, model file and streaming settings](tools/deepseek-v41/README.md) · [one-, two- and three-drive M5 Max results](#deepseek-v41-flash-on-the-same-macbook-pro-macos-metal)
 - **Kimi K3.1 Pro on two NVIDIA GPUs:** [results on two RTX PRO 6000](#kimi-k31-pro-on-two-rtx-pro-6000-linux-cuda) · [switches and what changed](tools/kimi-k3/README.md#two-cards-19-november-2026)
-- **DeepSeek V4.1 Flash 1017 on two NVIDIA GPUs:** [results on two RTX PRO 6000](#deepseek-v41-flash-on-two-rtx-pro-6000-linux-cuda) · [switches and preload lists](tools/deepseek-v41/README.md#cuda-two-gpus-the-layers-split-between-them) · [both cards on every layer](tools/deepseek-v41/README.md#cuda-two-gpus-both-on-every-layer)
+- **DeepSeek V4.1 Flash 1017 on two NVIDIA GPUs:** [results on two RTX PRO 6000](#deepseek-v41-flash-on-two-rtx-pro-6000-linux-cuda) · [switches and preload lists](tools/deepseek-v41/README.md#cuda-two-gpus-the-layers-split-between-them) · [both cards on every layer](tools/deepseek-v41/README.md#cuda-two-gpus-both-on-every-layer) · [the DSpark drafter, 111 tok/s on JSON](tools/deepseek-v41/README.md#the-dspark-drafter-on-both-cards-22-november)
 
 ### Measured results at a glance
 
@@ -169,6 +169,25 @@ two- and three-drive setup, memory sizing and the CUDA counterparts:
 [DeepSeek V4.1 Flash](tools/deepseek-v41/README.md).
 
 ### DeepSeek V4.1 Flash on two RTX PRO 6000 (Linux, CUDA)
+
+**111 tok/s on JSON answers with DeepSeek's own drafter (22 November).** With both cards on every layer and the DSpark
+drafter made from the checkpoint's `mtp.*` weights, a 6,051-token prompt is read at about 1,700 tok/s and its 600-token
+JSON answer is written at 111 tok/s, against 80 without the drafter. The drafter's checks compute every row with the
+arithmetic of one-token decode, so the answer is the same with or without it, logit for logit. `ds4-bench`, a fresh
+process per run, both rows in one session, a 55 GiB RAM tier:
+
+| setup | 6,051-token table, JSON answer: prefill tok/s | decode tok/s | 6,000-token novel: prefill tok/s | decode tok/s |
+|---|---|---|---|---|
+| two cards | 1,717–1,727 | 79.9–80.5 | 1,309–1,311 | 68.8–69.1 |
+| the same with the DSpark drafter | 1,688–1,701 | **111.2–111.9** | 1,288–1,297 | 65.0–66.4 |
+
+The table prompt is synthetic, and `tools/deepseek-v41/make_weather_prompt.py` rebuilds it exactly. On prose the drafter
+mostly pauses, and its memory costs about 5 % there. Through the server, 6,000-token JSON extraction decodes at 103.4
+tok/s against 76.4. The drafter, its switches and the limits:
+[the DSpark drafter on both cards](tools/deepseek-v41/README.md#the-dspark-drafter-on-both-cards-22-november) and
+[prompts of 6,000 tokens](tools/deepseek-v41/README.md#prompts-of-6000-tokens-22-november-afternoon); for readers:
+[DeepSeek V4.1 Flash at 111 tokens per second on two GPUs](https://argonautlabs.ai/research/deepseek-v41-two-gpus.html).
+The way there, 18 to 21 November:
 
 On CUDA the same model runs on two cards with its layers split between them (`DS4_CUDA_STREAM_SPLIT=1`): the first
 20 layers on one card, the other 20 on the second, each card with its own cache of routed experts and the rest
