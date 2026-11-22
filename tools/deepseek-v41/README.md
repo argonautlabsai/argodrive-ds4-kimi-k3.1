@@ -269,6 +269,8 @@ Never include a prompt you are going to measure.
 - `make_corpus.py`, `make_hotlist.py`, `make_cooc.py`: the ranking and the conditional table, as above.
 - `make_replica.py`: an experts-only sparse replica for a second or third drive, verified against the source.
 - `make_cuda_preload.py`: the two preload lists of the CUDA caches (VRAM and host RAM) from a ranking.
+- `make_weather_prompt.py`: the synthetic 6,000-token table prompt of the 22 November benchmark (seeded, so it rebuilds
+  the same text).
 - `make_decode_chart.py`: the decode chart at the top of this page, as one SVG for light and one for dark pages.
 - `route_cache_sim.py`: replays a recorded run (`DS4_ARGODRIVE_PREFILL_TOKENS_DUMP`, `DS4_MOE_RECORD_SELECTED_IDS`)
   through a model of the expert cache, to size a cache or compare eviction rules without running the engine. It
@@ -344,7 +346,9 @@ Three changes besides the split account for the speed:
 - **Caches loaded before the first prompt.** See below.
 
 **Preloading the caches.** `make_cuda_preload.py` turns a ranking into two lists: every ranked expert, the best of
-each layer first, for the VRAM caches, and the experts that follow each layer's first 220 for the RAM tier.
+each layer first, for the VRAM caches, and the experts that follow each layer's first 220 for the RAM tier. With the
+DSpark drafter loaded the VRAM caches hold about 202 experts per layer; `--vram-per-layer 202` then starts the RAM list
+where the VRAM caches stop.
 
 ```
 python3 tools/deepseek-v41/make_cuda_preload.py DeepSeek-V4.1-Flash-1017-MXFP4-experts.gguf \
@@ -634,6 +638,27 @@ Python code 53.0 and 56.2, an English essay 54.0 and 52.8, Italian prose 66.9 an
 **Limits.** The drafter's own memory, about 2.6 GiB on each card, comes out of the expert
 cache, so text that drafts poorly decodes 0 to 7 % slower; the 5 GiB reserve instead of 8 gives the cache that room
 back (at least 1.8 GB stayed free with a 25,000-token prompt). Requests are served one at a time.
+
+#### Prompts of 6,000 tokens (22 November, afternoon)
+
+A prompt of about 6,000 tokens reads at 1,300 to 1,700 tokens per second, and a JSON answer written with the drafter
+comes out at 111 tokens per second. `ds4-bench`, every run a fresh process, both rows in one session, with the settings
+of the server table above and a 55 GiB RAM tier (its list made with `--vram-per-layer 202`). Two prompts: the table
+prompt below with a 600-token JSON answer (two runs, three with the drafter), and the novel of the tables above at
+6,000 tokens with 300 generated (two runs each).
+
+| setup | 6,051-token table, JSON answer: prefill tok/s | decode tok/s | 6,000-token novel: prefill tok/s | decode tok/s |
+|---|---|---|---|---|
+| two cards | 1,717–1,727 | 79.9–80.5 | 1,309–1,311 | 68.8–69.1 |
+| the same with the DSpark drafter | 1,688–1,701 | **111.2–111.9** | 1,288–1,297 | 65.0–66.4 |
+
+The table prompt is synthetic and anyone can rebuild it: `python3 tools/deepseek-v41/make_weather_prompt.py 67
+weather.txt` writes 67 days of weather readings for three cities and asks for one city's rows as JSON, 6,051 tokens
+with the chat template. Run it with `--chat-prompt-file weather.txt --ctx-start 6051 --ctx-max 6051 --ctx-alloc 8192
+--gen-tokens 600`, plus `--dspark --mtp-model <DSpark file>` for the second row. With and without the drafter, every
+position of the answer had the same logits (`DS4_DS41_LOGITS_HASH=1` with `ds4`; `ds4-bench` prints no text in chat
+mode). One of the three drafter runs read its prompt at 839 tok/s with the same expert reads as the other two; the
+range above leaves it out. On the novel the drafter mostly pauses, and its memory costs about 5 % there.
 
 **Measured and left out.** A lower confidence threshold than the CUDA default of 0.7 (0.5, 0.3 and 0: more rows
 checked, more of them rejected, slower on prose); splitting each expert read into 3 or 6 parts over 16 threads (a read
