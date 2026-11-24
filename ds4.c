@@ -65343,6 +65343,7 @@ typedef struct k3_gpu_buffers {
     ds4_gpu_tensor *moe_latent, *routed, *routed_norm, *moe_up, *sh_gate, *sh_up, *sh_mid, *sh_down;
     ds4_gpu_tensor *dense_gate, *dense_up, *dense_mid;
     ds4_gpu_tensor *anchors;
+    ds4_gpu_tensor *tp_x, *tp_v, *tp_g;   /* K3-TP: the other card's layer input and results land here first */
     ds4_gpu_tensor **kda_conv, **kda_state, **key_cache, **value_cache;
     ds4_gpu_tensor **idx_cache, *dsa_q, *dsa_k, *dsa_w, *dsa_scores, *dsa_sel, *dsa_mask;   /* step 95 */
     uint32_t cache_cap;
@@ -65360,6 +65361,13 @@ static int g_k3_split_dev1 = -1;  /* the second card's CUDA device */
 static int g_k3_alloc_tier = 0;   /* the card k3_gpu_alloc_* use: a layer's, while that layer's own tensors are made */
 static inline int k3_tier(uint32_t il) { return g_k3_split_cut > 0 && (int)il >= g_k3_split_cut ? 1 : 0; }
 static inline k3_gpu_buffers *k3_b_of(k3_gpu_buffers *b, uint32_t il) { return k3_tier(il) && b->t1 ? b->t1 : b; }
+/* K3-TP (24 Nov 2026): two-card tensor parallelism for the spine (DS4_K3_TP=1, with the spine split). A KDA layer's v and
+   output-gate projections and an MLA layer's output gate live on the other card, which computes them from a copy of the
+   layer's normed rows while the layer's card computes its other projections; each projection is the call one card makes,
+   so the logits are the same bits, and no weight is held twice. */
+static int k3_tp_env(void) { static int v = -1; if (v < 0) { const char *e = getenv("DS4_K3_TP"); v = e && atoi(e) != 0; } return v; }
+static int g_k3_tp = 0;
+static k3_gpu_buffers *g_k3_tp_hb = NULL;   /* the other card's working tensors for the layer being run (decode) */
 static ds4_gpu_tensor *k3_gpu_alloc_bytes(uint64_t bytes) {
     return g_k3_split_cut > 0 ? ds4_gpu_tensor_alloc_ptr_on(g_k3_alloc_tier, bytes) : ds4_gpu_tensor_alloc(bytes);
 }
@@ -65784,6 +65792,17 @@ static void k3_sc_report(uint32_t il, const char *stage, const float *gpu, const
     fprintf(stderr, "ds4: K3 stage check layer %u %-22s rel err %.3e, max abs %.3e at %llu (gpu %.7g cpu %.7g)\n", il, stage,
             den > 0 ? sqrt(num / den) : sqrt(num), mx, (unsigned long long)at, gpu[at], cpu[at]);
 }
+/* K3-TP: the other card computes w0 (and w1) from a copy of the layer's normed row and pushes the results into d0 (d1) */
+static bool k3_tp_launch(const k3_gpu_buffers *b, const ds4_model *model, uint32_t il, const ds4_tensor *w0, const ds4_tensor *w1,
+                         ds4_gpu_tensor *d0, ds4_gpu_tensor *d1, uint32_t dim) {
+    k3_gpu_buffers *h = g_k3_tp_hb;
+    const int to = k3_tier(il), th = 1 - to;
+    if (!ds4_gpu_k3_tp_pull(h->tp_x, b->normed, (uint64_t)DS4_N_EMBD * sizeof(float))) return false;
+    if (ds4_gpu_set_current_device(th) != 0) return false;
+    bool ok = k3_gpu_matmul(h->tp_v, model, w0, h->tp_x) && ds4_gpu_k3_tp_push(d0, h->tp_v, (uint64_t)dim * sizeof(float)) != 0;
+    if (ok && w1) ok = k3_gpu_matmul(h->tp_g, model, w1, h->tp_x) && ds4_gpu_k3_tp_push(d1, h->tp_g, (uint64_t)dim * sizeof(float)) != 0;
+    return ds4_gpu_set_current_device(to) == 0 && ok;
+}
 static bool k3_gpu_layer_tier(k3_gpu_buffers *b, const ds4_model *model, const ds4_layer_weights *l, uint32_t il,
                               uint32_t pos, uint32_t *n_anchor) {
     const uint32_t n = DS4_N_EMBD;
@@ -65817,13 +65836,16 @@ static bool k3_gpu_layer_tier(k3_gpu_buffers *b, const ds4_model *model, const d
         sc_normed = g; free(ai); free(c);
     }
     if (ds4_k3_layer_is_kda(il)) {
+        const bool tp = g_k3_tp && g_k3_tp_hb;   /* K3-TP: v and the output gate on the other card meanwhile */
+        if (tp) K3_GPU_CHECK(k3_tp_launch(b, model, il, l->kda_v, l->kda_gate, b->kda_v, b->kda_ogate, proj), "K3-TP kda v + gate");
         K3_GPU_CHECK(k3_gpu_matmul(b->kda_q, model, l->kda_q, b->normed), "kda q");
         K3_GPU_CHECK(k3_gpu_matmul(b->kda_k, model, l->kda_k, b->normed), "kda k");
-        K3_GPU_CHECK(k3_gpu_matmul(b->kda_v, model, l->kda_v, b->normed), "kda v");
+        if (!tp) K3_GPU_CHECK(k3_gpu_matmul(b->kda_v, model, l->kda_v, b->normed), "kda v");
         K3_GPU_CHECK(k3_gpu_matmul(b->kda_f_a, model, l->kda_f_a, b->normed), "kda f_a");
         K3_GPU_CHECK(k3_gpu_matmul(b->kda_raw_gate, model, l->kda_f_b, b->kda_f_a), "kda f_b");
         K3_GPU_CHECK(k3_gpu_matmul(b->kda_beta, model, l->kda_beta, b->normed), "kda beta");
-        K3_GPU_CHECK(k3_gpu_matmul(b->kda_ogate, model, l->kda_gate, b->normed), "kda gate");
+        if (!tp) K3_GPU_CHECK(k3_gpu_matmul(b->kda_ogate, model, l->kda_gate, b->normed), "kda gate");
+        else K3_GPU_CHECK(ds4_gpu_k3_tp_join(k3_tier(il), 1 - k3_tier(il)) != 0, "K3-TP join");
         K3_GPU_CHECK(ds4_gpu_k3_kda_decode(b->kda_out, b->kda_conv[il], b->kda_state[il], b->kda_q, b->kda_k, b->kda_v,
                      b->kda_raw_gate, b->kda_beta, b->kda_ogate, model->map, model->size,
                      l->kda_q_conv->abs_offset, l->kda_k_conv->abs_offset, l->kda_v_conv->abs_offset,
@@ -65844,6 +65866,8 @@ static bool k3_gpu_layer_tier(k3_gpu_buffers *b, const ds4_model *model, const d
             free(st.conv_hist); free(st.state); free(c); free(g);
         }
     } else {
+        const bool tpm = g_k3_tp && g_k3_tp_hb;   /* K3-TP: the output gate on the other card meanwhile */
+        if (tpm) K3_GPU_CHECK(k3_tp_launch(b, model, il, l->attn_gate, NULL, b->gate, NULL, heads * vdim), "K3-TP mla gate");
         K3_GPU_CHECK(k3_gpu_matmul(b->q_a, model, l->attn_q_a, b->normed), "mla q_a");
         K3_GPU_CHECK(k3_gpu_rms_norm(b->q_an, b->q_a, model, l->attn_q_a_norm, DS4_N_LORA_Q), "mla q_a norm");
         K3_GPU_CHECK(k3_gpu_matmul(b->q, model, l->attn_q_b, b->q_an), "mla q_b");
@@ -65889,7 +65913,8 @@ static bool k3_gpu_layer_tier(k3_gpu_buffers *b, const ds4_model *model, const d
             k3_dsa_dump_one(dir, il, "heads", b->heads, (uint64_t)heads * vdim * 4u);
             fprintf(stderr, "ds4: K3 DSA: dumped layer %u at position %u to %s\n", il, pos, dir);
         }
-        K3_GPU_CHECK(k3_gpu_matmul(b->gate, model, l->attn_gate, b->normed), "mla gate");
+        if (tpm) K3_GPU_CHECK(ds4_gpu_k3_tp_join(k3_tier(il), 1 - k3_tier(il)) != 0, "K3-TP join (mla gate)");
+        else K3_GPU_CHECK(k3_gpu_matmul(b->gate, model, l->attn_gate, b->normed), "mla gate");
         K3_GPU_CHECK(ds4_gpu_k3_sigmoid_mul_tensor(b->gated, b->heads, b->gate, heads * vdim) != 0, "mla gate mul");
         K3_GPU_CHECK(k3_gpu_matmul(b->attn_out, model, l->attn_output, b->gated), "mla output");
     }
@@ -66014,7 +66039,9 @@ typedef struct k3_gpu_batch {
     ds4_gpu_tensor *kda_q, *kda_k, *kda_v, *kda_f_a, *kda_raw_gate, *kda_beta, *kda_ogate, *kda_out;
     ds4_gpu_tensor *router_logits, *moe_latent, *routed, *routed_norm, *moe_up, *sh_gate, *sh_up, *sh_mid, *sh_down;
     ds4_gpu_tensor *dense_gate, *dense_up, *dense_mid;
+    ds4_gpu_tensor *tp_x, *tp_v, *tp_g;   /* K3-TP: the other card's rows and results land here first (one element when off) */
 } k3_gpu_batch;
+static k3_gpu_batch *g_k3_tp_hbb = NULL;   /* K3-TP: the other card's batch tensors for the layer being run */
 static inline k3_gpu_batch *k3_bb_of(k3_gpu_batch *bb, uint32_t il) { return k3_tier(il) && bb->t1 ? bb->t1 : bb; }   /* step 146 */
 
 static ds4_gpu_tensor *k3_gpu_try_f32(uint64_t elems) { return k3_gpu_alloc_bytes(elems * sizeof(float)); }
@@ -66052,6 +66079,10 @@ static bool k3_gpu_batch_alloc_tier(k3_gpu_batch *bb, uint32_t T) {
     bb->sh_mid = k3_gpu_try_f32((uint64_t)T * sh); bb->sh_down = k3_gpu_try_f32((uint64_t)T * n);
     bb->dense_gate = k3_gpu_try_f32((uint64_t)T * DS4_N_FF_DENSE); bb->dense_up = k3_gpu_try_f32((uint64_t)T * DS4_N_FF_DENSE);
     bb->dense_mid = k3_gpu_try_f32((uint64_t)T * DS4_N_FF_DENSE);
+    {   /* K3-TP */
+        const uint64_t tr = k3_tp_env() && g_k3_split_cut > 0 ? T : 0u;
+        bb->tp_x = k3_gpu_try_f32(tr ? tr * n : 1u); bb->tp_v = k3_gpu_try_f32(tr ? tr * proj : 1u); bb->tp_g = k3_gpu_try_f32(tr ? tr * proj : 1u);
+    }
     {
         ds4_gpu_tensor **t = (ds4_gpu_tensor **)&bb->tokens;
         const size_t n_t = (sizeof(*bb) - offsetof(k3_gpu_batch, tokens)) / sizeof(ds4_gpu_tensor *);
@@ -66169,6 +66200,17 @@ static void k3_prefill_hint_next(k3_gpu_batch *bb, const ds4_model *model, const
     g_k3_pp_hints++; g_k3_pp_experts += m;
 }
 
+/* K3-TP: the same for a batch of rows */
+static bool k3_tp_launch_batch(const k3_gpu_batch *bb, const ds4_model *model, uint32_t il, uint32_t T, const ds4_tensor *w0,
+                               const ds4_tensor *w1, ds4_gpu_tensor *d0, ds4_gpu_tensor *d1, uint32_t dim) {
+    k3_gpu_batch *h = g_k3_tp_hbb;
+    const int to = k3_tier(il), th = 1 - to;
+    if (!ds4_gpu_k3_tp_pull(h->tp_x, bb->normed, (uint64_t)T * DS4_N_EMBD * sizeof(float))) return false;
+    if (ds4_gpu_set_current_device(th) != 0) return false;
+    bool ok = k3_gpu_matmul_n(h->tp_v, model, w0, h->tp_x, T) && ds4_gpu_k3_tp_push(d0, h->tp_v, (uint64_t)T * dim * sizeof(float)) != 0;
+    if (ok && w1) ok = k3_gpu_matmul_n(h->tp_g, model, w1, h->tp_x, T) && ds4_gpu_k3_tp_push(d1, h->tp_g, (uint64_t)T * dim * sizeof(float)) != 0;
+    return ds4_gpu_set_current_device(to) == 0 && ok;
+}
 static bool k3_gpu_layer_batch_tier(k3_gpu_buffers *b, k3_gpu_batch *bb, const ds4_model *model, const ds4_layer_weights *l,
                                     uint32_t il, uint32_t pos0, uint32_t *n_anchor, uint32_t ckpt_row, float **ck_conv, float **ck_state) {
     if (il == 1 && getenv("DS4_K3_TRACE_STAGE")) k3_trace_weights(l, il, "batched");
@@ -66199,13 +66241,17 @@ static bool k3_gpu_layer_batch_tier(k3_gpu_buffers *b, k3_gpu_batch *bb, const d
     K3_GPU_CHECK(k3_gpu_rms_norm_rows(bb->normed, bb->attn_in, model, l->attn_norm, n, T), "attn norm");
     if (g_k3_trace_on) k3_trace_acc("rms norm rows (attn)", k3_trace_mark(bb->normed) - tm0); }
     if (ds4_k3_layer_is_kda(il)) {
+        const bool tp = g_k3_tp && g_k3_tp_hbb;   /* K3-TP: v and the output gate on the other card meanwhile */
+        if (tp) K3_GPU_CHECK(k3_tp_launch_batch(bb, model, il, T, l->kda_v, l->kda_gate, bb->kda_v, bb->kda_ogate,
+                                                DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM), "K3-TP kda v + gate");
         K3_GPU_CHECK(k3_gpu_matmul_n(bb->kda_q, model, l->kda_q, bb->normed, T), "kda q");
         K3_GPU_CHECK(k3_gpu_matmul_n(bb->kda_k, model, l->kda_k, bb->normed, T), "kda k");
-        K3_GPU_CHECK(k3_gpu_matmul_n(bb->kda_v, model, l->kda_v, bb->normed, T), "kda v");
+        if (!tp) K3_GPU_CHECK(k3_gpu_matmul_n(bb->kda_v, model, l->kda_v, bb->normed, T), "kda v");
         K3_GPU_CHECK(k3_gpu_matmul_n(bb->kda_f_a, model, l->kda_f_a, bb->normed, T), "kda f_a");
         K3_GPU_CHECK(k3_gpu_matmul_n(bb->kda_raw_gate, model, l->kda_f_b, bb->kda_f_a, T), "kda f_b");
         K3_GPU_CHECK(k3_gpu_matmul_n(bb->kda_beta, model, l->kda_beta, bb->normed, T), "kda beta");
-        K3_GPU_CHECK(k3_gpu_matmul_n(bb->kda_ogate, model, l->kda_gate, bb->normed, T), "kda gate");
+        if (!tp) K3_GPU_CHECK(k3_gpu_matmul_n(bb->kda_ogate, model, l->kda_gate, bb->normed, T), "kda gate");
+        else K3_GPU_CHECK(ds4_gpu_k3_tp_join(k3_tier(il), 1 - k3_tier(il)) != 0, "K3-TP join");
         { const double tm0 = g_k3_trace_on ? k3_trace_mark(bb->kda_ogate) : 0.0;
         if (ckpt_row > 0u && ckpt_row < T && ck_conv && ck_state && ck_conv[il] && ck_state[il]) {
             /* step 56: the first ckpt_row rows, the states after them read out for the checkpoint, then the rest */
@@ -66245,6 +66291,8 @@ static bool k3_gpu_layer_batch_tier(k3_gpu_buffers *b, k3_gpu_batch *bb, const d
         if (g_k3_trace_on) k3_trace_acc("kda decode batch", k3_trace_mark(bb->kda_out) - tm0); }
         K3_GPU_CHECK(k3_gpu_matmul_n(bb->attn_out, model, l->kda_output, bb->kda_out, T), "kda output");
     } else {
+        const bool tpm = g_k3_tp && g_k3_tp_hbb;   /* K3-TP: the output gate on the other card meanwhile */
+        if (tpm) K3_GPU_CHECK(k3_tp_launch_batch(bb, model, il, T, l->attn_gate, NULL, bb->gate, NULL, heads * vdim), "K3-TP mla gate");
         K3_GPU_CHECK(k3_gpu_matmul_n(bb->q_a, model, l->attn_q_a, bb->normed, T), "mla q_a");
         K3_GPU_CHECK(k3_gpu_rms_norm_rows(bb->q_an, bb->q_a, model, l->attn_q_a_norm, DS4_N_LORA_Q, T), "mla q_a norm");
         K3_GPU_CHECK(k3_gpu_matmul_n(bb->q, model, l->attn_q_b, bb->q_an, T), "mla q_b");
@@ -66291,7 +66339,8 @@ static bool k3_gpu_layer_batch_tier(k3_gpu_buffers *b, k3_gpu_batch *bb, const d
         else K3_GPU_CHECK(ds4_gpu_k3_mla_attend_batch_tensor(bb->heads, bb->q, b->key_cache[il], b->value_cache[il], pos0, T,
                           heads, nope + rot, vdim) != 0, "mla attention");
         if (g_k3_trace_on) k3_trace_acc("mla attend batch", k3_trace_mark(bb->heads) - tm0); }
-        K3_GPU_CHECK(k3_gpu_matmul_n(bb->gate, model, l->attn_gate, bb->normed, T), "mla gate");
+        if (tpm) K3_GPU_CHECK(ds4_gpu_k3_tp_join(k3_tier(il), 1 - k3_tier(il)) != 0, "K3-TP join (mla gate)");
+        else K3_GPU_CHECK(k3_gpu_matmul_n(bb->gate, model, l->attn_gate, bb->normed, T), "mla gate");
         K3_GPU_CHECK(ds4_gpu_k3_sigmoid_mul_tensor(bb->gated, bb->heads, bb->gate, T * heads * vdim) != 0, "mla gate mul");
         K3_GPU_CHECK(k3_gpu_matmul_n(bb->attn_out, model, l->attn_output, bb->gated, T), "mla output");
     }
@@ -66441,6 +66490,7 @@ static bool k3_gpu_layer(k3_gpu_buffers *b, const ds4_model *model, const ds4_la
         return false;
     }
     const int tier = k3_tier(il);
+    g_k3_tp_hb = tier ? b : t1;   /* K3-TP */
     bool ok = k3_gpu_layer_tier(tier ? t1 : b, model, l, il, pos, n_anchor);
     if (tier && (!ok || il + 1u == DS4_N_LAYER))   /* back for the output head (after a failure: the card set back) */
         ok = k3_split_hop(b->cur, t1->cur, b->anchors, t1->anchors, row, (uint64_t)*n_anchor * row, 0) && ok;
@@ -66461,6 +66511,7 @@ static bool k3_gpu_layer_batch(k3_gpu_buffers *b, k3_gpu_batch *bb, const ds4_mo
             return false;
         }
     }
+    g_k3_tp_hbb = k3_tier(il) ? bb : t1;   /* K3-TP */
     if (!k3_tier(il)) return k3_gpu_layer_batch_tier(b, bb, model, l, il, pos0, n_anchor, ckpt_row, ck_conv, ck_state);
     /* a caller that keeps a layer's KDA inputs (the drafter) has put that layer's own tensors into bb: they live on this card */
     ds4_gpu_tensor **own[6] = { &t1->kda_q, &t1->kda_k, &t1->kda_v, &t1->kda_raw_gate, &t1->kda_beta, &t1->kda_ogate };
@@ -68601,6 +68652,13 @@ static int generate_k3_cuda_argmax(
             fprintf(stderr, "ds4: kimi-k3 spine split (step 146): layers 0-%d on the first card, %d-%u on the second; the residual stream crosses twice per forward\n",
                     g_k3_split_cut - 1, g_k3_split_cut, (unsigned)DS4_N_LAYER - 1u);
         }
+        g_k3_tp = k3_tp_env();   /* K3-TP */
+        if (g_k3_tp && !ds4_gpu_k3_tp_ready()) ds4_die("K3-TP (DS4_K3_TP=1) needs peer access between the two cards");
+        static bool said_tp = false;
+        if (g_k3_tp && !said_tp) {
+            said_tp = true;
+            fprintf(stderr, "ds4: K3-TP: each layer's KDA v and output gate (MLA: output gate) run on the other card, from a copy of the layer's normed rows\n");
+        }
     }
     {   /* step 106: fp32 activations in the spine and prompt-pass expert matmuls (DS4_K3_F32_ACT=0: the int8 / bf16 paths) */
         const char *fa = getenv("DS4_K3_F32_ACT");
@@ -68775,6 +68833,7 @@ static int generate_k3_cuda_argmax(
     b.sh_gate = k3_gpu_alloc_f32(sh); b.sh_up = k3_gpu_alloc_f32(sh); b.sh_mid = k3_gpu_alloc_f32(sh); b.sh_down = k3_gpu_alloc_f32(n);
     b.dense_gate = k3_gpu_alloc_f32(DS4_N_FF_DENSE); b.dense_up = k3_gpu_alloc_f32(DS4_N_FF_DENSE); b.dense_mid = k3_gpu_alloc_f32(DS4_N_FF_DENSE);
     b.anchors = k3_gpu_alloc_f32((uint64_t)16 * n);
+    b.tp_x = k3_gpu_alloc_f32(n); b.tp_v = k3_gpu_alloc_f32(proj); b.tp_g = k3_gpu_alloc_f32(proj);   /* K3-TP */
     b.kda_conv = xcalloc(L, sizeof(*b.kda_conv)); b.kda_state = xcalloc(L, sizeof(*b.kda_state));
     b.key_cache = xcalloc(L, sizeof(*b.key_cache)); b.value_cache = xcalloc(L, sizeof(*b.value_cache));
     g_k3_lat_cap = cache_cap;   /* step 96b */
@@ -79861,6 +79920,15 @@ static int engine_install_per_device_caches(ds4_engine *e) {
             (t == e->model.ngram_tensor || engine_stream_split_routed_tensor(e, t, entry))) continue;   /* S3: streamed */
         int logical_tier = e->placement[entry];
         if (logical_tier == DS4_LAYER_PACK_CPU) continue;        /* CPU spill: skip here. */
+        if (ds4_model_is_kimi_k3() && k3_tp_env() && engine_stream_split_cut(e, &e->gpu_cfg) > 0 &&
+            entry >= 1 && entry <= (int)DS4_N_LAYER && logical_tier >= 0 && logical_tier < 2) {   /* K3-TP: on the other card */
+            const ds4_layer_weights *lw = &e->weights.layer[entry - 1];
+            if (t == lw->kda_v || t == lw->kda_gate || t == lw->attn_gate) {
+                static bool said = false;
+                if (!said) { said = true; fprintf(stderr, "ds4: K3-TP: KDA v / output gate and MLA output gate placed on the other card\n"); }
+                logical_tier = 1 - logical_tier;
+            }
+        }
         if (logical_tier < 0 || logical_tier >= e->gpu_cfg.n_gpus) {
             fprintf(stderr,
                     "ds4: placement tier %d out of range for tensor %.*s\n",

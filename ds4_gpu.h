@@ -4040,6 +4040,11 @@ int ds4_gpu_k3_residual_mix_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
 int ds4_gpu_k3_situ_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up,
                            uint32_t n, float beta, float beta_linear);
 int ds4_gpu_k3_sigmoid_mul_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const ds4_gpu_tensor *gate, uint32_t n);
+/* K3-TP (24 Nov 2026): two-card tensor parallelism for Kimi's spine (ds4_cuda.cu) */
+int ds4_gpu_k3_tp_ready(void);
+int ds4_gpu_k3_tp_pull(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t bytes);
+int ds4_gpu_k3_tp_push(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t bytes);
+int ds4_gpu_k3_tp_join(int o_tier, int h_tier);
 int ds4_gpu_k3_split_kvb_tensor(ds4_gpu_tensor *k_nope, ds4_gpu_tensor *value, const ds4_gpu_tensor *kvb,
                                 uint32_t heads, uint32_t nope, uint32_t vdim);
 int ds4_gpu_k3_mla_store_tensor(ds4_gpu_tensor *key_cache, ds4_gpu_tensor *value_cache, const ds4_gpu_tensor *k_nope,

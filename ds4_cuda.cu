@@ -5103,6 +5103,27 @@ extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
     return ds4_gpu_tensor_copy_xdev_impl(dst, src, bytes, false);
 }
 
+/* K3-SMCOPY (24 Nov 2026): small copies between the cards as SM stores through the peer mapping (DS4_K3_SMCOPY=1) */
+static int k3_smcopy_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DS4_K3_SMCOPY"); v = e && atoi(e) != 0; } return v; }
+__global__ static void k3_smcopy4_kernel(float4 *dst, const float4 *src, uint64_t n4) {
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (uint64_t)gridDim.x * blockDim.x) dst[i] = src[i];
+    __threadfence_system();
+}
+__global__ static void k3_smcopy1_kernel(uint32_t *dst, const uint32_t *src, uint64_t n) {
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (uint64_t)gridDim.x * blockDim.x) dst[i] = src[i];
+    __threadfence_system();
+}
+static int k3_smcopy_launch(void *dst, const void *src, uint64_t bytes, cudaStream_t st) {   /* on the current device */
+    if (bytes % 4u) return 0;
+    const bool v4 = bytes % 16u == 0u && (uintptr_t)dst % 16u == 0u && (uintptr_t)src % 16u == 0u;
+    const uint64_t n = v4 ? bytes / 16u : bytes / 4u;
+    unsigned grid = (unsigned)((n + 255u) / 256u);
+    if (grid > 1024u) grid = 1024u;
+    if (grid == 0u) grid = 1u;
+    if (v4) k3_smcopy4_kernel<<<grid, 256, 0, st>>>((float4 *)dst, (const float4 *)src, n);
+    else k3_smcopy1_kernel<<<grid, 256, 0, st>>>((uint32_t *)dst, (const uint32_t *)src, n);
+    return cudaGetLastError() == cudaSuccess;
+}
 static int ds4_gpu_tensor_copy_xdev_default_impl(ds4_gpu_tensor *dst,
                                                   const ds4_gpu_tensor *src,
                                                   uint64_t bytes) {
@@ -5126,7 +5147,8 @@ static int ds4_gpu_tensor_copy_xdev_default_impl(ds4_gpu_tensor *dst,
     if (peer) {
         int ok = 0;
         WITH_DEVICE(g_gpu[sd].device_id) {
-            ok = cuda_ok(cudaMemcpyPeerAsync(
+            ok = (k3_smcopy_on() && bytes <= (1ull << 20) && bytes % 4u == 0u) ? k3_smcopy_launch(dst->ptr, src->ptr, bytes, 0)   /* K3-SMCOPY */
+               : cuda_ok(cudaMemcpyPeerAsync(
                              dst->ptr, g_gpu[dd].device_id,
                              src->ptr, g_gpu[sd].device_id,
                              (size_t)bytes, 0),
@@ -5175,6 +5197,81 @@ extern "C" int ds4_gpu_tensor_copy_xdev_default(ds4_gpu_tensor *dst,
                                                  const ds4_gpu_tensor *src,
                                                  uint64_t bytes) {
     return ds4_gpu_tensor_copy_xdev_default_impl(dst, src, bytes);
+}
+
+/* K3-TP (24 Nov 2026): Kimi's two-card tensor parallelism. A layer's card (O) hands the layer's normed rows to the other
+   card (H), which computes whole projections with the same kernels and pushes the results back while O computes its own;
+   O waits for them only where it uses them. pull: H's default stream waits for O's work so far, then copies src (on O)
+   into dst (on H). push: H copies src (on H) into dst (on O) on its default stream. join: O's default stream waits for
+   H's pushes. They need peer access both ways (ds4_gpu_k3_tp_ready). */
+static cudaEvent_t g_k3tp_pull_ev[DS4_MAX_GPUS], g_k3tp_push_ev[DS4_MAX_GPUS];
+/* K3-TP 1b: the copies run on the helper card's SMs through the peer mapping (the copy engines carry the expert uploads,
+   behind which a small peer copy can wait for hundreds of microseconds); DS4_K3_TP_XFER=ce: cudaMemcpyPeerAsync */
+static int k3tp_sm(void) { static int v = -1; if (v < 0) { const char *e = getenv("DS4_K3_TP_XFER"); v = !(e && !strcmp(e, "ce")); } return v; }
+__global__ static void k3_tp_copy4_kernel(float4 *dst, const float4 *src, uint64_t n4) {
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (uint64_t)gridDim.x * blockDim.x) dst[i] = src[i];
+    __threadfence_system();
+}
+__global__ static void k3_tp_copy1_kernel(float *dst, const float *src, uint64_t n) {
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (uint64_t)gridDim.x * blockDim.x) dst[i] = src[i];
+    __threadfence_system();
+}
+static int k3tp_copy_sm(void *dst, const void *src, uint64_t bytes) {   /* on the current device's default stream */
+    const bool v4 = bytes % 16u == 0u && (uintptr_t)dst % 16u == 0u && (uintptr_t)src % 16u == 0u;
+    const uint64_t n = v4 ? bytes / 16u : bytes / 4u;
+    unsigned grid = (unsigned)((n + 255u) / 256u);
+    if (grid > 1024u) grid = 1024u;
+    if (grid == 0u) grid = 1u;
+    if (v4) k3_tp_copy4_kernel<<<grid, 256, 0, 0>>>((float4 *)dst, (const float4 *)src, n);
+    else k3_tp_copy1_kernel<<<grid, 256, 0, 0>>>((float *)dst, (const float *)src, n);
+    return cuda_ok(cudaGetLastError(), "K3-TP copy kernel");
+}
+static cudaEvent_t k3tp_event(cudaEvent_t *slot, int tier) {
+    if (!slot[tier]) {
+        WITH_DEVICE(g_gpu[tier].device_id) {
+            if (cudaEventCreateWithFlags(&slot[tier], cudaEventDisableTiming) != cudaSuccess) { (void)cudaGetLastError(); slot[tier] = nullptr; }
+        }
+    }
+    return slot[tier];
+}
+extern "C" int ds4_gpu_k3_tp_ready(void) {
+    return g_n_gpus == 2 && g_gpu_peer_ok[0][1] && g_gpu_peer_ok[1][0];
+}
+extern "C" int ds4_gpu_k3_tp_pull(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t bytes) {
+    if (!dst || !src || bytes > dst->bytes || bytes > src->bytes) return 0;
+    const int o = ds4_tensor_device_idx(src), h = ds4_tensor_device_idx(dst);
+    if (o < 0 || h < 0 || o >= g_n_gpus || h >= g_n_gpus || o == h || !g_gpu_peer_ok[h][o]) return 0;
+    const cudaEvent_t ev = k3tp_event(g_k3tp_pull_ev, o);
+    if (!ev) return 0;
+    int ok = 0;
+    WITH_DEVICE(g_gpu[o].device_id) { ok = cuda_ok(cudaEventRecord(ev, 0), "K3-TP pull record"); }
+    if (!ok) return 0;
+    WITH_DEVICE(g_gpu[h].device_id) {
+        ok = cuda_ok(cudaStreamWaitEvent(0, ev, 0), "K3-TP pull wait") &&
+             (k3tp_sm() ? k3tp_copy_sm(dst->ptr, src->ptr, bytes)
+                        : cuda_ok(cudaMemcpyPeerAsync(dst->ptr, g_gpu[h].device_id, src->ptr, g_gpu[o].device_id, (size_t)bytes, 0), "K3-TP pull copy"));
+    }
+    return ok;
+}
+extern "C" int ds4_gpu_k3_tp_push(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t bytes) {
+    if (!dst || !src || bytes > dst->bytes || bytes > src->bytes) return 0;
+    const int h = ds4_tensor_device_idx(src), o = ds4_tensor_device_idx(dst);
+    if (o < 0 || h < 0 || o >= g_n_gpus || h >= g_n_gpus || o == h || !g_gpu_peer_ok[h][o]) return 0;
+    const cudaEvent_t ev = k3tp_event(g_k3tp_push_ev, h);
+    if (!ev) return 0;
+    int ok = 0;
+    WITH_DEVICE(g_gpu[h].device_id) {
+        ok = (k3tp_sm() ? k3tp_copy_sm(dst->ptr, src->ptr, bytes)
+                        : cuda_ok(cudaMemcpyPeerAsync(dst->ptr, g_gpu[o].device_id, src->ptr, g_gpu[h].device_id, (size_t)bytes, 0), "K3-TP push copy")) &&
+             cuda_ok(cudaEventRecord(ev, 0), "K3-TP push record");
+    }
+    return ok;
+}
+extern "C" int ds4_gpu_k3_tp_join(int o_tier, int h_tier) {
+    if (o_tier < 0 || h_tier < 0 || o_tier >= g_n_gpus || h_tier >= g_n_gpus || o_tier == h_tier || !g_k3tp_push_ev[h_tier]) return 0;
+    int ok = 0;
+    WITH_DEVICE(g_gpu[o_tier].device_id) { ok = cuda_ok(cudaStreamWaitEvent(0, g_k3tp_push_ev[h_tier], 0), "K3-TP join"); }
+    return ok;
 }
 
 extern "C" int ds4_gpu_tensor_copy_xdev3_default_dst(
@@ -44070,11 +44167,13 @@ static int k3_moe_raw_batch_impl(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, c
     uint8_t g1_is[4096];
     if (g1_inplace) memset(g1_is, 0, g1_n_rows);
     auto g1_prep = [&]() -> bool {   /* the input row and the lists, to the second card; its partial rows cleared */
-        bool ok = cudaMemcpyAsync(p.g1_hx, x->ptr, (size_t)n_tok * latent * sizeof(float), cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
+        const bool smx = k3_smcopy_on();   /* K3-SMCOPY: the second card reads the row from the first, no host bounce */
+        bool ok = (smx || cudaMemcpyAsync(p.g1_hx, x->ptr, (size_t)n_tok * latent * sizeof(float), cudaMemcpyDeviceToHost, stream) == cudaSuccess) &&
                   cudaEventRecord(p.g1_ev_x, stream) == cudaSuccess &&
                   cudaSetDevice(p.g1_dev) == cudaSuccess &&
                   cudaStreamWaitEvent(p.g1_stream, p.g1_ev_x, 0) == cudaSuccess &&
-                  cudaMemcpyAsync(p.g1_x, p.g1_hx, (size_t)n_tok * latent * sizeof(float), cudaMemcpyHostToDevice, p.g1_stream) == cudaSuccess &&
+                  (smx ? k3_smcopy_launch(p.g1_x, x->ptr, (uint64_t)n_tok * latent * sizeof(float), p.g1_stream) != 0
+                       : cudaMemcpyAsync(p.g1_x, p.g1_hx, (size_t)n_tok * latent * sizeof(float), cudaMemcpyHostToDevice, p.g1_stream) == cudaSuccess) &&
                   cudaMemcpyAsync(p.g1_tok, p.host_tok, sizeof(uint32_t) * n_list, cudaMemcpyHostToDevice, p.g1_stream) == cudaSuccess &&
                   cudaMemcpyAsync(p.g1_tw, p.host_tw, sizeof(float) * n_list, cudaMemcpyHostToDevice, p.g1_stream) == cudaSuccess &&
                   cudaEventRecord(p.g1_ev_in, p.g1_stream) == cudaSuccess &&
