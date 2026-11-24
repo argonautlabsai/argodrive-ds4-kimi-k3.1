@@ -227,6 +227,12 @@ earlier runs, which is not part of this repository.
 | `DS4_K3_GPU1`, `DS4_K3_GPU1_SLABS`, `DS4_K3_GPU1_RESERVE_MB`, `DS4_K3_GPU1_MODE` | unset, all that fits, 2048, in place | without the split: a second card (its CUDA device number) as an expert cache only; experts cached there are computed there. `_MODE=copy` copies each slab to the first card instead |
 | `DS4_K3_VERIFY_RANK`, `DS4_K3_VERIFY_PF_SCALE` | unset, 0 | drafter blocks keep their most used experts per layer, as many as the caches hold, and both caches evict by use count instead of age; `_PF_SCALE=8` lets a block read ahead one plain step's quota per 8 rows. Off by default; the two-card drafter numbers use `1` and `8` |
 | `DS4_K3_CACHE_POLICY`, `DS4_K3_CACHE_DECAY` | unset, 0.9 | `decay-device`: the device cache evicts by a decayed use count instead of age (the host pool keeps its order). For plain decode; the two-card plain numbers use it with 0.95 |
+| `DS4_K3_TP`, `DS4_K3_TP_XFER` | unset, kernels | with the split: both cards on every layer, a KDA layer's v and output gate and an MLA layer's output gate computed on the other card ([24 November](#copy-drafts-images-and-both-cards-on-every-layer-24-november-2026)); `_XFER=ce` hands the rows over by peer copies instead of copy kernels |
+| `DS4_K3_SMCOPY` | unset | with the split: copies of at most 1 MB between the cards run as kernels, and the second card reads its expert input from the first directly |
+| `DS4_K3_COPY` | unset | `1`: drafts copied from the context wherever no draft model runs (plain decode, image prompts); `both`: beside the Qwen drafter as well; `shadow`: scored, never used. `DS4_K3_COPY_ROWS` (up to `DS4_K3_QWEN_ROWS`), `_MARGIN`, `_FALLBACK`, `_COST`, `_TRACE` tune and trace the rule |
+| `DS4_K3_CKPT_DIR`, `DS4_K3_CKPT_DISK_GB` | unset, 16 | saved prompt prefixes are also written to this directory (owner-only files) and restored by later processes; least recently used out first |
+| `DS4_K31_VISION`, `DS4_K31_IMAGE_CACHE_MB` | unset, 512 | images: the directory with the vision tower's safetensors, and the memory kept for encoded images |
+| `DS4_K31_PILLOW`, `DS4_K31_IMAGE_COMPAT` | 13, unset | image preprocessing as Pillow 13 orders its resize passes (`12`: as Pillow 12); `vllm`: as vLLM's Kimi processor (RGB on load) |
 | `DS4_K3_READ_STATS` | unset | a file that gets, per expert, how many decode calls were served from VRAM, host RAM and a drive read, and the bytes each directory read for it (diagnostic) |
 | `DS4_K3_UPLOAD_STREAMS` | 8 | CUDA streams for slab uploads |
 | `DS4_K3_POOL_FIRST` | 1 | decode: the layer's experts already on the device or in the host pool are visited before the ones needing a disk read (+2 % measured; from the argodrive V4.1 fork) |
@@ -572,6 +578,85 @@ Limits. The host pool is page-locked, and the spine is read through the page cac
 for it. In our 80 GiB VM a 56 GiB pool is safe; a 60 GiB one, forced by lowering `DS4_K3_CACHE_RAM_RESERVE_MB`, stopped
 the VM while the spine loaded, so leave that reserve at its default. The DSpark drafter is not split. A fourth expert
 directory needs a checksum table now (above).
+
+### Copy drafts, images and both cards on every layer (24 November 2026)
+
+At commit 2c4d7fc: the same two cards in an 87 GiB VM with the 56 GiB expert pool, and the experts laid out again on the
+same four NVMe devices from per-expert read counts, measured on the 6-token and 1,512-token prompts below, a second short
+prompt and two chat prompts, the benchmark prompts weighted more (74,375 on the RAID0, 16,213 on the fourth drive, 8,156
+of those second copies). One fresh process per run, greedy, raw prompts unless noted.
+
+| setup | 512-token prompt: prefill tok/s | decode tok/s | 1,512-token prompt: prefill tok/s | decode tok/s | 6-token prompt: decode tok/s |
+|---|---|---|---|---|---|
+| one card | 15.8 | 2.73 | 40.0 | 2.45 | 2.39 |
+| two cards | 15.9 | 3.03 | 40.2 | 2.94 | 3.71 |
+| **with the Qwen drafter** | | | | | |
+| one card | 15.7 | 3.86 | 39.9 | 2.93 | 3.81 |
+| two cards | 15.8 | 4.45 | 39.0 | 3.53 | 5.51 |
+
+The same tests as on 19 November: 200 tokens after the 512-token prompt, 128 after the 1,512-token one, 512 after the
+6-token one; every cell has the logits of the one-card reference runs. The rows without the drafter now take drafts
+copied from the context (`DS4_K3_COPY=1 DS4_K3_QWEN_ROWS=16`), which keep only the tokens Kimi picks itself, so their
+answers are those of plain decoding. Two cards run with the layers split and both cards on every layer
+(`DS4_K3_TP=1 DS4_K3_SMCOPY=1`), plus `decay-device` without the drafter and rank admission with it, as on 19 November.
+Against 19 November, decode without the drafter is 17–71 % faster and prefill is unchanged within 2 %. With the drafter
+the cells are 0–3 % lower, on one card as on two: the fourth drive keeps fewer second copies now (8,156 against 35,974),
+as it also holds DeepSeek's files.
+
+| more tests on two cards | prefill tok/s | decode tok/s |
+|---|---|---|
+| 13,087-token prompt at a 16k cache, 48 generated | 116 | 2.05, with the drafter 2.22 |
+| a 53-token chat prompt, 256 generated, chat settings, drafter | – | 2.94 |
+
+A made-up A4 invoice sent as an image (1,240 × 1,753 pixels, 2,835 image tokens) through the chat endpoint, the answer
+as JSON: the header fields (87 tokens) took 90 s and every field with eight line items (469 tokens) 277 s.
+Each includes about 42 s of prompt pass for the image and up to 5 s in the vision tower; the rest is writing.
+
+What changed:
+
+- **Drafts copied from the context** (`DS4_K3_COPY=1`, off by default). When the last three tokens occurred earlier in
+  the prompt or the answer, what followed there becomes the draft of the next verification block, and the block keeps
+  only the tokens that equal Kimi's own choice. Copies run where no draft model does: plain decode, image prompts, a
+  drafter that failed to start. Beside the Qwen drafter they gained nothing in our tests (`DS4_K3_COPY=both` allows
+  it). A draft is as long as its expected saving says, learned from how often copies of each kind were right and from
+  the measured cost of a block; `tools/kimi-k3/copy_replay.c` replays the rule over recorded token streams without a GPU.
+- **Saved prompt prefixes on a drive** (`DS4_K3_CKPT_DIR=<directory>`). Every prefix the server keeps in host memory is
+  also written there, and a later process restores it instead of reading the prompt again. A file is used only by the
+  build, model file and settings that wrote it, and only if its size, tokens and checksum hold; otherwise it is removed.
+  `DS4_K3_CKPT_DISK_GB` (16) bounds the directory, least recently used out first. A 2,901-token system prompt: 803 MB
+  written in 0.36 s and read back after a restart in 0.31 s, with the same logits. The files hold the prompts' tokens,
+  so they are created readable by their owner only.
+- **Images.** The chat endpoint takes image parts (`image_url` with a `data:` URL; no URL is fetched), decodes and
+  preprocesses them as Moonshot's processor does, runs K3.1's vision tower (`DS4_K31_VISION=<directory with the tower's
+  safetensors>`; `tools/kimi-k3/k31_vision_extract.py` writes a file with just the tower) and puts its rows where the
+  image's tokens are. On two cards the tower runs on the first. The preprocessing gives the same bits as the Python
+  reference (`tools/kimi-k3/k31_vision_ref.py`) on 18 images in each of its modes: Moonshot's processor under Pillow 13
+  (the default) or Pillow 12 (`DS4_K31_PILLOW=12`), and vLLM's (`DS4_K31_IMAGE_COMPAT=vllm`). The prompt ids are those
+  of Moonshot's encoder. Encoded images are kept for reuse (`DS4_K31_IMAGE_CACHE_MB`, 512), and a saved prefix is
+  restored only with the same images in it. The Qwen drafter is off for image prompts, since it cannot see the image;
+  copy drafts run.
+- **Both cards on every layer** (`DS4_K3_TP=1` with the split, off by default). A KDA layer's v and output-gate
+  projections and an MLA layer's output gate are placed on the other card, which computes them from a copy of the
+  layer's normed rows while the layer's card computes its other projections. Each projection is the call one card
+  makes, so the logits are the same bits, and no weight is held twice. The rows go across by copy kernels, because the
+  copy engines carry the expert uploads and a small peer copy could wait behind them for hundreds of microseconds
+  (`DS4_K3_TP_XFER=ce` uses peer copies).
+- **Small copies between the cards by kernel** (`DS4_K3_SMCOPY=1`, off by default): copies of at most 1 MB run on the
+  source card's SMs, and the second card reads its expert input straight from the first instead of through host memory.
+
+Where the time goes. A token on two cards waits for expert reads about 80 % of its time without the drafter and about
+85 % with it. Both cards on every layer and the small copies took plain decode from 3.15–3.18 to 3.26–3.32 tok/s
+(256 tokens) and the drafter from 5.45–5.47 to 5.49–5.53 (512 tokens), in alternating runs on the same layout, and
+the chat and code prompts from 2.86–2.88 to 2.94–2.95 and from 2.68 to 2.74 tok/s: they shorten the rest, not the reads. A long prompt is read in passes of at most 8,192 rows, and each pass reads the experts
+its rows need again: the 13,087-token prompt's two passes read 1.41 and 1.38 TB.
+
+Tried and left out, exact but no faster end to end: a batched expert kernel (1.9 times faster on its own), a
+residual-mix kernel (three to nine times faster on its own), reads in pieces through Linux native AIO, an uneven layer
+cut.
+
+Limits. Both cards on every layer needs peer access between the cards in both directions; the engine stops with a
+message without it. Prefix files are tied to the build that wrote them. When an image arrives with too little free
+VRAM on the first card, the expert cache lends the tower some of its own.
 
 ## The optional Qwen drafter
 

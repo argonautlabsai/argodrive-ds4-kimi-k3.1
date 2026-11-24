@@ -12,7 +12,7 @@ This is a **source release**. Model weights, NVIDIA drivers, CUDA build tools (o
 
 - **Kimi K3.1 Pro:** [installation guide](https://argonautlabs.ai/guides/install-kimi-k31.html) · [CUDA and Metal configuration](tools/kimi-k3/README.md)
 - **DeepSeek V4.1 Flash 1017:** [setup, model file and streaming settings](tools/deepseek-v41/README.md) · [one-, two- and three-drive M5 Max results](#deepseek-v41-flash-on-the-same-macbook-pro-macos-metal)
-- **Kimi K3.1 Pro on two NVIDIA GPUs:** [results on two RTX PRO 6000](#kimi-k31-pro-on-two-rtx-pro-6000-linux-cuda) · [switches and what changed](tools/kimi-k3/README.md#two-cards-19-november-2026)
+- **Kimi K3.1 Pro on two NVIDIA GPUs:** [results on two RTX PRO 6000](#kimi-k31-pro-on-two-rtx-pro-6000-linux-cuda) · [switches, images and what changed](tools/kimi-k3/README.md#copy-drafts-images-and-both-cards-on-every-layer-24-november-2026)
 - **DeepSeek V4.1 Flash 1017 on two NVIDIA GPUs:** [results on two RTX PRO 6000](#deepseek-v41-flash-on-two-rtx-pro-6000-linux-cuda) · [switches and preload lists](tools/deepseek-v41/README.md#cuda-two-gpus-the-layers-split-between-them) · [both cards on every layer](tools/deepseek-v41/README.md#cuda-two-gpus-both-on-every-layer) · [the DSpark drafter, 111 tok/s on JSON](tools/deepseek-v41/README.md#the-dspark-drafter-on-both-cards-22-november)
 
 ### Measured results at a glance
@@ -21,8 +21,8 @@ The following tables and footprint describe **Kimi K3.1 Pro**. DeepSeek V4.1 Fla
 
 | Hardware | Workload | Measured speed | Version and scope |
 |---|---|---:|---|
-| **Two RTX PRO 6000** (2 x 96 GB, Linux, CUDA) | Raw financial text: 6 prompt / 512 output tokens | **5.50–5.53 tok/s decode** | 19 November, layers split over both cards, Qwen drafter |
-| **Two RTX PRO 6000** (2 x 96 GB, Linux, CUDA) | The same text, no drafter: 6 prompt / 512 output tokens | **2.97 tok/s decode** | 19 November, layers split over both cards |
+| **Two RTX PRO 6000** (2 x 96 GB, Linux, CUDA) | Raw financial text: 6 prompt / 512 output tokens | **5.50–5.51 tok/s decode** | 24 November, both cards on every layer, Qwen drafter |
+| **Two RTX PRO 6000** (2 x 96 GB, Linux, CUDA) | The same text, no draft model: 6 prompt / 512 output tokens | **3.70–3.71 tok/s decode** | 24 November, both cards on every layer, drafts copied from the context |
 | **RTX PRO 6000** (96 GB, Linux, CUDA) | Short-prompt chat: 286 prompt / 200 output tokens | **2.01–2.02 tok/s decode** | 11 November, chat drafter settings |
 | **RTX PRO 6000** (96 GB, Linux, CUDA) | Raw financial text: 6 prompt / 512 output tokens | **3.77–3.79 tok/s decode** | 11 November, Qwen drafter, fp32 activations |
 | **RTX PRO 6000** (96 GB, Linux, CUDA) | Long raw prompt: 512 prompt / 200 output tokens | **3.88–3.89 tok/s decode** | 11 November, Qwen drafter |
@@ -33,7 +33,7 @@ The following tables and footprint describe **Kimi K3.1 Pro**. DeepSeek V4.1 Fla
 
 **Tested hardware, not minimum requirements:**
 - **RTX PRO 6000 (Linux, CUDA):** one RTX PRO 6000 Blackwell GPU with **96 GB VRAM**, **70 GiB RAM** assigned to the Ubuntu VM and **five physical NVMe devices** in three storage tiers (**four** in two tiers for the 10 and 11 November results). Context caches measured up to **16,384 tokens** using sparse attention.
-- **Two RTX PRO 6000 (Linux, CUDA):** both cards (96 GB each), **80 GiB RAM** assigned to the Ubuntu VM with a 56 GiB pinned expert pool, and **four physical NVMe devices** in two storage tiers. Contexts measured up to **16,384 tokens**.
+- **Two RTX PRO 6000 (Linux, CUDA):** both cards (96 GB each), **87 GiB RAM** assigned to the Ubuntu VM with a 56 GiB pinned expert pool, and **four physical NVMe devices** in two storage tiers. Contexts measured up to **16,384 tokens**.
 - **MacBook Pro (macOS, Metal):** a MacBook Pro with an **M5 Max and 128 GB** of unified memory, its internal SSD and **two Thunderbolt 5 NVMe drives**. Contexts measured up to **2,048 tokens**.
 - Both run the same engine on the same **1.45 TB of unique MXFP4 experts**, plus spine, checkpoint and replicas. **Equivalence to Moonshot’s reference implementation remains unvalidated.**
 
@@ -96,22 +96,25 @@ the text is. The 512-token prompt is `prompt-512-tokens.txt` from the deltafin K
 
 ### Kimi K3.1 Pro on two RTX PRO 6000 (Linux, CUDA)
 
-Measured on 19 November at commit d29ddcb, one fresh process per run, greedy:
+Measured on 24 November at commit 2c4d7fc, one fresh process per run, greedy:
 
 | setup | 512-token prompt: prefill tok/s | decode tok/s | 1,512-token prompt: prefill tok/s | decode tok/s | 6-token prompt: decode tok/s |
 |---|---|---|---|---|---|
-| one card | 16.0 | 1.60 | 39.5 | 1.74 | 2.04 |
-| two cards | 16.1 | 2.05 | 39.7 | 2.26 | 2.97 |
+| one card | 15.8 | 2.73 | 40.0 | 2.45 | 2.39 |
+| two cards | 15.9 | 3.03 | 40.2 | 2.94 | 3.71 |
 | **with the Qwen drafter** | | | | | |
-| one card | 16.0 | 3.95 | 39.6 | 3.01 | 3.87 |
-| two cards | 15.9 | 4.56 | 39.3 | 3.57 | **5.52** |
+| one card | 15.7 | 3.86 | 39.9 | 2.93 | 3.81 |
+| two cards | 15.8 | 4.45 | 39.0 | 3.53 | **5.51** |
 
 Prefill is how fast the prompt is read, decode how fast the answer is generated: 200 tokens after the 512-token
-prompt, 128 after the 1,512-token one, 512 after the 6-token one. Every cell has the logits of the
-one-card reference runs. Two cards: the layers split between them
-(`DS4_CUDA_STREAM_SPLIT=46`), an 80 GiB VM with a 56 GiB expert pool, four NVMe devices. The 512-token prompt is
+prompt, 128 after the 1,512-token one, 512 after the 6-token one. Every cell has the logits of the one-card reference
+runs. Without the drafter, drafts are copied from the context (`DS4_K3_COPY=1`), which keeps the answers of plain
+decoding; against 19 November that decode is 17–71 % faster, while the drafter cells are 0–3 % lower, as the fourth
+drive keeps fewer second copies now. Two cards: the layers split between them (`DS4_CUDA_STREAM_SPLIT=46`) and both cards on every layer
+(`DS4_K3_TP=1 DS4_K3_SMCOPY=1`), an 87 GiB VM with a 56 GiB expert pool, four NVMe devices. The 512-token prompt is
 `prompt-512-tokens.txt`, the 6-token one "The three main financial statements are". Prefill is bound by the drives on
-either setup. Switches, what changed and the limits: [two cards](tools/kimi-k3/README.md#two-cards-19-november-2026).
+either setup. Switches, images, what changed and the limits: [24 November](tools/kimi-k3/README.md#copy-drafts-images-and-both-cards-on-every-layer-24-november-2026);
+the layer split: [19 November](tools/kimi-k3/README.md#two-cards-19-november-2026).
 
 ### Standard benchmarks on a MacBook Pro M5 Max (macOS, Metal)
 
