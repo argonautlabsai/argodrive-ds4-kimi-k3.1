@@ -67206,32 +67206,62 @@ static uint64_t k3_rng_next(void) {
     return x;
 }
 
+static inline bool k3_tk_better(float va, int ia, float vb, int ib) { return va > vb || (va == vb && ia < ib); }   /* K3-DF 2 */
+
 static int k3_sample_next(const float *logits, uint32_t n_vocab) {
     const float temp = g_k3_sampling.temperature;
     if (temp <= 0.0f) return sample_argmax(logits, n_vocab);
     int k = g_k3_sampling.top_k > 0 ? g_k3_sampling.top_k : 200;
     if (k > 1024) k = 1024;
     if ((uint32_t)k > n_vocab) k = (int)n_vocab;
-    /* top-k by repeated maximum over a candidate mask (k is small against the vocabulary) */
+    /* K3-DF 2: the k best in one pass over the vocabulary (a heap whose root is the worst kept), then best first:
+       the same list in the same order as the k passes it replaces (larger logit first, equal logits by smaller
+       index; -inf and NaN never picked) */
     int *idx = xmalloc(sizeof(int) * (size_t)k);
     float *val = xmalloc(sizeof(float) * (size_t)k);
-    float floor_logit = -INFINITY;
-    for (int i = 0; i < k; i++) {
-        int best = -1;
-        float best_v = -INFINITY;
-        for (uint32_t t = 0; t < n_vocab; t++) {
-            const float v = logits[t];
-            if (v > best_v && (i == 0 || v < floor_logit || (v == floor_logit && (int)t > idx[i - 1]))) {
-                /* strictly below the previous pick, or equal with a larger index (stable ordering) */
-                best_v = v; best = (int)t;
+    int n_h = 0;
+    for (uint32_t t = 0; t < n_vocab; t++) {
+        const float v = logits[t];
+        if (!(v > -INFINITY)) continue;
+        if (n_h == k && !k3_tk_better(v, (int)t, val[0], idx[0])) continue;
+        int i;
+        if (n_h < k) {
+            i = n_h++;
+            while (i > 0) {
+                const int p = (i - 1) / 2;
+                if (!k3_tk_better(val[p], idx[p], v, (int)t)) break;
+                val[i] = val[p]; idx[i] = idx[p]; i = p;
+            }
+        } else {
+            i = 0;
+            for (;;) {
+                int c = 2 * i + 1;
+                if (c >= n_h) break;
+                if (c + 1 < n_h && k3_tk_better(val[c], idx[c], val[c + 1], idx[c + 1])) c++;
+                if (!k3_tk_better(v, (int)t, val[c], idx[c])) break;
+                val[i] = val[c]; idx[i] = idx[c]; i = c;
             }
         }
-        if (best < 0) { k = i; break; }
-        idx[i] = best; val[i] = best_v; floor_logit = best_v;
+        val[i] = v; idx[i] = (int)t;
     }
+    for (int end = n_h - 1; end > 0; end--) {   /* the worst kept goes to the back, so the front ends best first */
+        const float tv = val[end]; const int ti = idx[end];
+        val[end] = val[0]; idx[end] = idx[0];
+        int i = 0;
+        for (;;) {
+            int c = 2 * i + 1;
+            if (c >= end) break;
+            if (c + 1 < end && k3_tk_better(val[c], idx[c], val[c + 1], idx[c + 1])) c++;
+            if (!k3_tk_better(tv, ti, val[c], idx[c])) break;
+            val[i] = val[c]; idx[i] = idx[c]; i = c;
+        }
+        val[i] = tv; idx[i] = ti;
+    }
+    k = n_h;
     if (k <= 0) { free(idx); free(val); return sample_argmax(logits, n_vocab); }
     double sum = 0.0;
-    for (int i = 0; i < k; i++) { val[i] = expf((val[i] - val[0]) / temp); sum += val[i]; }
+    const float vmax = val[0];   /* K3-DF 3: val[0] is overwritten in the first iteration; the max must be kept */
+    for (int i = 0; i < k; i++) { val[i] = expf((val[i] - vmax) / temp); sum += val[i]; }
     /* nucleus: keep the smallest prefix whose mass reaches top_p */
     int n_keep = k;
     if (g_k3_sampling.top_p < 1.0f) {

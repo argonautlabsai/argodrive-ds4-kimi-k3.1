@@ -42129,8 +42129,19 @@ extern "C" uint32_t ds4_gpu_k3_attn_max_pos(void) {
     const uint32_t m = (uint32_t)((k3_attn_optin() - 1024) / (int)sizeof(float));
     return m > 8192u ? m : 8192u;
 }
+static size_t k3_fn_static_smem(const void *fn) {   /* K3-DF 1: a kernel's own (static) shared memory, asked once */
+    static const void *fns[32]; static size_t vals[32]; static int n = 0;
+    for (int i = 0; i < n; i++) if (fns[i] == fn) return vals[i];
+    size_t v = 1024;   /* the max-position rule's allowance, if the query fails */
+    cudaFuncAttributes a;
+    if (cudaFuncGetAttributes(&a, fn) == cudaSuccess) v = a.sharedSizeBytes; else (void)cudaGetLastError();
+    if (n < 32) { fns[n] = fn; vals[n] = v; n++; }
+    return v;
+}
 static bool k3_attn_smem(const void *fn, uint8_t *raised, size_t bytes) {
-    if (bytes <= ((size_t)48 << 10)) return true;
+    /* K3-DF 1: the default 48 KiB holds static + dynamic shared memory; counting only the dynamic part sent decode
+       launches at 12,253-12,288 positions out without the raised limit, and they failed ("invalid argument") */
+    if (bytes + k3_fn_static_smem(fn) <= ((size_t)48 << 10)) return true;
     if (g_n_gpus > 1) {   /* step 155: the allowance belongs to a card's context: once per card and kernel */
         static std::vector<const void *> done[DS4_MAX_GPUS];
         std::vector<const void *> &v = done[g_stream_tier];
