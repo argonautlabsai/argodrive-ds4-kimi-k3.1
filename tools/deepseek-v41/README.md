@@ -436,7 +436,9 @@ finalize with the next rows' loads issued early (slower).
 
 **Limits.** Each layer runs on one card; for both cards on every layer see [below](#cuda-two-gpus-both-on-every-layer). Requests are served one at a time:
 decoding several sessions' rows in one batch is off with the split. DSpark and the decode read-ahead are not part of
-it. Prompts beyond about 11,000 tokens have not been run on two cards. And the model still does not fit: with 9,152
+it. Prompts of up to 63,000 tokens (a 64k context) run on two cards since the fix of 25 November: before it, a
+prompt pass on the second card stopped once the context passed about 24,000 tokens ("token-tile union builder
+failed: invalid argument", layer 20). And the model still does not fit: with 9,152
 experts in VRAM and 2,739 in the RAM tier, 3,469 stay on the drive.
 
 ## CUDA: two GPUs, both on every layer
@@ -507,7 +509,8 @@ both cards as well (estimated at about zero: the exchanges cost what the split s
 
 **Limits.** Decode rows that carry an image run without the CUDA graphs.
 Requests are served one at a time. Each card holds the dense weights of all 40 layers, so the two caches hold about
-6 % fewer experts than with the layers split. Prompts beyond about 6,000 tokens have not been run with `DS4_CUDA_TP2`.
+6 % fewer experts than with the layers split. Prompts of up to 63,000 tokens (a 64k context) have run with
+`DS4_CUDA_TP2` since the fix of 25 November, also with the DSpark drafter at 31,500 tokens.
 
 ### The decode work of 21 November (night)
 

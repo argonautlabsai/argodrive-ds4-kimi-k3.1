@@ -22665,9 +22665,16 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                     (size_t)bitmap_words * sizeof(uint32_t);
                 /* The launch limit includes the kernel's static scan array,
                  * so opt in to the largest bitmap admitted by this path even
-                 * when the dynamic bitmap alone is just under 48 KiB. */
-                static int union_smem_attr_set = 0;
-                if (!union_smem_attr_set) {
+                 * when the dynamic bitmap alone is just under 48 KiB. The
+                 * limit belongs to each card's context: with the layer split
+                 * the second card runs this kernel too (layers 20-39). */
+                static int union_smem_attr_set[DS4_MAX_GPUS] = {0};
+                int union_dev = 0;
+                if (cudaGetDevice(&union_dev) != cudaSuccess ||
+                    union_dev < 0 || union_dev >= DS4_MAX_GPUS) {
+                    return 0;
+                }
+                if (!union_smem_attr_set[union_dev]) {
                     const int max_bitmap_smem =
                         (int)(((32768u + 1u) >> 1u) * sizeof(uint32_t));
                     if (!cuda_ok(cudaFuncSetAttribute(
@@ -22677,7 +22684,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                         "set token-tile union shared-memory limit")) {
                         return 0;
                     }
-                    union_smem_attr_set = 1;
+                    union_smem_attr_set[union_dev] = 1;
                 }
                 if (!cuda_ok(cudaFuncSetAttribute(
                     attention_tokentile_hmma_kernel,
