@@ -590,6 +590,12 @@ stages guess up to five tokens, and the model checks them in one pass over sever
 with the arithmetic of one-token decode, so the answer is the one you get without the drafter, token for token and
 logit for logit. Every run below was compared that way, position by position.
 
+Until 25 November that held only for the prompts we had tested, of about 6,000 tokens. With a longer prompt the
+drafter kept the last 128 rows in the prompt pass's later layers where plain decoding keeps one, which moved the
+pass's chunk boundaries, and from 12,000 tokens on the answer drifted. Since the fix the drafter takes the rows the
+plain pass computes: prompts of 6,000, 12,000, 20,000, 26,000 and 31,500 tokens now give the same logits at all
+300 answer positions with and without it, at the same speed.
+
 A guess only pays if the check costs less than the tokens it confirms, and a check began at about 110 ms for six rows
 against 13 to 17 ms for one token. These changes bring it to about 53 ms:
 

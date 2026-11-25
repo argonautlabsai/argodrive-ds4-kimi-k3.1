@@ -46210,7 +46210,9 @@ static bool ds41_graph_prefill_sweep_body(ds41_gpu_graph *g, const ds4_model *m,
             if (il == 20u)
                 ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
                     0, total_count, true, batch_hc, batch_attention, cancel, cancel_ud);
-            const uint32_t final_rows = medium_suffix || g->dspark ? 128u : 1u;
+            /* DS-DX 1: the drafter does not widen the suffix: a wider one moved the chunk boundaries and so the
+             * arithmetic of the prompt pass; the drafter captures what plain's schedule computes */
+            const uint32_t final_rows = medium_suffix ? 128u : 1u;
             const uint32_t needed = final_rows + (DS4_N_LAYER - 1u - il) * 127u;
             first = needed < total_count ? total_count - needed : 0u;
             if (suffix_all) {
