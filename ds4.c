@@ -66927,6 +66927,7 @@ static int k3_gpu_prefill_lm(k3_gpu_buffers *b, const ds4_model *model, const ds
         free(tok32);
         if (!ok) fprintf(stderr, "ds4: K3 batched embedding failed\n");
     }
+    { const char *ea = getenv("DS4_K3_LM_ATTN_MB"); ds4_gpu_k3_attn_budget_pass(ea ? (uint32_t)atoi(ea) : 2048u); }   /* K3-AG */
     if (ok && k3_tp_attn_env() && g_k3_tp && g_k3_split_cut > 0 &&
         !ds4_gpu_k3_attn_split_reserve(chunk, pos0 + T, pos0 + T, DS4_N_HEAD, DS4_N_KEY_MLA + DS4_N_ROT, DS4_N_VALUE_MLA))   /* K3-TP attention */
         fprintf(stderr, "ds4: K3-TP attention: no room for the split's buffers before the pass; heads split where they fit\n");
@@ -66966,6 +66967,7 @@ static int k3_gpu_prefill_lm(k3_gpu_buffers *b, const ds4_model *model, const ds
         }
     }
     ds4_gpu_k3_expert_split_allow(0);   /* K3-ES 3 */
+    ds4_gpu_k3_attn_budget_pass(0);   /* K3-AG */
     (void)ds4_gpu_set_current_device(0);
     if (ok) {
         const uint32_t c = C - 1u;

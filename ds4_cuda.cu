@@ -46159,12 +46159,15 @@ __global__ static void k3_attn_softmax_exact_g_kernel(float *s, uint32_t lds, si
 static ds4_per_tier<float *> g_k3_attn_s_pt; static ds4_per_tier<size_t> g_k3_attn_s_bytes_pt;   /* step 146: one per card */
 #define g_k3_attn_s (g_k3_attn_s_pt.v[g_stream_tier])
 #define g_k3_attn_s_bytes (g_k3_attn_s_bytes_pt.v[g_stream_tier])
+static size_t g_k3_attn_budget_pass = 0;   /* K3-AG: a layer-major pass's scratch budget (0: the default) */
+extern "C" void ds4_gpu_k3_attn_budget_pass(uint32_t mb) { g_k3_attn_budget_pass = (size_t)mb << 20; }
 static size_t k3_attn_gemm_bytes(uint32_t n_tok, uint32_t n_cols, uint32_t heads, uint32_t *G_out) {
-    static size_t budget = 0;
-    if (!budget) budget = (size_t)k3_env_u32("DS4_K3_ATTN_GEMM_MB", 256u) << 20;
+    static size_t budget = 0; static bool env_set = false;
+    if (!budget) { env_set = getenv("DS4_K3_ATTN_GEMM_MB") != NULL; budget = (size_t)k3_env_u32("DS4_K3_ATTN_GEMM_MB", 256u) << 20; }
+    const size_t bud = !env_set && g_k3_attn_budget_pass ? g_k3_attn_budget_pass : budget;   /* K3-AG */
     const uint32_t ldc = (n_cols + 127u) & ~127u;
     const size_t per_head = (size_t)n_tok * ldc * sizeof(float) + (size_t)n_tok * sizeof(float);
-    uint32_t G = (uint32_t)(budget / per_head);
+    uint32_t G = (uint32_t)(bud / per_head);
     if (G < 1u) G = 1u;
     if (G > heads) G = heads;
     if (G_out) *G_out = G;
@@ -46399,6 +46402,11 @@ extern "C" void ds4_gpu_k3_prompt_buffers_release(void) {
         if (!b.q && !b.k && !b.v && !b.o && !b.m) continue;
         WITH_DEVICE(g_gpu[t].device_id) { (void)cudaDeviceSynchronize(); cudaFree(b.q); cudaFree(b.k); cudaFree(b.v); cudaFree(b.o); cudaFree(b.m); }
         b = k3_ta_bufs();
+    }
+    for (int t = 0; t < g_n_gpus && t < DS4_MAX_GPUS; t++) {   /* K3-AG: the GEMM attention's scores scratch, a long pass's size */
+        if (!g_k3_attn_s_pt.v[t]) continue;
+        WITH_DEVICE(g_gpu[t].device_id) { (void)cudaDeviceSynchronize(); cudaFree(g_k3_attn_s_pt.v[t]); }
+        g_k3_attn_s_pt.v[t] = nullptr; g_k3_attn_s_bytes_pt.v[t] = 0;
     }
 }
 static int k3_attn_gemm_mode(void) {   /* 1 GEMM attention (default), 0 the kernels, 2 GEMM checked against the full-scan kernel */
