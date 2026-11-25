@@ -65367,6 +65367,7 @@ static inline k3_gpu_buffers *k3_b_of(k3_gpu_buffers *b, uint32_t il) { return k
    so the logits are the same bits, and no weight is held twice. */
 static int k3_tp_env(void) { static int v = -1; if (v < 0) { const char *e = getenv("DS4_K3_TP"); v = e && atoi(e) != 0; } return v; }
 static int k3_tp_shared_env(void) { static int v = -1; if (v < 0) { const char *e = getenv("DS4_K3_TP_SHARED"); v = k3_tp_env() && e && atoi(e) != 0; } return v; }   /* K3-TP shared */
+static int k3_tp_attn_env(void) { static int v = -1; if (v < 0) { const char *e = getenv("DS4_K3_TP_ATTN"); v = k3_tp_env() && e && atoi(e) != 0; } return v; }   /* K3-TP attention */
 static int g_k3_tp = 0;
 static k3_gpu_buffers *g_k3_tp_hb = NULL;   /* the other card's working tensors for the layer being run (decode) */
 static ds4_gpu_tensor *k3_gpu_alloc_bytes(uint64_t bytes) {
@@ -66358,6 +66359,8 @@ static bool k3_gpu_layer_batch_tier(k3_gpu_buffers *b, k3_gpu_batch *bb, const d
         K3_GPU_CHECK(ds4_gpu_k3_mla_store_batch_tensor(b->key_cache[il], b->value_cache[il], bb->k_nope, bb->kv, bb->value,
                      pos0, T, b->cache_cap, heads, nope, rot, DS4_N_KV_LORA, vdim) != 0, "mla cache store");
         const bool dsa_sel = k3_dsa_on() && pos0 + T > g_k3_dsa.top_k;   /* step 95 */
+        if (dsa_sel && g_k3_tp && g_k3_split_cut > 0 && k3_tp_attn_env() && T >= 256u && !g_k3_verify_on)   /* K3-AP: copies during the DSA scores */
+            (void)ds4_gpu_k3_mla_attend_split_prefetch(bb->q, b->key_cache[il], b->value_cache[il], pos0, T, heads, nope + rot, vdim, 1 - k3_tier(il));
         if (k3_dsa_on()) {
             K3_GPU_CHECK(k3_dsa_keys(bb->dsa_q, bb->dsa_k, bb->dsa_w, b->idx_cache[il], bb->normed, bb->q_an, il, pos0, T, b->cache_cap,
                          dsa_sel), "dsa keys");
@@ -66370,7 +66373,10 @@ static bool k3_gpu_layer_batch_tier(k3_gpu_buffers *b, k3_gpu_batch *bb, const d
             }
         }
         { const double tm0 = g_k3_trace_on ? k3_trace_mark(bb->q) : 0.0;
-        if (dsa_sel) K3_GPU_CHECK(ds4_gpu_k3_mla_attend_batch_masked_tensor(bb->heads, bb->q, b->key_cache[il], b->value_cache[il], bb->dsa_mask,
+        const bool tpa = dsa_sel && g_k3_tp && g_k3_split_cut > 0 && k3_tp_attn_env() && T >= 256u && !g_k3_verify_on;   /* K3-TP attention */
+        if (tpa) K3_GPU_CHECK(ds4_gpu_k3_mla_attend_split_tensor(bb->heads, bb->q, b->key_cache[il], b->value_cache[il], bb->dsa_mask,
+                              pos0, T, pos0 + T, g_k3_dsa.top_k, heads, nope + rot, vdim, 1 - k3_tier(il)) != 0, "mla attention (split heads)");
+        else if (dsa_sel) K3_GPU_CHECK(ds4_gpu_k3_mla_attend_batch_masked_tensor(bb->heads, bb->q, b->key_cache[il], b->value_cache[il], bb->dsa_mask,
                                   pos0, T, pos0 + T, g_k3_dsa.top_k, heads, nope + rot, vdim) != 0, "mla attention (selected)");
         else K3_GPU_CHECK(ds4_gpu_k3_mla_attend_batch_tensor(bb->heads, bb->q, b->key_cache[il], b->value_cache[il], pos0, T,
                           heads, nope + rot, vdim) != 0, "mla attention");
@@ -66921,6 +66927,10 @@ static int k3_gpu_prefill_lm(k3_gpu_buffers *b, const ds4_model *model, const ds
         free(tok32);
         if (!ok) fprintf(stderr, "ds4: K3 batched embedding failed\n");
     }
+    if (ok && k3_tp_attn_env() && g_k3_tp && g_k3_split_cut > 0 &&
+        !ds4_gpu_k3_attn_split_reserve(chunk, pos0 + T, pos0 + T, DS4_N_HEAD, DS4_N_KEY_MLA + DS4_N_ROT, DS4_N_VALUE_MLA))   /* K3-TP attention */
+        fprintf(stderr, "ds4: K3-TP attention: no room for the split's buffers before the pass; heads split where they fit\n");
+    (void)ds4_gpu_set_current_device(0);
     uint32_t grow_after = L;   /* the first attention layer: its round allocates the pass's attention scratch */
     for (uint32_t il = 0; il < L; il++) if (!ds4_k3_layer_is_kda(il)) { grow_after = il; break; }
     bool grew = false;

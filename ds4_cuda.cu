@@ -45852,6 +45852,185 @@ static bool k3_attn_gemm(float *heads_out, const float *q, const float *key, con
     }
     return cuda_ok(cudaGetLastError(), "K3 GEMM attention launch") != 0;
 }
+/* K3-TP attention (24 Nov 2026): the GEMM attention for a run of nh heads in any row layout. ho, q, key and val point at the
+   run's first head; *_ld are the row strides in floats. Every head gets k3_attn_gemm's three launches with the same arguments
+   (only the addresses and strides differ), so a head's values do not depend on where it runs or with which heads. */
+static bool k3_attn_scratch_ensure(uint32_t n_tok, uint32_t n_cols, uint32_t nh, uint32_t *G, cudaStream_t st) {
+    const size_t need = k3_attn_gemm_bytes(n_tok, n_cols, nh, G);
+    if (g_k3_attn_s_bytes >= need) return true;
+    if (cudaStreamSynchronize(st) != cudaSuccess) return false;
+    if (g_k3_attn_s) cudaFree(g_k3_attn_s);
+    g_k3_attn_s = nullptr; g_k3_attn_s_bytes = 0;
+    if (cudaMalloc(&g_k3_attn_s, need) != cudaSuccess) { cudaGetLastError(); return false; }
+    g_k3_attn_s_bytes = need;
+    return true;
+}
+static bool k3_attn_gemm_rs(float *ho, uint32_t ho_ld, const float *q, uint32_t q_ld, const float *key, uint32_t k_ld,
+                            const float *val, uint32_t v_ld, const uint8_t *mask, uint32_t mask_stride, uint32_t pos0, uint32_t n_tok,
+                            uint32_t nh, uint32_t qk, uint32_t vdim, float scale, cudaStream_t st) {
+    const uint32_t n_cols = pos0 + n_tok, ldc = (n_cols + 127u) & ~127u;
+    uint32_t G = 1;
+    if (!k3_attn_scratch_ensure(n_tok, n_cols, nh, &G, st)) return false;
+    float *S = g_k3_attn_s, *inv = g_k3_attn_s + (size_t)G * n_tok * ldc;
+    for (uint32_t h0 = 0; h0 < nh; h0 += G) {
+        const uint32_t g = nh - h0 < G ? nh - h0 : G;
+        k3_sgemm128_exact_kernel<true><<<dim3((n_cols + 127u) / 128u, (n_tok + 127u) / 128u, g), 256, 0, st>>>(S, ldc, (size_t)n_tok * ldc,
+            q + (size_t)h0 * qk, q_ld, qk, key + (size_t)h0 * qk, k_ld, qk, n_tok, n_cols, qk, scale, nullptr, 0, pos0);
+        k3_attn_softmax_exact_g_kernel<<<dim3(n_tok, g), 256, 0, st>>>(S, ldc, (size_t)n_tok * ldc, mask, mask_stride, pos0, n_cols, inv, n_tok);
+        k3_sgemm128_exact_kernel<false><<<dim3((vdim + 127u) / 128u, (n_tok + 127u) / 128u, g), 256, 0, st>>>(ho + (size_t)h0 * vdim,
+            ho_ld, vdim, S, ldc, (size_t)n_tok * ldc, val + (size_t)h0 * vdim, v_ld, vdim, n_tok, vdim, n_cols, 1.0f, inv, n_tok, pos0);
+    }
+    return cuda_ok(cudaGetLastError(), "K3 GEMM attention launch (heads run)") != 0;
+}
+__global__ static void k3_copy2d_f4_kernel(float4 *dst, uint64_t dpitch4, const float4 *src, uint64_t spitch4, uint64_t width4, uint64_t rows) {
+    const uint64_t total = width4 * rows;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (uint64_t)gridDim.x * blockDim.x) {
+        const uint64_t r = i / width4, k = i - r * width4;
+        dst[r * dpitch4 + k] = src[r * spitch4 + k];
+    }
+    __threadfence_system();
+}
+__global__ static void k3_copy_bytes_kernel(uint8_t *dst, const uint8_t *src, uint64_t n) {
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (uint64_t)gridDim.x * blockDim.x) dst[i] = src[i];
+    __threadfence_system();
+}
+static bool k3_copy2d_f(float *dst, uint64_t dpitch, const float *src, uint64_t spitch, uint64_t width, uint64_t rows, cudaStream_t st) {
+    if ((width | dpitch | spitch) % 4u || (uintptr_t)dst % 16u || (uintptr_t)src % 16u) return false;
+    const uint64_t total = (width / 4u) * rows;
+    unsigned grid = (unsigned)((total + 255u) / 256u); if (grid > 4096u) grid = 4096u; if (!grid) grid = 1u;
+    k3_copy2d_f4_kernel<<<grid, 256, 0, st>>>((float4 *)dst, dpitch / 4u, (const float4 *)src, spitch / 4u, width / 4u, rows);
+    return cudaGetLastError() == cudaSuccess;
+}
+struct k3_ta_bufs { float *q = nullptr, *k = nullptr, *v = nullptr, *o = nullptr; uint8_t *m = nullptr; size_t cq = 0, ck = 0, cv = 0, co = 0, cm = 0; };
+static k3_ta_bufs g_k3_ta[DS4_MAX_GPUS];
+static cudaEvent_t g_k3_ta_ev_o[DS4_MAX_GPUS], g_k3_ta_ev_h[DS4_MAX_GPUS];
+static cudaEvent_t k3_ta_event(cudaEvent_t *slot, int t) {   /* made on device t, where it is recorded */
+    if (!slot[t]) {
+        WITH_DEVICE(g_gpu[t].device_id) { if (cudaEventCreateWithFlags(&slot[t], cudaEventDisableTiming) != cudaSuccess) { (void)cudaGetLastError(); slot[t] = nullptr; } }
+    }
+    return slot[t];
+}
+static bool k3_ta_grow(void **p, size_t *cap, size_t need) {
+    if (*cap >= need) return true;
+    if (*p) { (void)cudaDeviceSynchronize(); cudaFree(*p); *p = nullptr; *cap = 0; }
+    if (cudaMalloc(p, need) != cudaSuccess) { cudaGetLastError(); *p = nullptr; return false; }
+    *cap = need; return true;
+}
+static bool k3_ta_ensure(int t, uint32_t n_tok, uint32_t n_cols, uint32_t mask_stride, uint32_t hh, uint32_t qk, uint32_t vdim) {   /* on device t */
+    k3_ta_bufs &b = g_k3_ta[t];
+    return k3_ta_grow((void **)&b.q, &b.cq, (size_t)n_tok * hh * qk * sizeof(float)) && k3_ta_grow((void **)&b.k, &b.ck, (size_t)n_cols * hh * qk * sizeof(float)) &&
+           k3_ta_grow((void **)&b.v, &b.cv, (size_t)n_cols * hh * vdim * sizeof(float)) && k3_ta_grow((void **)&b.o, &b.co, (size_t)n_tok * hh * vdim * sizeof(float)) &&
+           k3_ta_grow((void **)&b.m, &b.cm, (size_t)n_tok * mask_stride);
+}
+/* K3-TP attention: the helper buffers and both cards' attention scratch, made before a layer-major pass grows the cache */
+extern "C" int ds4_gpu_k3_attn_split_reserve(uint32_t n_tok, uint32_t n_cols, uint32_t mask_stride, uint32_t heads, uint32_t qk, uint32_t vdim) {
+    if (g_n_gpus != 2) return 0;
+    int ok = 1;
+    for (int t = 0; t < 2; t++) {
+        if (ds4_gpu_set_current_device(t) != 0) return 0;
+        uint32_t G = 1;
+        ok = ok && k3_ta_ensure(t, n_tok, n_cols, mask_stride, heads - heads / 2u, qk, vdim) && k3_attn_scratch_ensure(n_tok, n_cols, heads / 2u, &G, 0);
+    }
+    (void)ds4_gpu_set_current_device(0);
+    return ok;
+}
+extern "C" int ds4_gpu_k3_mla_attend_batch_masked_tensor(ds4_gpu_tensor *heads_out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *key_cache,
+                                                         const ds4_gpu_tensor *value_cache, const ds4_gpu_tensor *mask, uint32_t pos0,
+                                                         uint32_t n_tok, uint32_t mask_stride, uint32_t top_k, uint32_t heads, uint32_t qk,
+                                                         uint32_t vdim);
+/* K3-AP (25 Nov 2026): the helper's copies of q, keys and values start when the layer's card has stored them, while it still
+   computes the DSA scores; the split attention then copies only the mask (16 bytes a thread). */
+struct k3_ta_pre_t { const void *q = nullptr, *k = nullptr, *v = nullptr; const float *bq = nullptr, *bk = nullptr, *bv = nullptr;
+                     size_t cq = 0, ck = 0, cv = 0; uint32_t pos0 = 0, n_tok = 0; int helper = -1; bool valid = false; };   /* caps: a realloc in between voids it */
+static k3_ta_pre_t g_k3_ta_pre;
+__global__ static void k3_copy_bytes16_kernel(uint4 *dst, const uint4 *src, uint64_t n16, uint8_t *dtail, const uint8_t *stail, uint32_t ntail) {
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n16; i += (uint64_t)gridDim.x * blockDim.x) dst[i] = src[i];
+    if (blockIdx.x == 0) for (uint32_t i = threadIdx.x; i < ntail; i += blockDim.x) dtail[i] = stail[i];
+    __threadfence_system();
+}
+static bool k3_copy_bytes16(uint8_t *dst, const uint8_t *src, uint64_t n, cudaStream_t st) {
+    if ((uintptr_t)dst % 16u || (uintptr_t)src % 16u) return false;
+    const uint64_t n16 = n / 16u; const uint32_t nt = (uint32_t)(n - n16 * 16u);
+    unsigned grid = (unsigned)((n16 + 255u) / 256u); if (grid > 4096u) grid = 4096u; if (!grid) grid = 1u;
+    k3_copy_bytes16_kernel<<<grid, 256, 0, st>>>((uint4 *)dst, (const uint4 *)src, n16, dst + n16 * 16u, src + n16 * 16u, nt);
+    return cudaGetLastError() == cudaSuccess;
+}
+extern "C" int ds4_gpu_k3_mla_attend_split_prefetch(const ds4_gpu_tensor *q, const ds4_gpu_tensor *key_cache, const ds4_gpu_tensor *value_cache,
+                                                    uint32_t pos0, uint32_t n_tok, uint32_t heads, uint32_t qk, uint32_t vdim, int helper) {
+    static int on = -1;
+    if (on < 0) on = (int)k3_env_u32("DS4_K3_TP_ATTN_PREFETCH", 1u) != 0;
+    g_k3_ta_pre = k3_ta_pre_t();
+    const int o = q ? ds4_tensor_device_idx(q) : -1;
+    const uint32_t n_cols = pos0 + n_tok, hs = heads / 2u, hh = heads - hs;
+    const bool can = on && o >= 0 && helper >= 0 && o != helper && o < g_n_gpus && helper < g_n_gpus && g_gpu_peer_ok[helper][o] &&
+                     g_gpu_peer_ok[o][helper] && !k3_raw_get().verify && k3_attn_gemm_mode() == 1 && k3_mla_cache_mode() == 0 && hs > 0u &&
+                     key_cache && value_cache && n_cols <= ds4_gpu_k3_attn_max_pos();
+    if (!can) return 0;
+    const cudaEvent_t ev_o = k3_ta_event(g_k3_ta_ev_o, o);
+    if (!ev_o) return 0;
+    k3_ta_bufs &b = g_k3_ta[helper];
+    bool ok = cudaEventRecord(ev_o, 0) == cudaSuccess;   /* the layer's card: q, keys and values are stored */
+    ok = ok && ds4_gpu_set_current_device(helper) == 0 && k3_ta_ensure(helper, n_tok, n_cols, n_cols, hh, qk, vdim) &&
+         cudaStreamWaitEvent(0, ev_o, 0) == cudaSuccess &&
+         k3_copy2d_f(b.q, (uint64_t)hh * qk, (const float *)q->ptr + (size_t)hs * qk, (uint64_t)heads * qk, (uint64_t)hh * qk, n_tok, 0) &&
+         k3_copy2d_f(b.k, (uint64_t)hh * qk, (const float *)key_cache->ptr + (size_t)hs * qk, (uint64_t)heads * qk, (uint64_t)hh * qk, n_cols, 0) &&
+         k3_copy2d_f(b.v, (uint64_t)hh * vdim, (const float *)value_cache->ptr + (size_t)hs * vdim, (uint64_t)heads * vdim, (uint64_t)hh * vdim, n_cols, 0);
+    (void)ds4_gpu_set_current_device(o);
+    if (!ok) { (void)cudaGetLastError(); return 0; }
+    g_k3_ta_pre.q = q->ptr; g_k3_ta_pre.k = key_cache->ptr; g_k3_ta_pre.v = value_cache->ptr;
+    g_k3_ta_pre.bq = b.q; g_k3_ta_pre.bk = b.k; g_k3_ta_pre.bv = b.v; g_k3_ta_pre.cq = b.cq; g_k3_ta_pre.ck = b.ck; g_k3_ta_pre.cv = b.cv;
+    g_k3_ta_pre.pos0 = pos0; g_k3_ta_pre.n_tok = n_tok; g_k3_ta_pre.helper = helper; g_k3_ta_pre.valid = true;
+    return 1;
+}
+extern "C" int ds4_gpu_k3_mla_attend_split_tensor(ds4_gpu_tensor *heads_out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *key_cache,
+                                                  const ds4_gpu_tensor *value_cache, const ds4_gpu_tensor *mask, uint32_t pos0, uint32_t n_tok,
+                                                  uint32_t mask_stride, uint32_t top_k, uint32_t heads, uint32_t qk, uint32_t vdim, int helper) {
+    const int o = heads_out ? ds4_tensor_device_idx(heads_out) : -1;
+    const uint32_t n_cols = pos0 + n_tok, hs = heads / 2u, hh = heads - hs;
+    const bool can = o >= 0 && helper >= 0 && o != helper && o < g_n_gpus && helper < g_n_gpus && g_gpu_peer_ok[helper][o] &&
+                     g_gpu_peer_ok[o][helper] && !k3_raw_get().verify && k3_attn_gemm_mode() == 1 && k3_mla_cache_mode() == 0 && hs > 0u &&
+                     q && key_cache && value_cache && mask && n_cols <= mask_stride && n_cols <= ds4_gpu_k3_attn_max_pos() &&
+                     mask->bytes >= (uint64_t)n_tok * mask_stride;
+    if (!can) return ds4_gpu_k3_mla_attend_batch_masked_tensor(heads_out, q, key_cache, value_cache, mask, pos0, n_tok, mask_stride, top_k, heads, qk, vdim);
+    const float scale = 1.0f / sqrtf((float)qk);
+    bool ok = ds4_gpu_set_current_device(helper) == 0 && k3_ta_ensure(helper, n_tok, n_cols, mask_stride, hh, qk, vdim);
+    uint32_t G = 1;
+    ok = ok && k3_attn_scratch_ensure(n_tok, n_cols, hh, &G, 0);
+    if (!ok || ds4_gpu_set_current_device(o) != 0)   /* nothing launched yet: the whole attention on the layer's card */
+        return ds4_gpu_set_current_device(o) == 0 &&
+               ds4_gpu_k3_mla_attend_batch_masked_tensor(heads_out, q, key_cache, value_cache, mask, pos0, n_tok, mask_stride, top_k, heads, qk, vdim);
+    k3_ta_bufs &b = g_k3_ta[helper];
+    const cudaEvent_t ev_o = k3_ta_event(g_k3_ta_ev_o, o), ev_h = k3_ta_event(g_k3_ta_ev_h, helper);
+    if (!ev_o || !ev_h)
+        return ds4_gpu_k3_mla_attend_batch_masked_tensor(heads_out, q, key_cache, value_cache, mask, pos0, n_tok, mask_stride, top_k, heads, qk, vdim);
+    const bool pre = g_k3_ta_pre.valid && g_k3_ta_pre.q == q->ptr && g_k3_ta_pre.k == key_cache->ptr && g_k3_ta_pre.v == value_cache->ptr &&
+                     g_k3_ta_pre.bq == b.q && g_k3_ta_pre.bk == b.k && g_k3_ta_pre.bv == b.v && g_k3_ta_pre.cq == b.cq &&
+                     g_k3_ta_pre.ck == b.ck && g_k3_ta_pre.cv == b.cv && g_k3_ta_pre.pos0 == pos0 &&
+                     g_k3_ta_pre.n_tok == n_tok && g_k3_ta_pre.helper == helper;   /* K3-AP: q, keys and values are on their way */
+    g_k3_ta_pre = k3_ta_pre_t();
+    ok = cudaEventRecord(ev_o, 0) == cudaSuccess;   /* the layer's card: q, keys, values and mask are ready */
+    ok = ok && ds4_gpu_set_current_device(helper) == 0 && cudaStreamWaitEvent(0, ev_o, 0) == cudaSuccess &&
+         (pre ||
+          (k3_copy2d_f(b.q, (uint64_t)hh * qk, (const float *)q->ptr + (size_t)hs * qk, (uint64_t)heads * qk, (uint64_t)hh * qk, n_tok, 0) &&
+           k3_copy2d_f(b.k, (uint64_t)hh * qk, (const float *)key_cache->ptr + (size_t)hs * qk, (uint64_t)heads * qk, (uint64_t)hh * qk, n_cols, 0) &&
+           k3_copy2d_f(b.v, (uint64_t)hh * vdim, (const float *)value_cache->ptr + (size_t)hs * vdim, (uint64_t)heads * vdim, (uint64_t)hh * vdim, n_cols, 0)));
+    if (ok) {
+        const uint64_t mb = (uint64_t)n_tok * mask_stride;
+        if (!k3_copy_bytes16(b.m, (const uint8_t *)mask->ptr, mb, 0)) {   /* K3-AP: 16 bytes a thread (the byte copy for odd addresses) */
+            unsigned grid = (unsigned)((mb + 255u) / 256u); if (grid > 4096u) grid = 4096u; if (!grid) grid = 1u;
+            k3_copy_bytes_kernel<<<grid, 256, 0, 0>>>(b.m, (const uint8_t *)mask->ptr, mb);
+        }
+        ok = cudaGetLastError() == cudaSuccess;
+    }
+    ok = ok && k3_attn_gemm_rs(b.o, hh * vdim, b.q, hh * qk, b.k, hh * qk, b.v, hh * vdim, b.m, mask_stride, pos0, n_tok, hh, qk, vdim, scale, 0) &&
+         k3_copy2d_f((float *)heads_out->ptr + (size_t)hs * vdim, (uint64_t)heads * vdim, b.o, (uint64_t)hh * vdim, (uint64_t)hh * vdim, n_tok, 0) &&
+         cudaEventRecord(ev_h, 0) == cudaSuccess;
+    ok = ds4_gpu_set_current_device(o) == 0 && ok &&
+         k3_attn_gemm_rs((float *)heads_out->ptr, heads * vdim, (const float *)q->ptr, heads * qk, (const float *)key_cache->ptr, heads * qk,
+                         (const float *)value_cache->ptr, heads * vdim, (const uint8_t *)mask->ptr, mask_stride, pos0, n_tok, hs, qk, vdim, scale, 0) &&
+         cudaStreamWaitEvent(0, ev_h, 0) == cudaSuccess;
+    return ok ? 1 : 0;
+}
 static int k3_attn_gemm_mode(void) {   /* 1 GEMM attention (default), 0 the kernels, 2 GEMM checked against the full-scan kernel */
     static int mode = -1;
     if (mode < 0) { const char *e = getenv("DS4_K3_ATTN_GEMM"); mode = !e ? 1 : !strcmp(e, "check") ? 2 : (atoi(e) ? 1 : 0); }

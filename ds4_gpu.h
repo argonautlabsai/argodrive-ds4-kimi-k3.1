@@ -4073,6 +4073,12 @@ void ds4_gpu_k3_moe_raw_stats(double *wait_s, uint64_t *bytes);
 int ds4_gpu_k3_cache_grow(void);
 uint64_t ds4_gpu_k3_cache_lend(void);
 uint32_t ds4_gpu_k3_cache_grow_pass(uint64_t reserve);   /* K3-LM */
+int ds4_gpu_k3_attn_split_reserve(uint32_t n_tok, uint32_t n_cols, uint32_t mask_stride, uint32_t heads, uint32_t qk, uint32_t vdim);   /* K3-TP attention */
+int ds4_gpu_k3_mla_attend_split_prefetch(const ds4_gpu_tensor *q, const ds4_gpu_tensor *key_cache, const ds4_gpu_tensor *value_cache,
+                                         uint32_t pos0, uint32_t n_tok, uint32_t heads, uint32_t qk, uint32_t vdim, int helper);   /* K3-AP */
+int ds4_gpu_k3_mla_attend_split_tensor(ds4_gpu_tensor *heads_out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *key_cache,
+                                       const ds4_gpu_tensor *value_cache, const ds4_gpu_tensor *mask, uint32_t pos0, uint32_t n_tok,
+                                       uint32_t mask_stride, uint32_t top_k, uint32_t heads, uint32_t qk, uint32_t vdim, int helper);
 /* K3.1 vision tower (ds4_k31_vision.cu): patches [gh*gw][588] -> out [(gh/2)*(gw/2)][7168]; 1 on success */
 int ds4_gpu_k31_vision_encode(const char *dir, const float *patches, uint32_t gh, uint32_t gw, float *out);
 uint32_t ds4_gpu_k3_attn_max_pos(void);
