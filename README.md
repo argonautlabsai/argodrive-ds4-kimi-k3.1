@@ -21,8 +21,10 @@ The following tables and footprint describe **Kimi K3.1 Pro**. DeepSeek V4.1 Fla
 
 | Hardware | Workload | Measured speed | Version and scope |
 |---|---|---:|---|
-| **Two RTX PRO 6000** (2 x 96 GB, Linux, CUDA) | Raw financial text: 6 prompt / 512 output tokens | **5.50–5.51 tok/s decode** | 24 November, both cards on every layer, Qwen drafter |
+| **Two RTX PRO 6000** (2 x 96 GB, Linux, CUDA) | Raw financial text: 6 prompt / 512 output tokens | **5.54–5.56 tok/s decode** | 25 November, both cards on every layer, Qwen drafter, measured-hot second copies on the fourth drive |
 | **Two RTX PRO 6000** (2 x 96 GB, Linux, CUDA) | The same text, no draft model: 6 prompt / 512 output tokens | **3.70–3.71 tok/s decode** | 24 November, both cards on every layer, drafts copied from the context |
+| **Two RTX PRO 6000** (2 x 96 GB, Linux, CUDA) | Chat question: 256 output tokens | **3.04 tok/s decode** | 25 November, chat drafter settings; 2.18 on 24 November |
+| **Two RTX PRO 6000** (2 x 96 GB, Linux, CUDA) | Code question: 256 output tokens | **2.85–2.86 tok/s decode** | 25 November, chat drafter settings; 1.77 on 24 November |
 | **RTX PRO 6000** (96 GB, Linux, CUDA) | Short-prompt chat: 286 prompt / 200 output tokens | **2.01–2.02 tok/s decode** | 11 November, chat drafter settings |
 | **RTX PRO 6000** (96 GB, Linux, CUDA) | Raw financial text: 6 prompt / 512 output tokens | **3.77–3.79 tok/s decode** | 11 November, Qwen drafter, fp32 activations |
 | **RTX PRO 6000** (96 GB, Linux, CUDA) | Long raw prompt: 512 prompt / 200 output tokens | **3.88–3.89 tok/s decode** | 11 November, Qwen drafter |
@@ -127,6 +129,24 @@ logits:
 | 21,873-token prompt, 25 November | **194** | 1.90 |
 
 The switches, the prompts and what changed: [25 November](tools/kimi-k3/README.md#long-prompts-layer-by-layer-25-november-2026).
+
+Since the evening of 25 November the expert files are placed by measured disk reads. The three-drive RAID0 holds all
+82,432 experts, and the fourth drive holds second copies of the 68,161 that our recorded runs read from disk most often,
+so the reader can split nearly every cache miss across both drives; until then about 8,000 experts had two homes. Same
+engine (main `d5273d4`), same logits:
+
+| two cards, with the drafter | decode tok/s, 24 November | decode tok/s, 25 November |
+|---|---|---|
+| 6-token prompt, 512 generated | 5.51 | **5.54–5.56** |
+| chat question, 256 generated | 2.18 | **3.04** |
+| code question, 256 generated | 1.77 | **2.85–2.86** |
+
+The chat question is "Explain how a central bank sets interest rates and what happens when it raises them.", the code
+question "Write a Python function that parses a CSV file of bank transactions, groups them by month and category, and
+prints a summary table. Explain each step.", both through the chat template with the drafter's chat settings
+(`DS4_K3_QWEN_CHAT=1 DS4_K3_QWEN_CONF=0.9 DS4_K3_QWEN_ROWS=16`). Without the drafter, decode over 200 tokens after the
+13,087-token prompt went from 1.78–1.82 to 1.95 tok/s that day, and the 512-token prompt reads at 16.4 tok/s and decodes
+at 3.12. Prefill of long prompts stays where the 25 November table above has it.
 
 ### Standard benchmarks on a MacBook Pro M5 Max (macOS, Metal)
 
