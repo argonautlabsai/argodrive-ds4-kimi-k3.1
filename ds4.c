@@ -66794,6 +66794,158 @@ static bool k3_images_apply(ds4_gpu_tensor *cur, uint32_t pos0, uint32_t T) {
     return true;
 }
 
+/* K3-LM (24 Nov 2026): a prompt longer than one pass runs layer-major (DS4_K3_PREFILL_LAYER_MAJOR=1): all passes of
+   8,192 rows go through a layer before any pass enters the next one, so the layer's experts are read once for all
+   passes instead of once per pass. Each (layer, pass) call is the call the chunk-major loop makes, with the same rows,
+   positions, caches and per-layer state order, so the logits are the same bits. The passes share one set of work
+   buffers; each keeps its own residual rows and anchors (pointers swapped per call; with the spine split, on both cards).
+   After the first attention layer's round, when the pass's scratch exists, the device cache grows into the VRAM that is
+   left, so a layer's experts stay resident across the passes; the region goes back after the pass. Returns 1 done,
+   0 failed, -1 no VRAM for the passes' rows (nothing run: the caller runs chunk-major). */
+static int k3_lm_env(void) { static int v = -1; if (v < 0) { const char *e = getenv("DS4_K3_PREFILL_LAYER_MAJOR"); v = e && atoi(e) != 0; } return v; }
+static bool k3_kda_state_read_layer(const k3_gpu_buffers *b, uint32_t il, float **ck_conv, float **ck_state) {
+    if (!ds4_k3_layer_is_kda(il) || !ck_conv[il] || !ck_state[il]) return true;
+    return ds4_gpu_tensor_read(b->kda_conv[il], 0, ck_conv[il], ds4_gpu_tensor_bytes(b->kda_conv[il])) != 0 &&
+           ds4_gpu_tensor_read(b->kda_state[il], 0, ck_state[il], ds4_gpu_tensor_bytes(b->kda_state[il])) != 0;
+}
+#define K3_LM_MAX 16u
+static int k3_gpu_prefill_lm(k3_gpu_buffers *b, const ds4_model *model, const ds4_weights *weights, const int *ids,
+                             uint32_t T, uint32_t pos0, uint32_t chunk, uint64_t per_row, uint32_t *n_anchor_out,
+                             uint32_t ckpt_row, float **ck_conv, float **ck_state) {
+    const uint32_t n = DS4_N_EMBD, L = DS4_N_LAYER, C = (T + chunk - 1u) / chunk;
+    if (C < 2u || C > K3_LM_MAX) return -1;
+    uint32_t Tc[K3_LM_MAX], P0[K3_LM_MAX], na[K3_LM_MAX];
+    uint64_t store = 0;   /* the passes after the first keep their own rows: residual, 16 anchors, tokens */
+    for (uint32_t c = 0; c < C; c++) {
+        Tc[c] = c + 1u < C ? chunk : T - c * chunk; P0[c] = pos0 + c * chunk; na[c] = 0u;
+        if (c) store += (uint64_t)Tc[c] * (17u * n * sizeof(float) + sizeof(int32_t));
+    }
+    (void)ds4_gpu_set_current_device(0);
+    (void)ds4_gpu_k3_cache_lend();   /* the pass sizes the device cache itself, after its own buffers */
+    if ((uint64_t)chunk * per_row + store + ((uint64_t)1 << 30) > ds4_gpu_tier_free_vram(0)) return -1;
+    {   /* K3-LM 5: a layer's experts must fit beside the pass, or layer-major reads as much as pass by pass */
+        const char *mg = getenv("DS4_K3_LM_MIN_CACHE_GB");
+        const uint64_t room = (uint64_t)(mg && atoi(mg) >= 0 ? atoi(mg) : 17) << 30;
+        if ((uint64_t)chunk * per_row + store + ((uint64_t)1 << 30) + room > ds4_gpu_tier_free_vram(0)) {
+            fprintf(stderr, "ds4: K3 layer-major: no room for a layer's experts beside the pass; pass by pass\n");
+            return -1;
+        }
+    }
+    if (g_k3_split_cut > 0) {
+        const uint64_t need1 = (uint64_t)chunk * per_row + store + ((uint64_t)1536 << 20);
+        if (need1 > ds4_gpu_tier_free_vram(1)) (void)ds4_gpu_k3_g1_lend();
+        if (need1 > ds4_gpu_tier_free_vram(1)) return -1;
+    }
+    k3_gpu_batch bb;
+    if (!k3_gpu_batch_alloc(&bb, chunk)) return -1;
+    k3_gpu_batch *t1 = g_k3_split_cut > 0 ? bb.t1 : NULL;
+    if (g_k3_split_cut > 0 && !t1) { k3_gpu_batch_free(&bb); return -1; }
+    ds4_gpu_tensor *cur0[K3_LM_MAX] = {0}, *anc0[K3_LM_MAX] = {0}, *tok[K3_LM_MAX] = {0}, *cur1[K3_LM_MAX] = {0}, *anc1[K3_LM_MAX] = {0};
+    ds4_gpu_tensor *const own_cur = bb.cur, *const own_anc = bb.anchors, *const own_tok = bb.tokens;
+    ds4_gpu_tensor *const own_cur1 = t1 ? t1->cur : NULL, *const own_anc1 = t1 ? t1->anchors : NULL;
+    bool ok = true;
+    for (uint32_t c = 0; c < C && ok; c++) {
+        if (c == 0u) { cur0[0] = own_cur; anc0[0] = own_anc; tok[0] = own_tok; cur1[0] = own_cur1; anc1[0] = own_anc1; continue; }
+        cur0[c] = ds4_gpu_tensor_alloc_ptr_on(0, (uint64_t)Tc[c] * n * sizeof(float));
+        anc0[c] = ds4_gpu_tensor_alloc_ptr_on(0, (uint64_t)Tc[c] * 16u * n * sizeof(float));
+        tok[c] = ds4_gpu_tensor_alloc_ptr_on(0, (uint64_t)Tc[c] * sizeof(int32_t));
+        ok = cur0[c] && anc0[c] && tok[c];
+        if (ok && t1) {
+            cur1[c] = ds4_gpu_tensor_alloc_ptr_on(1, (uint64_t)Tc[c] * n * sizeof(float));
+            anc1[c] = ds4_gpu_tensor_alloc_ptr_on(1, (uint64_t)Tc[c] * 16u * n * sizeof(float));
+            ok = cur1[c] && anc1[c];
+        }
+    }
+    const bool fit = ok;
+    const double t0 = now_sec();
+    double wait0 = 0.0; uint64_t bytes0 = 0;
+    ds4_gpu_k3_moe_raw_stats(&wait0, &bytes0);
+    uint64_t lm_pfi0 = 0, lm_pfa0 = 0, lm_qn0 = 0, lm_ph0 = 0, lm_tb0[3] = {0, 0, 0}, lm_fr0 = 0, lm_fb0 = 0; double lm_qw0 = 0.0; int lm_con = 0;
+    ds4_gpu_k3_prefetch_stats(&lm_pfi0, &lm_pfa0); ds4_gpu_k3_queue_stats(&lm_qw0, &lm_qn0, &lm_ph0);
+    ds4_gpu_k3_source_stats(lm_tb0, &lm_fr0, &lm_fb0, &lm_con);
+    g_k3_pf_attn = g_k3_pf_route = g_k3_pf_moe = 0.0;
+    g_k3_trace_on = getenv("DS4_K3_TRACE_MATMUL") != NULL;
+    (void)ds4_gpu_set_current_device(0);
+    if (ok) {
+        int32_t *tok32 = xmalloc(sizeof(int32_t) * chunk);
+        for (uint32_t c = 0; c < C && ok; c++) {
+            for (uint32_t t = 0; t < Tc[c]; t++) tok32[t] = (int32_t)ids[(size_t)c * chunk + t];
+            ok = ds4_gpu_tensor_write(tok[c], 0, tok32, sizeof(int32_t) * Tc[c]) != 0 &&
+                 ds4_gpu_embed_tokens_quant_tensor(cur0[c], tok[c], model->map, model->size, weights->token_embd->abs_offset,
+                                                   weights->token_embd->type, DS4_N_VOCAB, Tc[c], n) != 0;
+            if (ok && g_k3_img_n) ok = k3_images_apply(cur0[c], P0[c], Tc[c]);
+        }
+        free(tok32);
+        if (!ok) fprintf(stderr, "ds4: K3 batched embedding failed\n");
+    }
+    uint32_t grow_after = L;   /* the first attention layer: its round allocates the pass's attention scratch */
+    for (uint32_t il = 0; il < L; il++) if (!ds4_k3_layer_is_kda(il)) { grow_after = il; break; }
+    bool grew = false;
+    const int cut = g_k3_split_cut;
+    const bool lm_trace = getenv("DS4_K3_LM_TRACE") != NULL;   /* K3-LM trace */
+    if (lm_trace) { struct timespec rt; clock_gettime(CLOCK_REALTIME, &rt);
+                    fprintf(stderr, "ds4: K3-LM trace start wall %.3f\n", (double)rt.tv_sec + (double)rt.tv_nsec * 1e-9); }
+    for (uint32_t il = 0; il < L && ok; il++) {
+        for (uint32_t c = 0; c < C && ok; c++) {
+            bb.cur = cur0[c]; bb.anchors = anc0[c]; bb.tokens = tok[c]; bb.n_tok = Tc[c];
+            if (t1) { t1->cur = cur1[c]; t1->anchors = anc1[c]; t1->n_tok = Tc[c]; }
+            (void)ds4_gpu_set_current_device(cut > 0 && (int)il > cut ? 1 : 0);   /* the card chunk-major is on at this call */
+            const uint32_t done = c * chunk;
+            const uint32_t local = (ckpt_row > done && ckpt_row < done + Tc[c]) ? ckpt_row - done : 0u;
+            double tw0 = 0.0, tc0 = 0.0; uint64_t tb0 = 0;
+            if (lm_trace) { tc0 = now_sec() - t0; ds4_gpu_k3_moe_raw_stats(&tw0, &tb0); }
+            ok = k3_gpu_layer_batch(b, &bb, model, &weights->layer[il], il, P0[c], &na[c], local, ck_conv, ck_state);
+            if (ok && ckpt_row > 0u && ckpt_row == done + Tc[c] && ck_conv && ck_state) ok = k3_kda_state_read_layer(b, il, ck_conv, ck_state);
+            if (lm_trace) { double tw1 = 0.0; uint64_t tb1 = 0; ds4_gpu_k3_moe_raw_stats(&tw1, &tb1);
+                            fprintf(stderr, "ds4: K3-LM trace %u %u %.4f %.4f wait %.4f read %.3f\n", il, c, tc0, now_sec() - t0, tw1 - tw0, (double)(tb1 - tb0) / 1e9); }
+        }
+        if (ok && !grew && il >= grow_after) {
+            grew = true;
+            const char *rv = getenv("DS4_K3_LM_RESERVE_MB");
+            const uint64_t reserve = (uint64_t)(rv && atoi(rv) > 0 ? atoi(rv) : 2560) << 20;
+            (void)ds4_gpu_set_current_device(0);
+            if (!ds4_gpu_k3_cache_grow_pass(reserve)) fprintf(stderr, "ds4: K3 layer-major prompt pass: the device cache did not grow\n");
+        }
+    }
+    (void)ds4_gpu_set_current_device(0);
+    if (ok) {
+        const uint32_t c = C - 1u;
+        ok = ds4_gpu_tensor_copy(b->cur, 0, cur0[c], (uint64_t)(Tc[c] - 1u) * n * sizeof(float), (uint64_t)n * sizeof(float)) != 0 &&
+             ds4_gpu_tensor_copy(b->anchors, 0, anc0[c], (uint64_t)(Tc[c] - 1u) * 16u * n * sizeof(float),
+                                 (uint64_t)16u * n * sizeof(float)) != 0;
+    }
+    if (grew) (void)ds4_gpu_k3_cache_lend();   /* generation start grows the cache from what is free then */
+    bb.cur = own_cur; bb.anchors = own_anc; bb.tokens = own_tok; bb.n_tok = chunk;
+    if (t1) { t1->cur = own_cur1; t1->anchors = own_anc1; t1->n_tok = chunk; }
+    for (uint32_t c = 1; c < C; c++) {
+        ds4_gpu_tensor *f[5] = {cur0[c], anc0[c], tok[c], cur1[c], anc1[c]};
+        for (int i = 0; i < 5; i++) if (f[i]) ds4_gpu_tensor_free(f[i]);
+    }
+    k3_gpu_batch_free(&bb);
+    if (!fit) return -1;
+    double wait1 = 0.0; uint64_t bytes1 = 0;
+    ds4_gpu_k3_moe_raw_stats(&wait1, &bytes1);
+    const double dt = now_sec() - t0;
+    if (ok && pos0 + T >= g_k3_prefill_end) fprintf(stderr, "ds4: K3 first token %.2f s after process start\n", now_sec() - g_k3_process_t0);
+    fprintf(stderr, "ds4: K3 prefill %u tokens in %.2f s (%.2f tok/s): expert reads %.2f GB, waited %.2f s (%.1f GB/s); layer-major over %u passes\n",
+            T, dt, dt > 0.0 ? (double)T / dt : 0.0, (double)(bytes1 - bytes0) / 1e9, wait1 - wait0,
+            wait1 > wait0 ? (double)(bytes1 - bytes0) / 1e9 / (wait1 - wait0) : 0.0, C);
+    if (getenv("DS4_K3_TRACE_TIMING"))
+        fprintf(stderr, "ds4: K3 prefill phases: attention %.2f s, routing %.2f s, experts+shared %.2f s\n", g_k3_pf_attn, g_k3_pf_route, g_k3_pf_moe);
+    {   /* K3-LM diagnostics: the reads of the whole layer-major pass */
+        uint64_t pfi = 0, pfa = 0, qn = 0, ph = 0, tb[3] = {0, 0, 0}, fr = 0, fb = 0; double qw = 0.0; int con = 0;
+        ds4_gpu_k3_prefetch_stats(&pfi, &pfa); ds4_gpu_k3_queue_stats(&qw, &qn, &ph); ds4_gpu_k3_source_stats(tb, &fr, &fb, &con);
+        fprintf(stderr, "ds4: K3 layer-major reads: read-ahead issued %llu, adopted %llu, hit later %llu; demand reads %llu waited %.2f s in the queue; "
+                        "RAID %.1f GB, Samsung %.1f GB, tier C %.1f GB\n",
+                (unsigned long long)(pfi - lm_pfi0), (unsigned long long)(pfa - lm_pfa0), (unsigned long long)(ph - lm_ph0),
+                (unsigned long long)(qn - lm_qn0), qw - lm_qw0, (double)(tb[0] - lm_tb0[0]) / 1e9, (double)(tb[1] - lm_tb0[1]) / 1e9,
+                (double)(tb[2] - lm_tb0[2]) / 1e9);
+    }
+    k3_trace_report();
+    g_k3_trace_on = false;
+    *n_anchor_out = na[C - 1u];
+    return ok ? 1 : 0;
+}
 static bool k3_gpu_prefill(k3_gpu_buffers *b, const ds4_model *model, const ds4_vocab *vocab, const ds4_weights *weights,
                            const int *ids, uint32_t T, uint32_t pos0, uint32_t *n_anchor_out, uint32_t ckpt_row, float **ck_conv, float **ck_state) {
     uint32_t chunk = T;
@@ -66830,6 +66982,12 @@ static bool k3_gpu_prefill(k3_gpu_buffers *b, const ds4_model *model, const ds4_
         if (need1 > ds4_gpu_tier_free_vram(1)) (void)ds4_gpu_k3_g1_lend();
     }
     if (chunk < T) fprintf(stderr, "ds4: K3 prompt pass of %u tokens in chunks of %u (%.2f MB of buffers per row, %.1f GB free)\n", T, chunk, (double)per_row / 1e6, (double)ds4_gpu_tier_free_vram(0) / 1e9);
+    if (chunk < T && k3_lm_env() && !k3_hdump_init() && !g_k3_draft.active && !getenv("DS4_K3_TRACE_LAYERS") &&
+        !(ckpt_row > 0u && ckpt_row < T && ckpt_row % chunk == 0u)) {   /* K3-LM (a checkpoint on a pass boundary: chunk-major, as tested) */
+        const int r = k3_gpu_prefill_lm(b, model, weights, ids, T, pos0, chunk, per_row, n_anchor_out, ckpt_row, ck_conv, ck_state);
+        if (r >= 0) return r == 1;
+        fprintf(stderr, "ds4: K3 layer-major prompt pass: no VRAM for the rows of %u passes; chunk-major instead\n", (T + chunk - 1u) / chunk);
+    }
     uint32_t done = 0;
     while (done < T) {
         const uint32_t n_this = T - done < chunk ? T - done : chunk;

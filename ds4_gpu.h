@@ -4072,6 +4072,7 @@ int ds4_gpu_k3_moe_raw_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, cons
 void ds4_gpu_k3_moe_raw_stats(double *wait_s, uint64_t *bytes);
 int ds4_gpu_k3_cache_grow(void);
 uint64_t ds4_gpu_k3_cache_lend(void);
+uint32_t ds4_gpu_k3_cache_grow_pass(uint64_t reserve);   /* K3-LM */
 /* K3.1 vision tower (ds4_k31_vision.cu): patches [gh*gw][588] -> out [(gh/2)*(gw/2)][7168]; 1 on success */
 int ds4_gpu_k31_vision_encode(const char *dir, const float *patches, uint32_t gh, uint32_t gw, float *out);
 uint32_t ds4_gpu_k3_attn_max_pos(void);

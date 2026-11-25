@@ -42535,6 +42535,8 @@ struct k3_lru {
     std::vector<uint8_t> pinned;                    /* slab -> 1 while a pending job owns it: not evictable */
     std::vector<uint8_t> filling;                   /* slab -> 1 from enqueue until its fill was seen */
     std::vector<uint8_t> transient;                 /* slab -> 1 when inserted by a prompt pass (evicted first) */
+    bool lm_front = false;                          /* K3-LM: a layer-major pass inserts its fills at the hot end (still transient) */
+    uint32_t lm_layer = 0;                          /* K3-LM 4: the layer the pass is in; slabs of earlier layers are recycled first */
     std::vector<uint8_t> warm;                      /* step 81: a transient slab whose expert is copied down when evicted */
     std::vector<uint8_t> chance;                    /* slab -> extra passes through the LRU before eviction (cold-tier entries) */
     uint8_t cold_chance = 1;                        /* DS4_K3_CACHE_COLD_CHANCE */
@@ -42547,6 +42549,7 @@ struct k3_lru {
        hot end, the decayed-count rule has to pass over it by this stamp. */
     uint64_t call_id = 0;
     std::vector<uint64_t> in_call;
+    uint64_t lm_finished = 0;                       /* K3-LM 4: slabs of finished layers recycled */
     uint64_t decay_victims = 0, decay_in_call = 0;  /* victims the decayed-count rule took; samples whose lowest score was in use */
     bool last_evicted_transient = false;            /* step 78: the slab alloc() just took was transient */
     float last_evicted_score = -1e30f;              /* step 152: and the score its entry had */
@@ -42631,6 +42634,13 @@ struct k3_lru {
                     if (twin_map->count(key[s])) { victim = (int)s; break; }
                 }
             }
+            if (victim < 0 && !hot && lm_front) {   /* K3-LM 4: the pass never reads a finished layer again */
+                for (auto bt = order.rbegin(); bt != order.rend(); ++bt) {
+                    const uint32_t s = *bt;
+                    if (pinned[s] || barred(s)) continue;
+                    if (key[s] == K3_NOKEY || (uint32_t)(key[s] >> 20) < lm_layer) { victim = (int)s; lm_finished++; break; }
+                }
+            }
             if (victim < 0) {
             auto it = order.rbegin();
             while (it != order.rend()) {
@@ -42659,7 +42669,7 @@ struct k3_lru {
         chance[s] = protect ? cold_chance : 0;
         score[s] = hot ? (float)(tick * lb) + w : -1e30f;
         order.erase(pos[s]);
-        if (hot) { order.push_front(s); pos[s] = order.begin(); }
+        if (hot || lm_front) { order.push_front(s); pos[s] = order.begin(); }   /* K3-LM: the oldest layer's fills go first */
         else { order.push_back(s); pos[s] = std::prev(order.end()); }
         return (int)s;
     }
@@ -42780,6 +42790,9 @@ struct k3_raw_pool {
     std::mutex mu;
     std::condition_variable cv_job, cv_done;
     std::deque<k3_raw_job> jobs;
+    std::deque<k3_raw_job> jobs_pf;                 /* K3-LM: a layer-major pass's read-ahead, taken only when no demand job waits */
+    uint32_t lm_pf_cap = 0;                         /* K3-LM: next-layer device read-ahead that fits beside a full layer */
+    uint32_t lm_pf_layer = ~0u, lm_pf_done = 0;     /* K3-LM stage 3b: device read-ahead issued so far for that next layer */
     std::deque<uint32_t> ready_q;                   /* device slabs whose fill (read + upload) was issued */
     std::vector<uint32_t> failed_slabs;
     int failed = 0;
@@ -42917,9 +42930,10 @@ static void k3_raw_worker(k3_raw_pool *p) {
                         if (t >= 0) { job = *it; p->cold_q.erase(it); home = t; took = true; break; }
                     }
                     if (took) break;
-                    if (!p->jobs.empty()) {
-                        job = p->jobs.front();
-                        p->jobs.pop_front();
+                    if (!p->jobs.empty() || !p->jobs_pf.empty()) {
+                        std::deque<k3_raw_job> &q = !p->jobs.empty() ? p->jobs : p->jobs_pf;   /* K3-LM: demand reads first */
+                        job = q.front();
+                        q.pop_front();
                         if (!job.read) break;
                         home = pick(job);
                         if (home >= 0) break;
@@ -42949,9 +42963,10 @@ static void k3_raw_worker(k3_raw_pool *p) {
                         }
                         if (took) break;
                     }
-                    if (!p->jobs.empty()) {
-                        job = p->jobs.front();
-                        p->jobs.pop_front();
+                    if (!p->jobs.empty() || !p->jobs_pf.empty()) {
+                        std::deque<k3_raw_job> &q = !p->jobs.empty() ? p->jobs : p->jobs_pf;   /* K3-LM: demand reads first */
+                        job = q.front();
+                        q.pop_front();
                         const bool cold = job.read && p->cold_limit != 0u && !ds4_k3_expert_source_is_primary(job.layer, job.expert);
                         if (!cold) break;
                         if (p->cold_now < p->cold_limit) { p->cold_now++; tier = 1; break; }
@@ -44094,6 +44109,7 @@ static int k3_moe_raw_batch_impl(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, c
     static uint32_t bulk_min = k3_env_u32("DS4_K3_BULK_MIN", 64u);   /* step 88, default 64 since step 93: a prompt this short reads like decode (split, least expected completion) */
     const bool bulk = n_tok > bulk_min && !verify;   /* step 35: a prompt pass's fills may use tier C and prefetch the next layer */
     const uint64_t layer_key = (uint64_t)layer << 20;
+    if (p.dc.lm_front) p.dc.lm_layer = layer;   /* K3-LM 4 */
     if (n_tok == 1u || verify) { p.dc.tick += 1.0; p.hc.tick += 1.0; }
     /* deterministic decode: every expert of the union accumulates into its own row (indexed by its position in
        ulist), and a reduce in that fixed order writes out; the GEMM path and prompt passes keep accumulating. */
@@ -44378,7 +44394,7 @@ static int k3_moe_raw_batch_impl(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, c
                 const uint64_t off = (uint64_t)i * per * 4096u;
                 if (off >= p.file_bytes) { if (p.chunks_left[d]) p.chunks_left[d]--; continue; }
                 const uint64_t len = per * 4096u < p.file_bytes - off ? per * 4096u : p.file_bytes - off;
-                p.jobs.push_back({L, E, (int)d, h, read, bulk, pf, (uint32_t)off, (uint32_t)len, k3_now_sec()});
+                (pf && p.dc.lm_front ? p.jobs_pf : p.jobs).push_back({L, E, (int)d, h, read, bulk, pf, (uint32_t)off, (uint32_t)len, k3_now_sec()});   /* K3-LM */
                 pushed++;
             }
         }
@@ -44403,9 +44419,14 @@ static int k3_moe_raw_batch_impl(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, c
             if (want_max > pf_cap) want_max = pf_cap;
             pf_cap_all = pf_cap;
         }
+        if (!hot && p.dc.lm_front) {   /* K3-LM: the cap is per next layer, over all the passes */
+            if (p.lm_pf_layer != nl) { p.lm_pf_layer = nl; p.lm_pf_done = 0; }
+            want_max = p.lm_pf_cap > p.lm_pf_done ? p.lm_pf_cap - p.lm_pf_done : 0u; pf_cap_all = want_max + p.bulk_hpf_max;
+        }
         if (want_max == 0u && !(hot && p.hpf_n)) return;   /* step 117: host-only reads may still go */
         const uint32_t want_rank = hot ? p.pf_rank * dmult : p.hint_n;
-        const uint32_t want_inflight = hot ? p.pf_inflight_max * dmult : p.bulk_pf_inflight;
+        const uint32_t want_inflight = hot ? p.pf_inflight_max * dmult
+                                     : (p.dc.lm_front && p.lm_pf_cap > p.bulk_pf_inflight ? p.lm_pf_cap : p.bulk_pf_inflight);   /* K3-LM */
         uint32_t issued = 0;
         const int passes = (hot && p.pf_mode == 3) ? 2 : 1;   /* step 50: cold-tier candidates first, then the rest */
         for (int pass = 0; pass < passes; pass++)
@@ -44435,6 +44456,7 @@ static int k3_moe_raw_batch_impl(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, c
             if (!p.wake_mode) p.cv_job.notify_all();   /* step 114: push_fill woke its readers */
             p.pf_pending++; p.pf_issued++; issued++;
         }
+        if (!hot && p.dc.lm_front) p.lm_pf_done += issued;   /* K3-LM stage 3b */
         if (!hot && p.bulk_hpf_max && pf_cap_all > issued) {   /* step 126: the rest of the pass's quota, into held host slabs */
             uint32_t hissued = 0;
             const uint32_t hwant = pf_cap_all - issued < p.bulk_hpf_max ? pf_cap_all - issued : p.bulk_hpf_max;
@@ -44454,7 +44476,7 @@ static int k3_moe_raw_batch_impl(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, c
                 {
                     std::lock_guard<std::mutex> lk(p.mu);
                     p.hwait[(uint32_t)h2] = 1; p.hfail[(uint32_t)h2] = 0;
-                    p.jobs.push_back({nl, e2, -1, h2, true, true, true, 0u, (uint32_t)p.file_bytes, k3_now_sec()});
+                    (p.dc.lm_front ? p.jobs_pf : p.jobs).push_back({nl, e2, -1, h2, true, true, true, 0u, (uint32_t)p.file_bytes, k3_now_sec()});   /* K3-LM */
                 }
                 if (p.wake_mode) p.cv_job.notify_one(); else p.cv_job.notify_all();
                 p.misses++; p.bhpf_issued++; hissued++;
@@ -44527,6 +44549,12 @@ static int k3_moe_raw_batch_impl(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, c
                 if (!p.wanted[(uint32_t)d]) {
                     if (p.rs_cnt && hot && layer < 93u && e < 896u) p.rs_cnt[((size_t)layer * 896u + e) * 4u + 2u]++;   /* step 145: a read already under way */
                     p.wanted[(uint32_t)d] = 1; pending++; p.pf_adopted++; p.pf_slab[(uint32_t)d] = 0;
+                    if (p.dc.lm_front) {   /* K3-LM: its chunks still queued as read-ahead go to the demand queue */
+                        std::lock_guard<std::mutex> lk(p.mu);
+                        for (auto it = p.jobs_pf.begin(); it != p.jobs_pf.end(); ) {
+                            if (it->dev == (int)d) { p.jobs.push_front(*it); it = p.jobs_pf.erase(it); } else ++it;
+                        }
+                    }
                     if (p.pf_pending) p.pf_pending--;
                     if (p.cold_job[(uint32_t)d]) cold_inflight++;
                 }
@@ -44850,6 +44878,45 @@ extern "C" int ds4_gpu_k3_cache_grow(void) {
             (double)p.dc.cap * p.file_bytes / 1e9, (double)free_b / 1e9);
     return 1;
 }
+/* K3-LM (24 Nov 2026): a layer-major prompt pass grows the device cache into the VRAM its buffers left, keeping `reserve`
+   bytes free, and leaves the pass's scratch alone (ds4_gpu_k3_cache_grow frees it for decode). The region is the growth
+   region, so ds4_gpu_k3_cache_lend drops it after the pass and generation start grows the cache as ever. */
+extern "C" uint32_t ds4_gpu_k3_cache_grow_pass(uint64_t reserve) {
+    k3_raw_pool &p = k3_raw_get();
+    if (!p.ready || p.grown) return 0;
+    if (!k3_raw_quiesce(p)) return 0;
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) { cudaGetLastError(); return 0; }
+    const uint64_t budget = free_b > reserve ? free_b - reserve : 0;
+    uint32_t n_new = (uint32_t)(budget / p.file_bytes);
+    if (p.dc.cap + n_new > 32768u) n_new = 32768u - p.dc.cap;
+    if (n_new < 16u) return 0;
+    uint8_t *region = nullptr;
+    while (n_new >= 16u && cudaMalloc(&region, p.file_bytes * n_new) != cudaSuccess) { cudaGetLastError(); n_new /= 2u; region = nullptr; }
+    if (!region) return 0;
+    const uint32_t n0 = p.dc.cap;
+    p.grow_region = region; p.grow_base = n0;   /* step 97 */
+    p.dev_ptr.resize(n0 + n_new);
+    for (uint32_t s = 0; s < n_new; s++) p.dev_ptr[n0 + s] = region + (size_t)s * p.file_bytes;
+    p.dev_free.resize(n0 + n_new); p.dev_ready.resize(n0 + n_new); p.dev_host.resize(n0 + n_new, -1); p.hhit.resize(n0 + n_new, 0);
+    p.wanted.resize(n0 + n_new, 0); p.cold_job.resize(n0 + n_new, 0); p.pf_slab.resize(n0 + n_new, 0); p.tf_enq.resize(n0 + n_new, 0.0); p.tf_pick.resize(n0 + n_new, 0.0); p.tf_r0.resize(n0 + n_new, 0.0); p.tf_r1.resize(n0 + n_new, 0.0); p.tf_up.resize(n0 + n_new, 0.0); p.tf_rdy.resize(n0 + n_new, 0.0); p.tf_tier.resize(n0 + n_new, -1); /* step 68 */ p.chunks_left.resize(n0 + n_new, 0); p.chunk_failed.resize(n0 + n_new, 0);
+    for (uint32_t s = n0; s < n0 + n_new; s++) {
+        if (cudaEventCreateWithFlags(&p.dev_free[s], cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&p.dev_ready[s], cudaEventDisableTiming) != cudaSuccess) return 0;
+    }
+    p.dc.grow(n_new);
+    p.grown = true;
+    p.dc.lm_front = true;   /* K3-LM stage 2 */
+    {   /* K3-LM stage 3a: the next layer's device read-ahead takes what a full layer (896 slabs + 64) leaves */
+        const uint32_t usable = p.dc.cap - p.dc.bar_n, keep = 896u + 64u;
+        const uint32_t room = usable > keep ? usable - keep : 0u, want = k3_env_u32("DS4_K3_LM_PREFETCH_N", 1024u);
+        p.lm_pf_cap = room < want ? room : want;
+        fprintf(stderr, "ds4: K3 layer-major read-ahead: up to %u experts of the next layer on the card (%u usable slabs)\n", p.lm_pf_cap, usable);
+    }
+    fprintf(stderr, "ds4: kimi-k3 device expert cache grown by %u slabs to %u for a layer-major prompt pass (%.1f GB; %.1f GB was free)\n",
+            n_new, p.dc.cap, (double)n_new * p.file_bytes / 1e9, (double)free_b / 1e9);
+    return n_new;
+}
 /* step 97: a prompt pass that does not fit the free VRAM borrows the grown region: the pool quiesces, the GPU idles, the slabs
    the growth added are dropped and their region freed; ds4_gpu_k3_cache_grow (the driver calls it when generation starts)
    sizes the cache again from what is free then. Returns the bytes freed (0: nothing to lend). */
@@ -44870,6 +44937,12 @@ extern "C" uint64_t ds4_gpu_k3_cache_lend(void) {
     const uint64_t bytes = (uint64_t)(n1 - n0) * p.file_bytes;
     cudaFree(p.grow_region);
     p.grow_region = nullptr; p.grown = false;
+    if (p.dc.lm_finished) {   /* K3-LM 4 */
+        fprintf(stderr, "ds4: K3 layer-major pass: %llu slabs of finished layers recycled\n", (unsigned long long)p.dc.lm_finished);
+        p.dc.lm_finished = 0;
+    }
+    p.dc.lm_front = false;   /* K3-LM stage 2 */
+    p.lm_pf_layer = ~0u; p.lm_pf_done = 0;   /* K3-LM stage 3b */
     fprintf(stderr, "ds4: kimi-k3 device expert cache lends %u slabs (%.1f GB, %u experts dropped) to the prompt pass in %.2f s; it grows again when generation starts\n",
             n1 - n0, (double)bytes / 1e9, held, k3_now_sec() - t0);
     return bytes;
