@@ -65574,6 +65574,13 @@ static void k3_route_host(const float *logits_h, const float *bias, int32_t *sel
     for (uint32_t i = 0; i < n; i++) weights[i] = (float)(weights[i] / (wsum + 1.0e-20));
 }
 
+/* K3-RP (24 Nov 2026): rows of a prompt pass routed on the CPU worker pool; each row is the same k3_route_host call */
+typedef struct { const float *rl, *bias; int32_t *sel; float *wts; } k3_route_ctx;
+static void k3_route_worker(void *vctx, uint64_t r0, uint64_t r1) {
+    const k3_route_ctx *c = vctx;
+    for (uint64_t t = r0; t < r1; t++)
+        k3_route_host(c->rl + t * DS4_N_EXPERT, c->bias, c->sel + t * DS4_N_EXPERT_USED, c->wts + t * DS4_N_EXPERT_USED);
+}
 static double g_k3_process_t0 = 0.0;
 __attribute__((constructor)) static void k3_process_t0_init(void) { g_k3_process_t0 = now_sec(); }
 static void k3_trace_weights(const ds4_layer_weights *l, uint32_t il, const char *mode) {
@@ -66384,9 +66391,9 @@ static bool k3_gpu_layer_batch_tier(k3_gpu_buffers *b, k3_gpu_batch *bb, const d
         bool ok = bias != NULL && ds4_gpu_tensor_read(bb->router_logits, 0, rl, (uint64_t)T * DS4_N_EXPERT * sizeof(float)) != 0;
         if (g_k3_trace_on) k3_trace_acc("router readback", now_sec() - tr0);
         if (ok) {
-            for (uint32_t t = 0; t < T; t++) {
-                k3_route_host(rl + (size_t)t * DS4_N_EXPERT, bias, sel + (size_t)t * DS4_N_EXPERT_USED,
-                              wts + (size_t)t * DS4_N_EXPERT_USED);
+            {   /* K3-RP: the rows on the CPU worker pool (512 rows or more; fewer stay serial) */
+                k3_route_ctx rc = { rl, bias, sel, wts };
+                ds4_parallel_for(T, k3_route_worker, &rc);
             }
             if (la) {   /* step M24: experts of layer il+1 by how many rows predict them */
                 const float *bn = tensor_data(model, lnx->ffn_exp_probs_b);
