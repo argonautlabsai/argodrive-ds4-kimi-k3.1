@@ -42218,12 +42218,13 @@ static void ds41_tp2_free(ds41_gpu_graph *g) {
     g->tp2 = false;
 }
 
-/* After a prompt pass, which writes each layer's caches on that layer's card: the other card's copies. */
-static bool ds41_tp2_mirror(ds41_gpu_graph *g) {
+/* The other card's copies of the KV caches: after a prompt pass, which writes each layer's caches on that layer's
+ * card (from < 0), or after a session restore, which writes the set of card `from`. */
+static bool ds41_tp2_mirror(ds41_gpu_graph *g, int from) {
     struct ds41_tp2_kv **k = g->tp2_kv;
     bool ok = true;
 #define DS41_TP2_MIRROR(field, home) do { \
-        const int h_ = (home); \
+        const int h_ = from >= 0 ? from : (home); \
         if (ok) ok = ds4_gpu_tensor_copy_xdev_default(k[1 - h_]->field, k[h_]->field, \
                                                       ds4_gpu_tensor_bytes(k[h_]->field)) != 0; \
     } while (0)
@@ -42277,7 +42278,7 @@ static bool ds41_tp2_rows_mirror(ds41_gpu_graph *g, uint32_t start, uint32_t cou
 static DS4_MAYBE_UNUSED bool ds41_tp2_after_prefill(ds41_gpu_graph *g, bool rows, bool ok) {
 #ifdef DS41_SPLIT_BUILD
     if (rows && g->tp2) ds4_gpu_tp2_graphs_invalidate();   /* TP2-G: the pass may have moved a buffer */
-    if (ok && rows && g->tp2) return ds41_tp2_mirror(g);
+    if (ok && rows && g->tp2) return ds41_tp2_mirror(g, -1);
 #else
     (void)g; (void)rows;
 #endif
@@ -72804,6 +72805,12 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
             rc = payload_read_tensor_span(fp, spans[i].tensor, 0, spans[i].bytes,
                                            buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
         free(buf);
+#ifdef DS41_SPLIT_BUILD
+        if (!rc && g->tp2 && !ds41_tp2_mirror(g, g->tp2_cur)) {   /* TP2: the spans went to card tp2_cur's caches */
+            payload_set_err(err, errlen, "failed to copy the restored V4.1 caches to the other card");
+            rc = 1;
+        }
+#endif
         if (!rc) {
             ds41_graph_reset(g);
             for (uint32_t i = 0; i < 3 && i < pos; i++)

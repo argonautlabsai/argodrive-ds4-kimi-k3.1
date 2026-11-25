@@ -449,7 +449,10 @@ token instead. Add it to the two-card command above (it needs `DS4_CUDA_STREAM_S
 
 It keeps the output of the one-card build because no value is ever split: each is computed whole, on one card, by the
 kernel the one-card build uses for it. Matrices are divided by heads, by groups or by output rows, and the cards
-exchange finished halves, never partial sums.
+exchange finished halves, never partial sums. Each card keeps its own copy of the KV caches. Since 25 November a
+restored session (a snapshot, as `ds4-bench` takes between frontiers, or the server's disk cache) copies the restored
+caches to the other card too; before, that card kept what generation had left there and its next prompt pass parted
+from one card.
 
 - **Decode.** q_b and the attention run by heads (32 on each card), out_a by its groups, out_b and the shared and
   routed experts by output rows. The HC mixes, the norms, the router and the KV stores run on both cards from the same
