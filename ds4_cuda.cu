@@ -45578,6 +45578,148 @@ __global__ static void k3_dsa_scores_warp_kernel(float *scores, const float *q, 
         if (lane == 0u) scores[(size_t)token * n_rows + row] = total * scale;
     }
 }
+/* K3-DS (25 Nov 2026): k3_dsa_scores_warp_kernel's scores, bit for bit, from a tiled kernel. Per (token, row) the arithmetic
+   is the warp kernel's: every product rounded on its own, lane l's (q[l]k[l] + q[l+64]k[l+64]) + (q[l+32]k[l+32] +
+   q[l+96]k[l+96]), the shuffle tree over the lanes (16, 8, 4, 2, 1), the heads summed in order by the same expression. A block
+   keeps 32*TJ key rows and 32 tokens' queries of one head in shared memory, a lane's four values of a row in one float4; a
+   thread computes 4 tokens x TJ rows in registers and walks the lanes in the tree's order, so no shuffles. */
+template <int TJ>
+__device__ __forceinline__ void k3ds_v(float *v, const float4 *sq, const float4 *sk, uint32_t l) {
+    float4 a[4], b[TJ];
+#pragma unroll
+    for (int i = 0; i < 4; i++) a[i] = sq[i * 32 + l];
+#pragma unroll
+    for (int j = 0; j < TJ; j++) b[j] = sk[j * 32 * 33 + l];
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+#pragma unroll
+        for (int j = 0; j < TJ; j++)
+            v[i * TJ + j] = (__fmul_rn(a[i].x, b[j].x) + __fmul_rn(a[i].z, b[j].z)) + (__fmul_rn(a[i].y, b[j].y) + __fmul_rn(a[i].w, b[j].w));
+}
+template <int TJ>
+__device__ __forceinline__ void k3ds_w(float *w, const float4 *sq, const float4 *sk, uint32_t la, uint32_t lb) {
+    float va[4 * TJ], vb[4 * TJ];
+    k3ds_v<TJ>(va, sq, sk, la);
+    k3ds_v<TJ>(vb, sq, sk, lb);
+#pragma unroll
+    for (int u = 0; u < 4 * TJ; u++) w[u] = va[u] + vb[u];
+}
+template <int TJ>
+__device__ __forceinline__ void k3ds_tree(float *dot, const float4 *sq, const float4 *sk) {
+    constexpr int N = 4 * TJ;
+    float w0[N], w1[N], x0[N], x1[N], y0[N], z0[N];
+    k3ds_w<TJ>(w0, sq, sk, 0, 16); k3ds_w<TJ>(w1, sq, sk, 8, 24);
+#pragma unroll
+    for (int u = 0; u < N; u++) x0[u] = w0[u] + w1[u];                       /* x0 = w0 + w8 */
+    k3ds_w<TJ>(w0, sq, sk, 4, 20); k3ds_w<TJ>(w1, sq, sk, 12, 28);
+#pragma unroll
+    for (int u = 0; u < N; u++) { x1[u] = w0[u] + w1[u]; y0[u] = x0[u] + x1[u]; }   /* x4; y0 = x0 + x4 */
+    k3ds_w<TJ>(w0, sq, sk, 2, 18); k3ds_w<TJ>(w1, sq, sk, 10, 26);
+#pragma unroll
+    for (int u = 0; u < N; u++) x0[u] = w0[u] + w1[u];                       /* x2 */
+    k3ds_w<TJ>(w0, sq, sk, 6, 22); k3ds_w<TJ>(w1, sq, sk, 14, 30);
+#pragma unroll
+    for (int u = 0; u < N; u++) { x1[u] = w0[u] + w1[u]; z0[u] = y0[u] + (x0[u] + x1[u]); }   /* x6; z0 = y0 + (x2 + x6) */
+    k3ds_w<TJ>(w0, sq, sk, 1, 17); k3ds_w<TJ>(w1, sq, sk, 9, 25);
+#pragma unroll
+    for (int u = 0; u < N; u++) x0[u] = w0[u] + w1[u];                       /* x1 */
+    k3ds_w<TJ>(w0, sq, sk, 5, 21); k3ds_w<TJ>(w1, sq, sk, 13, 29);
+#pragma unroll
+    for (int u = 0; u < N; u++) { x1[u] = w0[u] + w1[u]; y0[u] = x0[u] + x1[u]; }   /* x5; y1 = x1 + x5 */
+    k3ds_w<TJ>(w0, sq, sk, 3, 19); k3ds_w<TJ>(w1, sq, sk, 11, 27);
+#pragma unroll
+    for (int u = 0; u < N; u++) x0[u] = w0[u] + w1[u];                       /* x3 */
+    k3ds_w<TJ>(w0, sq, sk, 7, 23); k3ds_w<TJ>(w1, sq, sk, 15, 31);
+#pragma unroll
+    for (int u = 0; u < N; u++) { x1[u] = w0[u] + w1[u]; dot[u] = z0[u] + (y0[u] + (x0[u] + x1[u])); }   /* x7; z0 + (y1 + (x3 + x7)) */
+}
+template <int TJ>
+__global__ static void __launch_bounds__(256, 1) k3_dsa_scores_tile_kernel(float *scores, const float *q, const float *weights,
+        const float *key, uint32_t n_rows, uint32_t n_tokens, uint32_t pos0, uint32_t n_head, float scale) {
+    extern __shared__ float4 k3ds_sm4[];
+    float4 *sk = k3ds_sm4;                                /* 32*TJ rows x 33 (32 lanes + 1 pad) */
+    float4 *sq = sk + 32 * TJ * 33;                       /* 32 tokens x 32 lanes, one head */
+    float *sw = (float *)(sq + 32 * 32);                  /* 32 tokens x n_head weights */
+    const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5u;
+    const uint32_t r0 = blockIdx.x * (32u * TJ), t0 = blockIdx.y * 32u;
+    const uint32_t t_end = t0 + 32u < n_tokens ? t0 + 32u : n_tokens;
+    const uint32_t vis_max = pos0 + t_end < n_rows ? pos0 + t_end : n_rows;   /* the block's last token's limit */
+    if (r0 >= vis_max) {   /* every row of the block is past every token's limit */
+        for (uint32_t i = 0; i < 4u; i++) {
+            const uint32_t t = t0 + warp * 4u + i;
+            if (t >= n_tokens) break;
+            for (uint32_t j = 0; j < (uint32_t)TJ; j++) { const uint32_t r = r0 + lane + 32u * j; if (r < n_rows) scores[(size_t)t * n_rows + r] = -INFINITY; }
+        }
+        return;
+    }
+    for (uint32_t x = threadIdx.x; x < 32u * TJ * 32u; x += blockDim.x) {
+        const uint32_t r = x >> 5u, l = x & 31u, row = r0 + r;
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (row < n_rows) { const float *kr = key + (size_t)row * 128u; v = make_float4(kr[l], kr[l + 32u], kr[l + 64u], kr[l + 96u]); }
+        sk[r * 33u + l] = v;
+    }
+    for (uint32_t x = threadIdx.x; x < 32u * n_head; x += blockDim.x) {
+        const uint32_t t = x / n_head, h = x - t * n_head, tok = t0 + t;
+        sw[x] = tok < n_tokens ? weights[(size_t)tok * n_head + h] : 0.0f;
+    }
+    float4 pf[4];
+#define K3DS_QLOAD(hh) \
+    for (uint32_t u = 0; u < 4u; u++) { \
+        const uint32_t x = threadIdx.x + u * 256u, t = x >> 5u, l = x & 31u, tok = t0 + t; \
+        pf[u] = make_float4(0.0f, 0.0f, 0.0f, 0.0f); \
+        if (tok < n_tokens) { const float *qr = q + ((size_t)tok * n_head + (hh)) * 128u; pf[u] = make_float4(qr[l], qr[l + 32u], qr[l + 64u], qr[l + 96u]); } \
+    }
+    K3DS_QLOAD(0u);
+    float total[4 * TJ];
+#pragma unroll
+    for (int u = 0; u < 4 * TJ; u++) total[u] = 0.0f;
+    for (uint32_t h = 0; h < n_head; h++) {
+        __syncthreads();   /* the previous head's queries were read (the first time: keys and weights stored) */
+        for (uint32_t u = 0; u < 4u; u++) sq[threadIdx.x + u * 256u] = pf[u];
+        __syncthreads();
+        if (h + 1u < n_head) { K3DS_QLOAD(h + 1u); }
+        float dot[4 * TJ];
+        k3ds_tree<TJ>(dot, sq + warp * 4u * 32u, sk + lane * 33u);
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const float wv = sw[(warp * 4u + i) * n_head + h];
+#pragma unroll
+            for (int j = 0; j < TJ; j++) total[i * TJ + j] += fmaxf(dot[i * TJ + j], 0.0f) * wv;
+        }
+    }
+#undef K3DS_QLOAD
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const uint32_t t = t0 + warp * 4u + i;
+        if (t >= n_tokens) break;
+        const uint32_t vis = pos0 + t + 1u, lim = vis < n_rows ? vis : n_rows;
+#pragma unroll
+        for (int j = 0; j < TJ; j++) {
+            const uint32_t r = r0 + lane + 32u * j;
+            if (r < n_rows) scores[(size_t)t * n_rows + r] = r >= lim ? -INFINITY : total[i * TJ + j] * scale;
+        }
+    }
+}
+static bool k3_dsa_scores_tile_launch(float *scores, const float *q, const float *weights, const float *key, uint32_t n_rows,
+                                      uint32_t n_tokens, uint32_t pos0, uint32_t n_head, float scale, cudaStream_t st) {
+    static int tj = -1;
+    if (tj < 0) { tj = (int)k3_env_u32("DS4_K3_DSA_TILE_TJ", 4u); if (tj != 2 && tj != 4) tj = 4; }
+    const size_t smem = ((size_t)32u * tj * 33u + 32u * 32u) * sizeof(float4) + (size_t)32u * n_head * sizeof(float);
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 8) return false;
+    static bool attr_set[2][8] = {};
+    const int ti = tj == 4 ? 0 : 1;
+    if (!attr_set[ti][dev]) {
+        const cudaError_t e = tj == 4 ? cudaFuncSetAttribute(k3_dsa_scores_tile_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)
+                                      : cudaFuncSetAttribute(k3_dsa_scores_tile_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        if (e != cudaSuccess) { (void)cudaGetLastError(); return false; }
+        attr_set[ti][dev] = true;
+    }
+    const dim3 grid((n_rows + 32u * tj - 1u) / (32u * tj), (n_tokens + 31u) / 32u, 1u);
+    if (tj == 4) k3_dsa_scores_tile_kernel<4><<<grid, 256, smem, st>>>(scores, q, weights, key, n_rows, n_tokens, pos0, n_head, scale);
+    else k3_dsa_scores_tile_kernel<2><<<grid, 256, smem, st>>>(scores, q, weights, key, n_rows, n_tokens, pos0, n_head, scale);
+    return cudaGetLastError() == cudaSuccess;
+}
 __global__ static void k3_bits_diff_kernel(const float *a, const float *b, uint64_t n, unsigned long long *count) {
     unsigned long long c = 0;
     for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (uint64_t)gridDim.x * blockDim.x)
@@ -45591,8 +45733,40 @@ extern "C" int ds4_gpu_k3_dsa_scores_tensor(ds4_gpu_tensor *scores, const ds4_gp
         q->bytes < (uint64_t)n_tokens * n_head * 128u * sizeof(float) || weights->bytes < (uint64_t)n_tokens * n_head * sizeof(float) ||
         key_cache->bytes < (uint64_t)n_rows * 128u * sizeof(float) || scores->bytes < (uint64_t)n_tokens * n_rows * sizeof(float)) return 0;
     static int mode = -1;   /* step 101: 1 warp kernel (default), 0 GLM kernel, 2 both, compared bit for bit */
-    if (mode < 0) { const char *e = getenv("DS4_K3_DSA_SCORES"); mode = !e ? 1 : !strcmp(e, "check") ? 2 : (atoi(e) ? 1 : 0); }
+    if (mode < 0) { const char *e = getenv("DS4_K3_DSA_SCORES");
+                    mode = !e ? 5 : !strcmp(e, "check") ? 2 : !strcmp(e, "tile") ? 3 : !strcmp(e, "tilecheck") ? 4 : !strcmp(e, "warp") ? 1 : (atoi(e) ? 1 : 0); }
     cudaStream_t st = cuda_decode_stream();
+    if ((mode == 3 || mode == 4 || (mode == 5 && n_tokens >= 32u)) && n_head <= 64u) {   /* K3-DS: the tiled kernel, the same bits (default: 32 tokens or more) */
+        if (!k3_dsa_scores_tile_launch((float *)scores->ptr, (const float *)q->ptr, (const float *)weights->ptr,
+                                       (const float *)key_cache->ptr, n_rows, n_tokens, pos0, n_head, scale, st))
+            return cuda_ok(cudaGetLastError(), "K3 DSA scores (tile) launch");
+        if (mode == 4) {   /* the warp kernel into a second buffer, compared bit for bit */
+            static float *ref = nullptr; static size_t ref_cap = 0; static unsigned long long *dcount = nullptr;
+            static uint64_t calls = 0, all = 0, bad = 0;
+            const size_t cnt = (size_t)n_tokens * n_rows;
+            if (ref_cap < cnt) {
+                if (cudaStreamSynchronize(st) != cudaSuccess) return 0;
+                if (ref) cudaFree(ref);
+                ref = nullptr; ref_cap = 0;
+                if (cudaMalloc(&ref, cnt * sizeof(float)) != cudaSuccess) return cuda_ok(cudaGetLastError(), "K3-DS check buffer");
+                ref_cap = cnt;
+            }
+            if (!dcount && cudaMalloc(&dcount, sizeof(*dcount)) != cudaSuccess) return cuda_ok(cudaGetLastError(), "K3-DS check counter");
+            k3_dsa_scores_warp_kernel<<<dim3((n_rows + 255u) / 256u, n_tokens, 1u), 256, (size_t)n_head * 129u * sizeof(float), st>>>(
+                ref, (const float *)q->ptr, (const float *)weights->ptr, (const float *)key_cache->ptr, n_rows, n_tokens, pos0, n_head, scale);
+            unsigned long long hcount = 0;
+            if (cudaMemsetAsync(dcount, 0, sizeof(*dcount), st) != cudaSuccess) return cuda_ok(cudaGetLastError(), "K3-DS check");
+            k3_bits_diff_kernel<<<1024, 256, 0, st>>>((const float *)scores->ptr, ref, (uint64_t)cnt, dcount);
+            if (cudaMemcpyAsync(&hcount, dcount, sizeof(hcount), cudaMemcpyDeviceToHost, st) != cudaSuccess || cudaStreamSynchronize(st) != cudaSuccess)
+                return cuda_ok(cudaGetLastError(), "K3-DS check readback");
+            calls++; all += cnt; bad += hcount;
+            if (hcount || calls % 12u == 0u)
+                fprintf(stderr, "ds4: K3-DS tile check: %llu calls, %llu scores compared, %llu differ%s\n", (unsigned long long)calls,
+                        (unsigned long long)all, (unsigned long long)bad, hcount ? " (this call differs)" : "");
+            if (hcount) { fprintf(stderr, "ds4: K3-DS TILE CHECK FAILED (rows %u, tokens %u, pos0 %u)\n", n_rows, n_tokens, pos0); return 0; }
+        }
+        return 1;
+    }
     if (mode == 0 || n_head > 64u) {
         glm_indexer_scores_f32_kernel<float><<<dim3(n_rows, n_tokens, 1u), 128, 0, st>>>((float *)scores->ptr,
             (const float *)q->ptr, (const float *)weights->ptr, (const float *)key_cache->ptr, n_rows, n_tokens, pos0, n_head, 128u, 1u,
