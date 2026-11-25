@@ -65366,6 +65366,7 @@ static inline k3_gpu_buffers *k3_b_of(k3_gpu_buffers *b, uint32_t il) { return k
    layer's normed rows while the layer's card computes its other projections; each projection is the call one card makes,
    so the logits are the same bits, and no weight is held twice. */
 static int k3_tp_env(void) { static int v = -1; if (v < 0) { const char *e = getenv("DS4_K3_TP"); v = e && atoi(e) != 0; } return v; }
+static int k3_tp_shared_env(void) { static int v = -1; if (v < 0) { const char *e = getenv("DS4_K3_TP_SHARED"); v = k3_tp_env() && e && atoi(e) != 0; } return v; }   /* K3-TP shared */
 static int g_k3_tp = 0;
 static k3_gpu_buffers *g_k3_tp_hb = NULL;   /* the other card's working tensors for the layer being run (decode) */
 static ds4_gpu_tensor *k3_gpu_alloc_bytes(uint64_t bytes) {
@@ -65810,6 +65811,18 @@ static bool k3_tp_launch(const k3_gpu_buffers *b, const ds4_model *model, uint32
     if (ok && w1) ok = k3_gpu_matmul(h->tp_g, model, w1, h->tp_x) && ds4_gpu_k3_tp_push(d1, h->tp_g, (uint64_t)dim * sizeof(float)) != 0;
     return ds4_gpu_set_current_device(to) == 0 && ok;
 }
+/* K3-TP shared: a first-card layer's shared expert on the second card, from a copy of the normed row; the result goes to b->sh_down */
+static bool k3_tp_shared(const k3_gpu_buffers *b, const ds4_model *model, uint32_t il, const ds4_layer_weights *l, uint32_t sh, float sb, float sbl) {
+    k3_gpu_buffers *h = g_k3_tp_hb;
+    const int to = k3_tier(il), th = 1 - to;
+    if (!ds4_gpu_k3_tp_pull(h->tp_x, b->normed, (uint64_t)DS4_N_EMBD * sizeof(float))) return false;
+    if (ds4_gpu_set_current_device(th) != 0) return false;
+    const bool ok = k3_gpu_matmul(h->sh_gate, model, l->ffn_gate_shexp, h->tp_x) && k3_gpu_matmul(h->sh_up, model, l->ffn_up_shexp, h->tp_x) &&
+                    ds4_gpu_k3_situ_tensor(h->sh_mid, h->sh_gate, h->sh_up, sh, sb, sbl) != 0 &&
+                    k3_gpu_matmul(h->sh_down, model, l->ffn_down_shexp, h->sh_mid) &&
+                    ds4_gpu_k3_tp_push(b->sh_down, h->sh_down, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+    return ds4_gpu_set_current_device(to) == 0 && ok;
+}
 static bool k3_gpu_layer_tier(k3_gpu_buffers *b, const ds4_model *model, const ds4_layer_weights *l, uint32_t il,
                               uint32_t pos, uint32_t *n_anchor) {
     const uint32_t n = DS4_N_EMBD;
@@ -65997,7 +66010,9 @@ static bool k3_gpu_layer_tier(k3_gpu_buffers *b, const ds4_model *model, const d
         K3_GPU_CHECK(k3_gpu_matmul(b->moe_latent, model, l->moe_latent_down, b->normed), "latent down");
         const bool ovl = k3_overlap_on();
         const uint32_t sh = (uint32_t)l->ffn_gate_shexp->dim[1];
-        if (ovl) {   /* step M20: before the routed experts, so it runs while their reads are in flight */
+        const bool tps = g_k3_tp && g_k3_tp_hb && k3_tp_shared_env() && k3_tier(il) == 0;   /* K3-TP shared */
+        if (tps) K3_GPU_CHECK(k3_tp_shared(b, model, il, l, sh, sb, sbl), "K3-TP shared expert");
+        if (ovl && !tps) {   /* step M20: before the routed experts, so it runs while their reads are in flight */
             K3_GPU_CHECK(k3_gpu_matmul(b->sh_gate, model, l->ffn_gate_shexp, b->normed), "shared gate");
             K3_GPU_CHECK(k3_gpu_matmul(b->sh_up, model, l->ffn_up_shexp, b->normed), "shared up");
             K3_GPU_CHECK(ds4_gpu_k3_situ_tensor(b->sh_mid, b->sh_gate, b->sh_up, sh, sb, sbl) != 0, "shared situ");
@@ -66013,12 +66028,13 @@ static bool k3_gpu_layer_tier(k3_gpu_buffers *b, const ds4_model *model, const d
         }
         K3_GPU_CHECK(k3_gpu_rms_norm(b->routed_norm, b->routed, model, l->moe_latent_norm, latent), "latent norm");
         K3_GPU_CHECK(k3_gpu_matmul(b->moe_up, model, l->moe_latent_up, b->routed_norm), "latent up");
-        if (!ovl) {
+        if (!ovl && !tps) {
             K3_GPU_CHECK(k3_gpu_matmul(b->sh_gate, model, l->ffn_gate_shexp, b->normed), "shared gate");
             K3_GPU_CHECK(k3_gpu_matmul(b->sh_up, model, l->ffn_up_shexp, b->normed), "shared up");
             K3_GPU_CHECK(ds4_gpu_k3_situ_tensor(b->sh_mid, b->sh_gate, b->sh_up, sh, sb, sbl) != 0, "shared situ");
             K3_GPU_CHECK(k3_gpu_matmul(b->sh_down, model, l->ffn_down_shexp, b->sh_mid), "shared down");
         }
+        if (tps) K3_GPU_CHECK(ds4_gpu_k3_tp_join(k3_tier(il), 1 - k3_tier(il)) != 0, "K3-TP join (shared)");
         K3_GPU_CHECK(ds4_gpu_add_tensor(b->ffn_out, b->moe_up, b->sh_down, n) != 0, "moe + shared");
     }
     K3_GPU_CHECK(ds4_gpu_add_tensor(b->cur, b->prefix, b->ffn_out, n) != 0, "layer residual");
@@ -66218,6 +66234,19 @@ static bool k3_tp_launch_batch(const k3_gpu_batch *bb, const ds4_model *model, u
     if (ok && w1) ok = k3_gpu_matmul_n(h->tp_g, model, w1, h->tp_x, T) && ds4_gpu_k3_tp_push(d1, h->tp_g, (uint64_t)T * dim * sizeof(float)) != 0;
     return ds4_gpu_set_current_device(to) == 0 && ok;
 }
+/* K3-TP shared: the same for a batch of rows (result into bb->sh_down) */
+static bool k3_tp_shared_batch(const k3_gpu_batch *bb, const ds4_model *model, uint32_t il, const ds4_layer_weights *l, uint32_t T,
+                               uint32_t sh, float sb, float sbl) {
+    k3_gpu_batch *h = g_k3_tp_hbb;
+    const int to = k3_tier(il), th = 1 - to;
+    if (!ds4_gpu_k3_tp_pull(h->tp_x, bb->normed, (uint64_t)T * DS4_N_EMBD * sizeof(float))) return false;
+    if (ds4_gpu_set_current_device(th) != 0) return false;
+    const bool ok = k3_gpu_matmul_n(h->sh_gate, model, l->ffn_gate_shexp, h->tp_x, T) && k3_gpu_matmul_n(h->sh_up, model, l->ffn_up_shexp, h->tp_x, T) &&
+                    ds4_gpu_k3_situ_tensor(h->sh_mid, h->sh_gate, h->sh_up, T * sh, sb, sbl) != 0 &&
+                    k3_gpu_matmul_n(h->sh_down, model, l->ffn_down_shexp, h->sh_mid, T) &&
+                    ds4_gpu_k3_tp_push(bb->sh_down, h->sh_down, (uint64_t)T * DS4_N_EMBD * sizeof(float)) != 0;
+    return ds4_gpu_set_current_device(to) == 0 && ok;
+}
 static bool k3_gpu_layer_batch_tier(k3_gpu_buffers *b, k3_gpu_batch *bb, const ds4_model *model, const ds4_layer_weights *l,
                                     uint32_t il, uint32_t pos0, uint32_t *n_anchor, uint32_t ckpt_row, float **ck_conv, float **ck_state) {
     if (il == 1 && getenv("DS4_K3_TRACE_STAGE")) k3_trace_weights(l, il, "batched");
@@ -66383,6 +66412,10 @@ static bool k3_gpu_layer_batch_tier(k3_gpu_buffers *b, k3_gpu_batch *bb, const d
             la = rnext != NULL;
         }
         if (la) K3_GPU_CHECK(k3_gpu_matmul_n(rnext, model, lnx->ffn_gate_inp, bb->normed, T), "lookahead router");
+        static int tp_early = -1;   /* K3-TE: the first card's shared expert on the second card during the routing */
+        if (tp_early < 0) { const char *e = getenv("DS4_K3_TP_SHARED_EARLY"); tp_early = !e || atoi(e) != 0; }
+        const bool tps_early = tp_early && g_k3_tp && g_k3_tp_hbb && k3_tp_shared_env() && k3_tier(il) == 0;
+        if (tps_early) K3_GPU_CHECK(k3_tp_shared_batch(bb, model, il, l, T, (uint32_t)l->ffn_gate_shexp->dim[1], sb, sbl), "K3-TP shared (early)");
         float *rl = xmalloc((size_t)T * DS4_N_EXPERT * sizeof(float));
         int32_t *sel = xmalloc((size_t)T * DS4_N_EXPERT_USED * sizeof(int32_t));
         float *wts = xmalloc((size_t)T * DS4_N_EXPERT_USED * sizeof(float));
@@ -66437,7 +66470,9 @@ static bool k3_gpu_layer_batch_tier(k3_gpu_buffers *b, k3_gpu_batch *bb, const d
         if (timing) tl2 = k3_pf_mark(bb->moe_latent);
         const bool ovl = k3_overlap_on();
         const uint32_t sh = (uint32_t)l->ffn_gate_shexp->dim[1];
-        if (ok && ovl) {   /* step M20: before the routed experts, so it runs while their reads are in flight */
+        const bool tps = g_k3_tp && g_k3_tp_hbb && k3_tp_shared_env() && k3_tier(il) == 0;   /* K3-TP shared */
+        if (ok && tps && !tps_early) ok = k3_tp_shared_batch(bb, model, il, l, T, sh, sb, sbl);
+        if (ok && ovl && !tps) {   /* step M20: before the routed experts, so it runs while their reads are in flight */
             ok = k3_gpu_matmul_n(bb->sh_gate, model, l->ffn_gate_shexp, bb->normed, T) &&
                  k3_gpu_matmul_n(bb->sh_up, model, l->ffn_up_shexp, bb->normed, T) &&
                  ds4_gpu_k3_situ_tensor(bb->sh_mid, bb->sh_gate, bb->sh_up, T * sh, sb, sbl) != 0 &&
@@ -66453,12 +66488,13 @@ static bool k3_gpu_layer_batch_tier(k3_gpu_buffers *b, k3_gpu_batch *bb, const d
         K3_GPU_CHECK(ok, "routed experts (batched raw pipeline)");
         K3_GPU_CHECK(k3_gpu_rms_norm_rows(bb->routed_norm, bb->routed, model, l->moe_latent_norm, latent, T), "latent norm");
         K3_GPU_CHECK(k3_gpu_matmul_n(bb->moe_up, model, l->moe_latent_up, bb->routed_norm, T), "latent up");
-        if (!ovl) {
+        if (!ovl && !tps) {
             K3_GPU_CHECK(k3_gpu_matmul_n(bb->sh_gate, model, l->ffn_gate_shexp, bb->normed, T), "shared gate");
             K3_GPU_CHECK(k3_gpu_matmul_n(bb->sh_up, model, l->ffn_up_shexp, bb->normed, T), "shared up");
             K3_GPU_CHECK(ds4_gpu_k3_situ_tensor(bb->sh_mid, bb->sh_gate, bb->sh_up, T * sh, sb, sbl) != 0, "shared situ");
             K3_GPU_CHECK(k3_gpu_matmul_n(bb->sh_down, model, l->ffn_down_shexp, bb->sh_mid, T), "shared down");
         }
+        if (tps) K3_GPU_CHECK(ds4_gpu_k3_tp_join(k3_tier(il), 1 - k3_tier(il)) != 0, "K3-TP join (shared)");
         K3_GPU_CHECK(ds4_gpu_add_tensor(bb->ffn_out, bb->moe_up, bb->sh_down, T * n) != 0, "moe + shared");
     }
     K3_GPU_CHECK(ds4_gpu_add_tensor(bb->cur, bb->prefix, bb->ffn_out, T * n) != 0, "layer residual");
@@ -80092,6 +80128,10 @@ static int engine_install_per_device_caches(ds4_engine *e) {
                 static bool said = false;
                 if (!said) { said = true; fprintf(stderr, "ds4: K3-TP: KDA v / output gate and MLA output gate placed on the other card\n"); }
                 logical_tier = 1 - logical_tier;
+            } else if (k3_tp_shared_env() && logical_tier == 0 && (t == lw->ffn_gate_shexp || t == lw->ffn_up_shexp || t == lw->ffn_down_shexp)) {
+                static bool said_sh = false;   /* K3-TP shared */
+                if (!said_sh) { said_sh = true; fprintf(stderr, "ds4: K3-TP shared: the first card's layers keep their shared expert on the second card\n"); }
+                logical_tier = 1;
             }
         }
         if (logical_tier < 0 || logical_tier >= e->gpu_cfg.n_gpus) {
