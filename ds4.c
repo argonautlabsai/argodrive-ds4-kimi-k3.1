@@ -66935,6 +66935,11 @@ static int k3_gpu_prefill_lm(k3_gpu_buffers *b, const ds4_model *model, const ds
     for (uint32_t il = 0; il < L; il++) if (!ds4_k3_layer_is_kda(il)) { grow_after = il; break; }
     bool grew = false;
     const int cut = g_k3_split_cut;
+    {   /* K3-ES 3: the expert split only with enough passes to reuse its slab copies */
+        const char *ep = getenv("DS4_K3_ES_PASSES");
+        const uint32_t es_min = ep && atoi(ep) > 0 ? (uint32_t)atoi(ep) : 3u;
+        ds4_gpu_k3_expert_split_allow(C >= es_min);
+    }
     const bool lm_trace = getenv("DS4_K3_LM_TRACE") != NULL;   /* K3-LM trace */
     if (lm_trace) { struct timespec rt; clock_gettime(CLOCK_REALTIME, &rt);
                     fprintf(stderr, "ds4: K3-LM trace start wall %.3f\n", (double)rt.tv_sec + (double)rt.tv_nsec * 1e-9); }
@@ -66960,6 +66965,7 @@ static int k3_gpu_prefill_lm(k3_gpu_buffers *b, const ds4_model *model, const ds
             if (!ds4_gpu_k3_cache_grow_pass(reserve)) fprintf(stderr, "ds4: K3 layer-major prompt pass: the device cache did not grow\n");
         }
     }
+    ds4_gpu_k3_expert_split_allow(0);   /* K3-ES 3 */
     (void)ds4_gpu_set_current_device(0);
     if (ok) {
         const uint32_t c = C - 1u;
@@ -69370,6 +69376,7 @@ static int generate_k3_cuda_argmax(
             continue;
         }
         if ((g_k3_qwen.active || (g_k3_copy.active && g_k3_copy.mode == 1)) && !k3_qwen_bufs()) { g_k3_qwen.active = false; g_k3_copy.active = false; }   /* step 120b: block buffers first, the cache grows around them */
+        ds4_gpu_k3_prompt_buffers_release();   /* K3-ES, K3-TP attention: the prompt pass's buffers on both cards */
         ds4_gpu_k3_cache_grow();   /* the spine is fully staged by now: size the device expert cache (once) */
         if (g_k3_split_cut > 0) (void)ds4_gpu_k3_g1_restore();   /* step 155: the second card's slabs, if a prompt pass borrowed them */
         /* generation */

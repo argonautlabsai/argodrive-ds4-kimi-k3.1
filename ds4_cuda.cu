@@ -42711,6 +42711,7 @@ struct k3_lru {
     }
 };
 
+struct k3_gemm32_scratch;   /* K3-ES */
 struct k3_raw_pool {
     bool ready = false;
     uint32_t ff = 0, latent = 0, max_tok = 0, max_pending = 16;
@@ -42793,6 +42794,18 @@ struct k3_raw_pool {
     std::deque<k3_raw_job> jobs_pf;                 /* K3-LM: a layer-major pass's read-ahead, taken only when no demand job waits */
     uint32_t lm_pf_cap = 0;                         /* K3-LM: next-layer device read-ahead that fits beside a full layer */
     uint32_t lm_pf_layer = ~0u, lm_pf_done = 0;     /* K3-LM stage 3b: device read-ahead issued so far for that next layer */
+    bool es_req = false, es_init = false, es_ok = false;   /* K3-ES: a prompt pass's experts split between the cards */
+    bool es_allow = false;                             /* K3-ES 3: set by a layer-major pass of enough passes */
+    int es_dev = -1;                                    /* the second card's CUDA device */
+    cudaStream_t es_s1 = nullptr, es_s0c = nullptr;     /* the second card's compute stream; the first card's slab-copy stream */
+    cublasHandle_t es_h1 = nullptr;
+    k3_gemm32_scratch *es_g = nullptr;                  /* on the second card */
+    float *es_x = nullptr, *es_pc = nullptr, *es_tw = nullptr; uint32_t *es_tok = nullptr, *es_iota = nullptr;
+    size_t es_x_cap = 0, es_pc_cap = 0, es_l_cap = 0;
+    uint8_t *es_slab = nullptr; uint32_t es_slab_n = 0, es_slab_used = 0, es_slab_layer = ~0u; int32_t es_slab_of[1024];
+    std::vector<cudaEvent_t> es_ev_slab;                /* first card: slab j copied */
+    cudaEvent_t es_ev_in = nullptr, es_ev_done = nullptr, es_ev_layer = nullptr;
+    uint64_t es_experts = 0, es_copies = 0;
     std::deque<uint32_t> ready_q;                   /* device slabs whose fill (read + upload) was issued */
     std::vector<uint32_t> failed_slabs;
     int failed = 0;
@@ -43493,6 +43506,7 @@ static bool k3_raw_pool_ensure(uint32_t ff, uint32_t latent) {
     p.bulk_pf_mode = getenv("DS4_K3_PREFILL_PREFETCH") ? atoi(getenv("DS4_K3_PREFILL_PREFETCH")) : 2;   /* step 93 default */
     p.bulk_pf_max = k3_env_u32("DS4_K3_PREFILL_PREFETCH_N", 256u); if (p.bulk_pf_max > 1024u) p.bulk_pf_max = 1024u;   /* step 108 */
     p.bulk_pf_inflight = k3_env_u32("DS4_K3_PREFILL_PREFETCH_INFLIGHT", 256u);   /* step 108 default */
+    p.es_req = k3_env_u32("DS4_K3_EXPERT_SPLIT", 0u) != 0u;   /* K3-ES */
     p.bulk_pf_div = k3_env_u32("DS4_K3_PREFILL_PREFETCH_DIV", 5u); if (p.bulk_pf_div == 0u) p.bulk_pf_div = 1u;   /* default 5 since step 93 */
     p.bulk_pf_min = k3_env_u32("DS4_K3_PREFILL_PREFETCH_MIN", 0u);   /* step 88 */
     {
@@ -43742,6 +43756,33 @@ static bool k3_gemm32_scratch_ensure(uint32_t ff, uint32_t latent, uint32_t n_to
     }
     g.ff = ff; g.latent = latent; g.cap_tok = n_tok;
     return true;
+}
+static bool k3_gemm32_scratch_ensure_on(k3_gemm32_scratch &g, uint32_t ff, uint32_t latent, uint32_t n_tok, cudaStream_t st) {   /* K3-ES */
+    if (g.ff == ff && g.latent == latent && g.cap_tok >= n_tok) return true;
+    if (cudaStreamSynchronize(st) != cudaSuccess) return false;
+    cudaFree(g.w1); cudaFree(g.w3); cudaFree(g.w2); cudaFree(g.x3); cudaFree(g.m3); cudaFree(g.mid); cudaFree(g.gate); cudaFree(g.up); cudaFree(g.part);
+    g = k3_gemm32_scratch();
+    const size_t wn = (size_t)ff * latent;
+    if (cudaMalloc(&g.w1, wn * 2) != cudaSuccess || cudaMalloc(&g.w3, wn * 2) != cudaSuccess || cudaMalloc(&g.w2, wn * 2) != cudaSuccess ||
+        cudaMalloc(&g.x3, (size_t)3 * n_tok * latent * 2) != cudaSuccess || cudaMalloc(&g.m3, (size_t)3 * n_tok * ff * 2) != cudaSuccess ||
+        cudaMalloc(&g.mid, (size_t)n_tok * ff * 4) != cudaSuccess || cudaMalloc(&g.gate, (size_t)n_tok * ff * 4) != cudaSuccess ||
+        cudaMalloc(&g.up, (size_t)n_tok * ff * 4) != cudaSuccess || cudaMalloc(&g.part, (size_t)n_tok * latent * 4) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaFree(g.w1); cudaFree(g.w3); cudaFree(g.w2); cudaFree(g.x3); cudaFree(g.m3); cudaFree(g.mid); cudaFree(g.gate); cudaFree(g.up); cudaFree(g.part);
+        g = k3_gemm32_scratch();
+        return false;
+    }
+    g.ff = ff; g.latent = latent; g.cap_tok = n_tok;
+    return true;
+}
+__global__ static void k3_es_iota_kernel(uint32_t *o, uint64_t n) {
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (uint64_t)gridDim.x * blockDim.x) o[i] = (uint32_t)i;
+}
+static bool k3_es_grow(void **p, size_t *cap, size_t need) {   /* on the current device */
+    if (*cap >= need) return true;
+    if (*p) { cudaFree(*p); *p = nullptr; *cap = 0; }
+    if (cudaMalloc(p, need) != cudaSuccess) { (void)cudaGetLastError(); *p = nullptr; return false; }
+    *cap = need; return true;
 }
 __global__ static void k3_raw_dequant_f32_kernel(float *out, const uint8_t *packed, const uint8_t *scales, uint32_t n_blocks) {
     __shared__ float tbl[16];
@@ -44179,6 +44220,85 @@ static int k3_moe_raw_batch_impl(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, c
     if (p.g1_n != 0u && !g1_plain && !g1_blk_on) { p.dc.bar_lo = p.g1_base; p.dc.bar_n = p.g1_n; }
     bool g1_prepped = false;
     uint32_t n_g1 = 0;
+    /* K3-ES: this call's experts split between the cards */
+    bool es_on = false, es_any = false;
+    uint8_t es_u1[1024]; memset(es_u1, 0, sizeof(es_u1));
+    if (p.es_req && p.es_allow && gemm_ok && g_k3_f32_act && use_cpart && n_tok >= 1024u && !p.verify && g_n_gpus == 2) {
+        if (!p.es_init) {
+            p.es_init = true;
+            const int t1 = 1, d1 = g_gpu[t1].device_id;
+            bool ok = g_gpu_peer_ok[0][1] && g_gpu_peer_ok[1][0];
+            cublasMath_t mm = CUBLAS_DEFAULT_MATH;
+            (void)cublasGetMathMode(cublas, &mm);
+            if (ok) ok = cudaStreamCreateWithFlags(&p.es_s0c, cudaStreamNonBlocking) == cudaSuccess &&
+                         cudaEventCreateWithFlags(&p.es_ev_in, cudaEventDisableTiming) == cudaSuccess;
+            p.es_slab_n = k3_env_u32("DS4_K3_ES_SLABS", 512u);
+            if (ok) { p.es_ev_slab.assign(p.es_slab_n, nullptr);
+                      for (uint32_t j = 0; ok && j < p.es_slab_n; j++) ok = cudaEventCreateWithFlags(&p.es_ev_slab[j], cudaEventDisableTiming) == cudaSuccess; }
+            if (ok) {
+                ok = cudaSetDevice(d1) == cudaSuccess && cudaStreamCreateWithFlags(&p.es_s1, cudaStreamNonBlocking) == cudaSuccess &&
+                     cublasCreate(&p.es_h1) == CUBLAS_STATUS_SUCCESS && cublasSetMathMode(p.es_h1, mm) == CUBLAS_STATUS_SUCCESS &&
+                     cublasSetStream(p.es_h1, p.es_s1) == CUBLAS_STATUS_SUCCESS &&
+                     cudaEventCreateWithFlags(&p.es_ev_done, cudaEventDisableTiming) == cudaSuccess &&
+                     cudaEventCreateWithFlags(&p.es_ev_layer, cudaEventDisableTiming) == cudaSuccess;
+                if (ok) p.es_g = new k3_gemm32_scratch();
+                (void)cudaSetDevice(p.device);
+            }
+            (void)cudaGetLastError();
+            p.es_dev = d1; p.es_ok = ok;
+            fprintf(stderr, "ds4: K3-ES: prompt-pass experts split between the cards %s (%u slab copies on the second card)\n", ok ? "on" : "unavailable", p.es_slab_n);
+        }
+        if (p.es_ok) {   /* the second card's buffers for this call (made while the pass's VRAM is free; released at generation start) */
+            const size_t need_x = (size_t)n_tok * latent * sizeof(float), need_pc = (size_t)n_list * latent * sizeof(float);
+            bool ok = cudaSetDevice(p.es_dev) == cudaSuccess;
+            if (ok && (p.es_x_cap < need_x || p.es_pc_cap < need_pc || p.es_l_cap < (size_t)n_list)) ok = cudaStreamSynchronize(p.es_s1) == cudaSuccess;
+            ok = ok && k3_es_grow((void **)&p.es_x, &p.es_x_cap, need_x) && k3_es_grow((void **)&p.es_pc, &p.es_pc_cap, need_pc);
+            if (ok && p.es_l_cap < (size_t)n_list) {
+                if (p.es_tok) cudaFree(p.es_tok); if (p.es_tw) cudaFree(p.es_tw); if (p.es_iota) cudaFree(p.es_iota);
+                p.es_tok = nullptr; p.es_tw = nullptr; p.es_iota = nullptr; p.es_l_cap = 0;
+                ok = cudaMalloc(&p.es_tok, (size_t)n_list * 4) == cudaSuccess && cudaMalloc(&p.es_tw, (size_t)n_list * 4) == cudaSuccess &&
+                     cudaMalloc(&p.es_iota, (size_t)n_list * 4) == cudaSuccess;
+                if (ok) { k3_es_iota_kernel<<<(unsigned)((n_list + 255u) / 256u > 4096u ? 4096u : (n_list + 255u) / 256u), 256, 0, p.es_s1>>>(p.es_iota, n_list); p.es_l_cap = n_list; }
+            }
+            if (ok && !p.es_slab) ok = cudaMalloc(&p.es_slab, (size_t)p.es_slab_n * p.file_bytes) == cudaSuccess;
+            uint32_t maxkt = 0; for (uint32_t i = 0; i < n_union; i++) if (count[ulist[i]] > maxkt) maxkt = count[ulist[i]];
+            if (ok) ok = k3_gemm32_scratch_ensure_on(*p.es_g, ff, latent, maxkt > 2048u ? maxkt : 2048u, p.es_s1);
+            (void)cudaGetLastError();
+            (void)cudaSetDevice(p.device);
+            es_on = ok;
+        }
+    }
+    if (es_on) {
+        if (p.es_slab_layer != layer) {   /* a new layer: its slab copies wait for the second card's work on the previous layer */
+            p.es_slab_layer = layer; p.es_slab_used = 0;
+            for (uint32_t i = 0; i < 1024u; i++) p.es_slab_of[i] = -1;
+            bool ok = cudaSetDevice(p.es_dev) == cudaSuccess && cudaEventRecord(p.es_ev_layer, p.es_s1) == cudaSuccess;
+            ok = cudaSetDevice(p.device) == cudaSuccess && ok && cudaStreamWaitEvent(p.es_s0c, p.es_ev_layer, 0) == cudaSuccess;
+            if (!ok) return cuda_ok(cudaGetLastError(), "K3-ES layer");
+        }
+        /* experts already copied to the second card this layer stay there; the rest by rows, to the card with fewer so far
+           (the second card pays the slab copies) */
+        uint64_t r0 = 0, r1 = 0;
+        for (uint32_t i = 0; i < n_union; i++) {
+            const uint32_t e = ulist[i];
+            if (count[e] >= (uint32_t)gemm_min && p.es_slab_of[e] >= 0) { es_u1[e] = 1; r1 += count[e]; }
+        }
+        for (uint32_t i = 0; i < n_union; i++) {
+            const uint32_t e = ulist[i];
+            if (es_u1[e]) continue;
+            if (count[e] < (uint32_t)gemm_min) { r0 += count[e]; continue; }
+            if (r1 * 11u < r0 * 10u) { es_u1[e] = 1; r1 += count[e]; } else r0 += count[e];
+        }
+        /* the inputs: the first card's rows, lists and zeroed partials are ready at this point of `stream` */
+        bool ok = cudaEventRecord(p.es_ev_in, stream) == cudaSuccess && cudaSetDevice(p.es_dev) == cudaSuccess &&
+                  cudaStreamWaitEvent(p.es_s1, p.es_ev_in, 0) == cudaSuccess &&
+                  cudaMemcpyPeerAsync(p.es_x, p.es_dev, x->ptr, p.device, (size_t)n_tok * latent * sizeof(float), p.es_s1) == cudaSuccess &&
+                  cudaMemcpyPeerAsync(p.es_tok, p.es_dev, p.dev_tok, p.device, (size_t)n_list * 4, p.es_s1) == cudaSuccess &&
+                  cudaMemcpyPeerAsync(p.es_tw, p.es_dev, p.dev_tw, p.device, (size_t)n_list * 4, p.es_s1) == cudaSuccess &&
+                  cudaMemsetAsync(p.es_pc, 0, (size_t)n_list * latent * sizeof(float), p.es_s1) == cudaSuccess;
+        ok = cudaSetDevice(p.device) == cudaSuccess && ok;
+        if (!ok) return cuda_ok(cudaGetLastError(), "K3-ES inputs");
+    }
     const uint32_t g1_n_rows = g1_blk_on ? (uint32_t)n_list : n_union;   /* rows of `latent` floats that may come back */
     uint8_t g1_is[4096];
     if (g1_inplace) memset(g1_is, 0, g1_n_rows);
@@ -44244,6 +44364,45 @@ static int k3_moe_raw_batch_impl(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, c
     auto launch = [&](uint32_t d, uint32_t e) -> bool {
         const bool on1 = p.g1_n != 0u && d - p.g1_base < p.g1_n;   /* step 140 */
         if (on1 && g1_inplace) return g1_launch(d, e);
+        if (es_on && es_u1[e] && !on1) {   /* K3-ES: this expert on the second card */
+            int32_t j = p.es_slab_of[e];
+            bool ok = true;
+            if (j < 0 && p.es_slab_used < p.es_slab_n) {   /* its slab to the second card, once per layer */
+                j = (int32_t)p.es_slab_used++; p.es_slab_of[e] = j;
+                ok = cudaStreamWaitEvent(p.es_s0c, p.dev_ready[d], 0) == cudaSuccess &&
+                     cudaMemcpyPeerAsync(p.es_slab + (size_t)j * p.file_bytes, p.es_dev, p.dev_ptr[d], p.device, p.file_bytes, p.es_s0c) == cudaSuccess &&
+                     cudaEventRecord(p.es_ev_slab[(uint32_t)j], p.es_s0c) == cudaSuccess;
+                if (ok) { ok = cudaSetDevice(p.es_dev) == cudaSuccess && cudaStreamWaitEvent(p.es_s1, p.es_ev_slab[(uint32_t)j], 0) == cudaSuccess;
+                          ok = cudaSetDevice(p.device) == cudaSuccess && ok; }
+                p.es_copies++;
+            }
+            if (j >= 0) {
+                ok = ok && cudaEventRecord(p.dev_free[d], p.es_s0c) == cudaSuccess && cudaSetDevice(p.es_dev) == cudaSuccess;
+                if (ok) {
+                    k3_gemm32_scratch &g = *p.es_g;
+                    const uint8_t *slab1 = p.es_slab + (size_t)j * p.file_bytes;
+                    const uint32_t nb = ff * latent / 32u, kt = count[e];
+                    const unsigned g4 = (unsigned)((nb * 4u + 255u) / 256u);
+                    k3_raw_dequant4_kernel<<<g4, 256, 0, p.es_s1>>>(g.w1, slab1 + p.w1p, slab1 + p.w1s, nb);
+                    k3_raw_dequant4_kernel<<<g4, 256, 0, p.es_s1>>>(g.w3, slab1 + p.w3p, slab1 + p.w3s, nb);
+                    k3_raw_dequant4_kernel<<<g4, 256, 0, p.es_s1>>>(g.w2, slab1 + p.w2p, slab1 + p.w2s, nb);
+                    k3_gather_split3_kernel<<<(kt * latent + 255u) / 256u, 256, 0, p.es_s1>>>(g.x3, p.es_x, p.es_tok + off[e], kt, latent);
+                    ok = k3_gemm_split3(p.es_h1, g.w1, g.x3, g.gate, (int)ff, (int)kt, (int)latent) &&
+                         k3_gemm_split3(p.es_h1, g.w3, g.x3, g.up, (int)ff, (int)kt, (int)latent);
+                    if (ok) {
+                        k3_situ_split3_kernel<<<(kt * ff + 255u) / 256u, 256, 0, p.es_s1>>>(g.m3, g.mid, g.gate, g.up, kt * ff, beta, beta_linear);
+                        ok = k3_gemm_split3(p.es_h1, g.w2, g.m3, g.part, (int)latent, (int)kt, (int)ff);
+                    }
+                    if (ok) k3_scatter_add_kernel<<<(kt * latent + 255u) / 256u, 256, 0, p.es_s1>>>(p.es_pc, g.part, p.es_iota + off[e], p.es_tw + off[e], kt, latent);
+                    ok = ok && cudaGetLastError() == cudaSuccess;
+                }
+                ok = cudaSetDevice(p.device) == cudaSuccess && ok;
+                if (!ok) return cuda_ok(cudaGetLastError(), "K3-ES expert") != 0 && false;
+                es_u1[e] = 2; es_any = true; p.es_experts++;
+                return true;
+            }
+            es_u1[e] = 0;   /* no slab copy left on the second card: this expert on the first card */
+        }
         const uint8_t *slab = on1 ? g1_fetch(d) : p.dev_ptr[d];
         if (!slab) return false;
         float *acc_out = use_part ? p.dev_part + (size_t)part_idx[e] * n_tok * latent : (use_cpart ? p.dev_cpart : (float *)out->ptr);
@@ -44725,6 +44884,18 @@ static int k3_moe_raw_batch_impl(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, c
             a = b + 1u;
         }
         if (!ok) return cuda_ok(cudaGetLastError(), "K3 second-card rows");
+    }
+    if (es_any) {   /* K3-ES: the second card's rows into the first card's partials (zero there), then the reduction waits */
+        bool ok = cudaSetDevice(p.es_dev) == cudaSuccess;
+        for (uint32_t i = 0; ok && i < n_union; i++) {
+            const uint32_t e = ulist[i];
+            if (es_u1[e] != 2u) continue;
+            ok = cudaMemcpyPeerAsync(p.dev_cpart + (size_t)off[e] * latent, p.device, p.es_pc + (size_t)off[e] * latent, p.es_dev,
+                                     (size_t)count[e] * latent * sizeof(float), p.es_s1) == cudaSuccess;
+        }
+        ok = ok && cudaEventRecord(p.es_ev_done, p.es_s1) == cudaSuccess;
+        ok = cudaSetDevice(p.device) == cudaSuccess && ok && cudaStreamWaitEvent(stream, p.es_ev_done, 0) == cudaSuccess;
+        if (!ok) return cuda_ok(cudaGetLastError(), "K3-ES join");
     }
     if (use_part) k3_part_reduce_kernel<<<(unsigned)((n_tok * latent + 255u) / 256u), 256, 0, stream>>>((float *)out->ptr, p.dev_part, n_union, n_tok, latent);
     else if (use_cpart) k3_tent_reduce_kernel<<<(unsigned)((n_tok * latent + 255u) / 256u), 256, 0, stream>>>((float *)out->ptr, p.dev_cpart, p.dev_tent, n_tok, n_used, latent);   /* step 76 */
@@ -46030,6 +46201,31 @@ extern "C" int ds4_gpu_k3_mla_attend_split_tensor(ds4_gpu_tensor *heads_out, con
                          (const float *)value_cache->ptr, heads * vdim, (const uint8_t *)mask->ptr, mask_stride, pos0, n_tok, hs, qk, vdim, scale, 0) &&
          cudaStreamWaitEvent(0, ev_h, 0) == cudaSuccess;
     return ok ? 1 : 0;
+}
+/* K3-ES / K3-TP attention: the prompt pass's buffers on both cards go back (decode's caches get the VRAM at generation start) */
+extern "C" void ds4_gpu_k3_expert_split_allow(int on) { k3_raw_get().es_allow = on != 0; }   /* K3-ES 3 */
+extern "C" void ds4_gpu_k3_prompt_buffers_release(void) {
+    k3_raw_pool &p = k3_raw_get();
+    if (p.es_ok && (p.es_x || p.es_pc || p.es_slab)) {
+        (void)k3_raw_quiesce(p);
+        WITH_DEVICE(p.es_dev) {
+            (void)cudaStreamSynchronize(p.es_s1);
+            cudaFree(p.es_x); cudaFree(p.es_pc); cudaFree(p.es_slab); cudaFree(p.es_tok); cudaFree(p.es_tw); cudaFree(p.es_iota);
+            if (p.es_g) { k3_gemm32_scratch &g = *p.es_g;
+                          cudaFree(g.w1); cudaFree(g.w3); cudaFree(g.w2); cudaFree(g.x3); cudaFree(g.m3); cudaFree(g.mid); cudaFree(g.gate); cudaFree(g.up); cudaFree(g.part);
+                          g = k3_gemm32_scratch(); }
+        }
+        p.es_x = p.es_pc = p.es_tw = nullptr; p.es_tok = p.es_iota = nullptr; p.es_slab = nullptr;
+        p.es_x_cap = p.es_pc_cap = p.es_l_cap = 0; p.es_slab_layer = ~0u;
+        fprintf(stderr, "ds4: K3-ES: %llu experts on the second card, %llu slab copies; buffers released\n",
+                (unsigned long long)p.es_experts, (unsigned long long)p.es_copies);
+    }
+    for (int t = 0; t < g_n_gpus && t < DS4_MAX_GPUS; t++) {
+        k3_ta_bufs &b = g_k3_ta[t];
+        if (!b.q && !b.k && !b.v && !b.o && !b.m) continue;
+        WITH_DEVICE(g_gpu[t].device_id) { (void)cudaDeviceSynchronize(); cudaFree(b.q); cudaFree(b.k); cudaFree(b.v); cudaFree(b.o); cudaFree(b.m); }
+        b = k3_ta_bufs();
+    }
 }
 static int k3_attn_gemm_mode(void) {   /* 1 GEMM attention (default), 0 the kernels, 2 GEMM checked against the full-scan kernel */
     static int mode = -1;
