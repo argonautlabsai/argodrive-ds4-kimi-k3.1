@@ -229,6 +229,10 @@ earlier runs, which is not part of this repository.
 | `DS4_K3_CACHE_POLICY`, `DS4_K3_CACHE_DECAY` | unset, 0.9 | `decay-device`: the device cache evicts by a decayed use count instead of age (the host pool keeps its order). For plain decode; the two-card plain numbers use it with 0.95 |
 | `DS4_K3_TP`, `DS4_K3_TP_XFER` | unset, kernels | with the split: both cards on every layer, a KDA layer's v and output gate and an MLA layer's output gate computed on the other card ([24 November](#copy-drafts-images-and-both-cards-on-every-layer-24-november-2026)); `_XFER=ce` hands the rows over by peer copies instead of copy kernels |
 | `DS4_K3_SMCOPY` | unset | with the split: copies of at most 1 MB between the cards run as kernels, and the second card reads its expert input from the first directly |
+| `DS4_K3_PREFILL_LAYER_MAJOR` | unset | prompts longer than one pass go through every layer pass by pass before the next layer ([25 November](#long-prompts-layer-by-layer-25-november-2026)), when a layer's experts fit beside the pass (`DS4_K3_LM_MIN_CACHE_GB`, 17); `DS4_K3_LM_RESERVE_MB` (2560) VRAM left free when the cache grows for the pass, `DS4_K3_LM_PREFETCH_N` (1024) next-layer read-ahead, `DS4_K3_LM_ATTN_MB` (2048) attention scratch, `DS4_K3_LM_TRACE` per-call times |
+| `DS4_K3_TP_SHARED`, `_EARLY` | unset, 1 | with `DS4_K3_TP`: the first card's shared experts on the second card, started during the routing (`_EARLY=0`: after it) |
+| `DS4_K3_TP_ATTN`, `DS4_K3_TP_ATTN_PREFETCH` | unset, 1 | with `DS4_K3_TP`: half of a prompt pass's MLA attention heads on the other card, its inputs copied during the DSA scores |
+| `DS4_K3_EXPERT_SPLIT`, `DS4_K3_ES_PASSES`, `DS4_K3_ES_SLABS` | unset, 3, 512 | layer-by-layer prompts of at least `_PASSES` passes: about half of each layer's experts computed on the second card, from up to `_SLABS` slab copies |
 | `DS4_K3_COPY` | unset | `1`: drafts copied from the context wherever no draft model runs (plain decode, image prompts); `both`: beside the Qwen drafter as well; `shadow`: scored, never used. `DS4_K3_COPY_ROWS` (up to `DS4_K3_QWEN_ROWS`), `_MARGIN`, `_FALLBACK`, `_COST`, `_TRACE` tune and trace the rule |
 | `DS4_K3_CKPT_DIR`, `DS4_K3_CKPT_DISK_GB` | unset, 16 | saved prompt prefixes are also written to this directory (owner-only files) and restored by later processes; least recently used out first |
 | `DS4_K31_VISION`, `DS4_K31_IMAGE_CACHE_MB` | unset, 512 | images: the directory with the vision tower's safetensors, and the memory kept for encoded images |
@@ -253,9 +257,9 @@ earlier runs, which is not part of this repository.
 | `DS4_K3_LAT_SEL` | 1 | the latent cache rebuilds only the positions attention reads, with batch-independent key/value projections (needs fp32 activations); 0 rebuilds every position |
 | `DS4_K3_PREFILL_MAX`, `DS4_K3_PREFILL_CHUNK`, `DS4_K3_PREFILL_FIT` | 8192, unset, unset | passes longer than `_MAX` run in chunks of exactly that many tokens; `_CHUNK` forces a chunk size (diagnostic); a pass that does not fit is refused unless `_FIT=1` |
 | `DS4_K3_CKPT_DEEPEN` | unset | chat endpoint: when a prompt shares more with the previous request than the saved prefix it restores (the same system prompt and document, a new question), the longer prefix is checkpointed during this request's pass. A reused prefix is a different batching of the prompt pass, as every checkpoint is ([below](#what-is-identical-and-what-is-not)) |
-| `DS4_K3_ATTN_GEMM`, `DS4_K3_ATTN_GEMM_MB` | 1, 256 | prompt-pass attention as exact GEMM passes with a score scratch of this size; 0 runs the per-row kernels; `check` runs both and stops on a mismatch |
+| `DS4_K3_ATTN_GEMM`, `DS4_K3_ATTN_GEMM_MB` | 1, 256 | prompt-pass attention as exact GEMM passes with a score scratch of this size (a layer-by-layer pass uses `DS4_K3_LM_ATTN_MB` unless `_MB` is set); 0 runs the per-row kernels; `check` runs both and stops on a mismatch |
 | `DS4_K3_ATTN_COMPACT` | 0 | attention over the selected positions only (exact, opt-in; it wins only past about 10,000 positions); `check` compares |
-| `DS4_K3_DSA_SCORES` | 1 | indexer scores with one warp per position and token, the reference kernel's arithmetic; 0 runs the reference kernel; `check` compares |
+| `DS4_K3_DSA_SCORES` | tiled from 32 tokens | indexer scores with the reference kernel's arithmetic: a register-tiled kernel for calls of 32 tokens or more, one warp per position and token below; `tile` or `warp` uses one of them everywhere, `tilecheck` runs both and stops on a mismatch, 0 runs the reference kernel, `check` compares it with the warp kernel |
 | `DS4_K3_QWEN_GRACE_MS` | 300 | the first drafter proposal waits at most this long for the sidecar; plain steps run until it is ready |
 | `DS4_K3_QWEN`, `DS4_K3_QWEN_PY`, `DS4_K3_QWEN_SCRIPT`, `DS4_K3_QWEN_DIR`, `DS4_K3_QWEN_META`, `DS4_K3_QWEN_CONF` | off, -, -, -, -, 0.6 | the optional Qwen drafter ([below](#the-optional-qwen-drafter)) |
 | `DS4_K3_QWEN_CHAT` | unset | allow the drafter on chat prompts; use it with the chat settings [below](#the-optional-qwen-drafter) |
@@ -657,6 +661,91 @@ cut.
 Limits. Both cards on every layer needs peer access between the cards in both directions; the engine stops with a
 message without it. Prefix files are tied to the build that wrote them. When an image arrives with too little free
 VRAM on the first card, the expert cache lends the tower some of its own.
+
+### Long prompts, layer by layer (25 November 2026)
+
+At commit ced025a, on the machine of 24 November. A prompt longer than 8,192 tokens is read in passes of 8,192 rows; the pass
+size is part of the arithmetic, so it stays. Until now each pass went through all 92 layers before the next one began, so
+every pass read the experts its rows needed again, about 1.4 TB a pass. Now all the passes go through a layer before any of
+them enters the next one, a layer's experts are read once for all of its passes, and the two cards share more of the rest.
+
+| two cards, long prompts | prefill tok/s | decode tok/s |
+|---|---|---|
+| *13,087-token prompt, 48 generated* | | |
+| 24 November | 116 | 2.05, with the drafter 2.22 |
+| 25 November | 175 | 2.05, with the drafter 2.22 |
+| *21,873-token prompt, 32 generated* | | |
+| 24 November | 115 | 1.91 |
+| 25 November | 194 | 1.90 |
+
+Every cell has the logits of the 24 November build. Both prompts are this repository's own text, so anyone can make them:
+
+```sh
+# 13,087 tokens
+(git show a67620e:README.md; git show a67620e:tools/kimi-k3/README.md | head -c 7874; printf '\n\n'
+ git show a67620e:docs/MODELS.md; printf '\n\n'; git show a67620e:docs/QWEN38_FLASH_NEXT.md) > prompt-13087.txt
+# 21,873 tokens
+(git show 2c4d7fc:tools/kimi-k3/README.md; git show 2c4d7fc:README.md) | head -c 76000 > prompt-21873.txt
+```
+
+The 25 November rows add `DS4_K3_PREFILL_LAYER_MAJOR=1 DS4_K3_TP_SHARED=1 DS4_K3_TP_ATTN=1 DS4_K3_EXPERT_SPLIT=1` to the
+two-card settings of 24 November (the layer split, `DS4_K3_TP=1 DS4_K3_SMCOPY=1`, `decay-device` without the drafter and rank
+admission with it), with the indexer file and a cache of 16,384 or 24,576 positions. The switches leave prompts of one pass
+alone; the faster DSA scores below are on by default and change no logit.
+
+Switch by switch, the 21,873-token prompt, 2 generated:
+
+| | prompt pass | prefill tok/s |
+|---|---|---|
+| 24 November, pass by pass | 191.0 s | 114.5 |
+| `DS4_K3_PREFILL_LAYER_MAJOR=1` | 148.7 s | 147.1 |
+| + `DS4_K3_TP_SHARED=1` | 142.8 s | 153.2 |
+| + `DS4_K3_TP_ATTN=1` | 130.9 s | 167.1 |
+| + `DS4_K3_EXPERT_SPLIT=1` | 122.1 s | 179.1 |
+| + tiled DSA scores (default now) | 114.9 s | 190.4 |
+| + several heads per attention launch (default now) | 111.7 s | 195.8 |
+
+What changed:
+
+- **Layer by layer** (`DS4_K3_PREFILL_LAYER_MAJOR=1`, off by default). Each (layer, pass) step is the call the old loop
+  made, with the same rows, positions, caches and per-layer state order, so the logits are the same bits. The passes share
+  one set of work buffers and keep their own residual rows. During the pass the first card's expert cache grows into the VRAM
+  the pass leaves, the slabs of layers the pass has finished are recycled first, and the next layer's experts are read ahead
+  in what is left beside a full layer, demand reads ahead of them. It needs room for a layer's experts beside the pass
+  (`DS4_K3_LM_MIN_CACHE_GB`, 17); on one card the 8,192-row pass's activations leave too little, so there the pass keeps
+  the pass-by-pass order (layer by layer it read just as much, 2.80 TB on the 13,087-token prompt, and took longer).
+- **Routing on the worker pool.** A prompt pass's routing is spread over the CPU's worker threads with the same per-row code,
+  so the same selections; the 13,087-token prompt's routing went from 7.0 to 2.6 s.
+- **The first card's shared experts on the second card** (`DS4_K3_TP_SHARED=1`, with `DS4_K3_TP=1`). The second card computes
+  them from a copy of the normed rows, starting right after the router logits, while the first card routes and runs the
+  routed experts. Decode is about 0.5 % slower with it, so it is a switch for long prompts.
+- **Half the attention heads on the other card** (`DS4_K3_TP_ATTN=1`). In a prompt pass of 256 rows or more the masked MLA
+  attention runs heads 0-31 on the layer's card and 32-63 on the other, every head with the same launches as before. The
+  other card copies its queries, keys and values while the layer's card computes the DSA scores, and the mask after them.
+- **The experts split between the cards** (`DS4_K3_EXPERT_SPLIT=1`), in layer-by-layer prompts of three passes or more
+  (`DS4_K3_ES_PASSES`): about half of a layer's experts are copied once to the second card and computed there, and their rows
+  come back to the first card before the fixed-order sum. With two passes the copies cost what the split saves.
+- **Tiled DSA scores** (default). The indexer scores of a prompt pass come from a register-tiled kernel with the old kernel's
+  arithmetic for every token and position: each product rounded on its own, the same add tree, the heads summed in the same
+  order. `DS4_K3_DSA_SCORES=tilecheck` runs both and compares: 7.7 billion scores per card on the 21,873-token prompt, none
+  differ. The scores of a 16,000-position pass went from 170-182 ms to 29-32 ms.
+- **Several heads per attention launch** (default in layer-by-layer passes). The GEMM attention's score scratch is 2 GB there
+  (`DS4_K3_LM_ATTN_MB`), so one launch covers several heads. Generation start now frees that scratch on both cards; it used
+  to keep a long pass's size into decode.
+
+Where the time goes now. The drives are no longer the limit for long prompts: the 21,873-token pass reads 1.55 TB of experts,
+about a third of what the drives could deliver in that time. Both cards are busy 60-70 % of the pass. The largest single item
+is the spine's fp32 matrix products, about 22 s on the first card and 35 s on the second, which run as cuBLAS's own kernels
+because they define the reference arithmetic. Next come the routed experts, thousands of small GEMMs whose launches, more than
+the cards, set the pace.
+
+Tried and left out: launching the experts from several host threads (no gain with the expert split, and 16 s slower with a
+thread for the second card); the experts on side streams; attention over the selected positions only; a row-share version of
+the expert split.
+
+Limits. Layer by layer needs the second card's room, and the switches that use both cards need peer access in both
+directions, like `DS4_K3_TP`. Tested up to 24,576 positions. A checkpoint row on a pass boundary keeps the pass-by-pass
+order.
 
 ## The optional Qwen drafter
 

@@ -116,6 +116,18 @@ drive keeps fewer second copies now. Two cards: the layers split between them (`
 either setup. Switches, images, what changed and the limits: [24 November](tools/kimi-k3/README.md#copy-drafts-images-and-both-cards-on-every-layer-24-november-2026);
 the layer split: [19 November](tools/kimi-k3/README.md#two-cards-19-november-2026).
 
+Since 25 November a prompt longer than 8,192 tokens is read layer by layer, with both cards sharing more of the work; same
+logits:
+
+| two cards, long prompts | prefill tok/s | decode tok/s |
+|---|---|---|
+| 13,087-token prompt, 24 November | 116 | 2.05 |
+| 13,087-token prompt, 25 November | 175 | 2.05 |
+| 21,873-token prompt, 24 November | 115 | 1.91 |
+| 21,873-token prompt, 25 November | **194** | 1.90 |
+
+The switches, the prompts and what changed: [25 November](tools/kimi-k3/README.md#long-prompts-layer-by-layer-25-november-2026).
+
 ### Standard benchmarks on a MacBook Pro M5 Max (macOS, Metal)
 
 The same engine runs Kimi K3.1 Pro on a MacBook Pro with an M5 Max and 128 GB of unified memory, through Metal, with the
