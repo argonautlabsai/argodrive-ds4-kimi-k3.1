@@ -747,6 +747,26 @@ Limits. Layer by layer needs the second card's room, and the switches that use b
 directions, like `DS4_K3_TP`. Tested up to 24,576 positions. A checkpoint row on a pass boundary keeps the pass-by-pass
 order.
 
+### Experts placed by measured disk reads (25 November 2026, evening)
+
+Since the evening of 25 November the expert files are placed by measured disk reads. The three-drive RAID0 holds all
+82,432 experts, and the fourth drive holds second copies of the 68,161 that our recorded runs read from disk most often,
+so the reader can split nearly every cache miss across both drives; until then about 8,000 experts had two homes. Same
+engine (main `d5273d4`), same logits:
+
+| two cards, with the drafter | decode tok/s, 24 November | decode tok/s, 25 November |
+|---|---|---|
+| 6-token prompt, 512 generated | 5.51 | **5.54–5.56** |
+| chat question, 256 generated | 2.18 | **3.04** |
+| code question, 256 generated | 1.77 | **2.85–2.86** |
+
+The chat question is "Explain how a central bank sets interest rates and what happens when it raises them.", the code
+question "Write a Python function that parses a CSV file of bank transactions, groups them by month and category, and
+prints a summary table. Explain each step.", both through the chat template with the drafter's chat settings
+(`DS4_K3_QWEN_CHAT=1 DS4_K3_QWEN_CONF=0.9 DS4_K3_QWEN_ROWS=16`). Without the drafter, decode over 200 tokens after the
+13,087-token prompt went from 1.78–1.82 to 1.95 tok/s that day, and the 512-token prompt reads at 16.4 tok/s and decodes
+at 3.12. Prefill of long prompts stays where the table above has it.
+
 ## The optional Qwen drafter
 
 Off by default. Greedy decoding only, and raw completions only unless you set `DS4_K3_QWEN_CHAT=1`.
@@ -760,6 +780,9 @@ rows, the current token plus the drafts, and keeps the drafts up to the first on
     DS4_K3_QWEN_DIR=/path/to/qwen3-0.6b-base DS4_K3_QWEN_META=/path/to/kimi-tokenizer-files \
     ./ds4 -m k3-spine.gguf --cuda --raw --ssd-streaming --ssd-streaming-cold --ssd-streaming-cache-experts 16 \
           --temp 0 -c 2048 -n 512 -p "..."
+
+`DS4_K3_QWEN_META` is the folder with K3's `tiktoken.model` and `tokenizer_config.json` from the checkpoint: keep those two
+files if you delete the checkpoint after preparing the weights.
 
 The recipe comes from the deltafin Kimi K3 work. Three things changed for this engine.
 
