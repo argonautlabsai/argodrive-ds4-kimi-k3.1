@@ -304,7 +304,7 @@ These are the two prompts from the deltafin Kimi K3 benchmark, run raw and greed
 
 Steady is the tokens after the first divided by the time after the first token; the engine prints it as `K3 decode split`. Wall
 is process start to exit. A fresh process spends about 21 s on the sequential path and 28 s on the batched one before steady
-decode starts: loading, 7 s allocating the expert pool, the rest of the 48 GB spine upload, then the prompt. A running server
+decode starts: loading, 7 s allocating the expert pool, the rest of the 56.65 GiB spine upload, then the prompt. A running server
 only pays for the loading once.
 
 For comparison, deltafin on our M5 Max (Kimi K3, four drives, drafter on) did 1.13 tok/s over 128 tokens and 1.00 over 512. Its
